@@ -1,0 +1,19 @@
+services:
+  lnbits:
+    image: lnbits/lnbits:latest
+    restart: unless-stopped
+    ports:
+      - "5000"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "5000"
+      LNBITS_DATA_FOLDER: /app/data
+      LNBITS_EXTENSIONS_PATH: /app/data/extensions
+      LNBITS_ADMIN_UI: "true"
+      FORWARDED_ALLOW_IPS: "*"
+      AUTH_HTTPS_ONLY: "true"
+    volumes:
+      - lnbits-data:/app/data
+
+volumes:
+  lnbits-data:
