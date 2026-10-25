@@ -247,6 +247,17 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
             guards.push(i);
         }
     }
+    // A local that a path can carry from before the loop to a read or to an exit where it is still used is
+    // written back from its register as it is, so it must hold a number on entry as well.
+    let live = live_locals(code, depth, proto.nlocals as usize);
+    for &(i, _) in &locals {
+        if !known(types, header, i)
+            && !guards.contains(&i)
+            && carries_entry_value(code, depth, &entries, &inside, &live, i)
+        {
+            guards.push(i);
+        }
+    }
     Some(Region {
         header,
         last,
@@ -437,6 +448,73 @@ fn known(types: &Numbers, ip: usize, i: u32) -> bool {
         .and_then(|s| s.get(i as usize))
         .copied()
         .unwrap_or(false)
+}
+
+/// For each local, the instructions from which a read of it may come before any store to it.
+fn live_locals(code: &[Op], depth: &[i32], nlocals: usize) -> Vec<Vec<bool>> {
+    let n = code.len();
+    let mut live = vec![vec![false; n]; nlocals];
+    for (i, row) in live.iter_mut().enumerate() {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for ip in (0..n).rev() {
+                if depth[ip] < 0 || row[ip] {
+                    continue;
+                }
+                let op = code[ip];
+                let stores = matches!(op, Op::SetLocal(j) | Op::PopToLocal(j) if j as usize == i);
+                let now = reads_of(op).contains(&(i as u32))
+                    || (!stores
+                        && successors(op, ip, depth[ip])
+                            .iter()
+                            .any(|&(next, _)| next < n && row[next]));
+                if now {
+                    row[ip] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+    live
+}
+
+/// Whether local `i` can reach a read inside the loop, or an exit where it is still live, with the value it
+/// had on entry: some path from an entry gets there without a store to `i`.
+fn carries_entry_value(
+    code: &[Op],
+    depth: &[i32],
+    entries: &[usize],
+    inside: &dyn Fn(usize) -> bool,
+    live: &[Vec<bool>],
+    i: u32,
+) -> bool {
+    let mut seen = vec![false; code.len()];
+    let mut todo = entries.to_vec();
+    while let Some(ip) = todo.pop() {
+        if !inside(ip) {
+            if live[i as usize].get(ip).copied().unwrap_or(false) {
+                return true;
+            }
+            continue;
+        }
+        if std::mem::replace(&mut seen[ip], true) || depth[ip] < 0 {
+            continue;
+        }
+        let op = code[ip];
+        if reads_of(op).contains(&i) {
+            return true;
+        }
+        if matches!(op, Op::SetLocal(j) | Op::PopToLocal(j) if j == i) {
+            continue;
+        }
+        todo.extend(
+            successors(op, ip, depth[ip])
+                .into_iter()
+                .map(|(next, _)| next),
+        );
+    }
+    false
 }
 
 /// Whether a loop region can run `op`: number work, plain locals and jumps.

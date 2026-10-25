@@ -153,14 +153,7 @@ pub fn to_num(v: &Value) -> f64 {
         Value::Null => 0.0,
         Value::Bool(b) => f64::from(u8::from(*b)),
         Value::Num(n) => *n,
-        Value::Str(s) => {
-            let t = s.trim();
-            if t.is_empty() {
-                0.0
-            } else {
-                t.parse::<f64>().unwrap_or(f64::NAN)
-            }
-        }
+        Value::Str(s) => text_to_num(s),
         Value::Arr(a) => {
             let a = a.borrow();
             match a.len() {
@@ -173,35 +166,89 @@ pub fn to_num(v: &Value) -> f64 {
     }
 }
 
-/// Formats a number the way JavaScript prints it for the common cases.
+/// Formats a number the way JavaScript's `Number::toString` does: the shortest digits that read back as the same
+/// number, in positional form up to 21 digits and in exponent form beyond that.
 pub fn num_to_string(n: f64) -> String {
     if n.is_nan() {
-        "NaN".to_string()
-    } else if n.is_infinite() {
-        if n > 0.0 {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        }
-    } else if n == 0.0 {
-        "0".to_string()
-    } else if n.fract() == 0.0 && n.abs() < 9.0e15 {
-        format!("{}", n as i64)
-    } else if n.abs() >= 1e21 || n.abs() < 1e-6 {
-        exponent_form(n)
-    } else {
-        format!("{}", n)
+        return "NaN".to_string();
     }
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    if n == 0.0 {
+        return "0".to_string();
+    }
+    if n.fract() == 0.0 && n.abs() < 9.0e15 {
+        return format!("{}", n as i64);
+    }
+    let sign = if n < 0.0 { "-" } else { "" };
+    let (digits, point) = shortest_digits(n.abs());
+    let k = digits.len() as i32;
+    let body = if k <= point && point <= 21 {
+        format!("{}{}", digits, "0".repeat((point - k) as usize))
+    } else if 0 < point && point <= 21 {
+        format!(
+            "{}.{}",
+            &digits[..point as usize],
+            &digits[point as usize..]
+        )
+    } else if -6 < point && point <= 0 {
+        format!("0.{}{}", "0".repeat((-point) as usize), digits)
+    } else {
+        let e = point - 1;
+        let exp_sign = if e < 0 { "-" } else { "+" };
+        if k == 1 {
+            format!("{}e{}{}", digits, exp_sign, e.abs())
+        } else {
+            format!("{}.{}e{}{}", &digits[..1], &digits[1..], exp_sign, e.abs())
+        }
+    };
+    format!("{}{}", sign, body)
 }
 
-/// JavaScript's exponent notation, such as `1e+21` or `1.5e-7`.
-fn exponent_form(n: f64) -> String {
-    let text = format!("{:e}", n);
-    match text.split_once('e') {
-        Some((mantissa, exp)) if exp.starts_with('-') => format!("{}e{}", mantissa, exp),
-        Some((mantissa, exp)) => format!("{}e+{}", mantissa, exp),
-        None => text,
+/// The shortest digits that read back as `x`, which is positive and finite, and the position of the decimal point:
+/// `x` is `0.d1d2...dk` times ten to the power `point`. Rust rounds an exact expansion to the even digit when two
+/// candidates of that length are equally close, which is the one JavaScript picks, so that rounding is used when
+/// it still reads back as `x`.
+fn shortest_digits(x: f64) -> (String, i32) {
+    let short = format!("{:e}", x);
+    let (mantissa, exp) = short.split_once('e').unwrap_or((short.as_str(), "0"));
+    let mut digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    let mut exp10: i32 = exp.parse().unwrap_or(0);
+    if could_tie(x) {
+        let exact = format!("{:.*e}", digits.len() - 1, x);
+        if let Some((m, e)) = exact.split_once('e') {
+            let alt: String = m.chars().filter(|c| c.is_ascii_digit()).collect();
+            if alt != digits && exact.parse::<f64>() == Ok(x) {
+                digits = alt;
+                exp10 = e.parse().unwrap_or(exp10);
+            }
+        }
     }
+    (digits.trim_end_matches('0').to_string(), exp10 + 1)
+}
+
+/// Whether two shortest candidates of `x` can tie. A tie needs the exact decimal form of `x` to have one more
+/// significant digit than the candidates, which are at most 17 digits, so an exact form of more than 18 digits
+/// rules it out. A double `m * 2^e` with `e < 0` has the exact form `m * 5^-e` times `10^e`.
+fn could_tie(x: f64) -> bool {
+    let bits = x.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (mut m, mut e) = if biased == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1u64 << 52), biased - 1075)
+    };
+    let zeros = m.trailing_zeros();
+    m >>= zeros;
+    e += zeros as i32;
+    if e >= 0 {
+        return false;
+    }
+    let j = (-e) as u32;
+    // `m` is below 2^53, so `m * 5^27` still fits in a u128.
+    j <= 27 && (u128::from(m) * 5u128.pow(j)).to_string().len() <= 18
 }
 
 pub fn to_str(v: &Value) -> String {
@@ -223,10 +270,88 @@ pub fn to_str(v: &Value) -> String {
             })
             .collect::<Vec<_>>()
             .join(","),
-        Value::Obj(_) => "[object Object]".to_string(),
+        Value::Obj(o) => error_text(o).unwrap_or_else(|| "[object Object]".to_string()),
         Value::Func(_) | Value::Native(_) => "function".to_string(),
         Value::Cell(c) => to_str(&c.borrow()),
     }
+}
+
+/// `Number(text)` for a string: decimal numbers, `0x`, `0o` and `0b` integers, and the names `Infinity` and
+/// `-Infinity`. Anything else, such as `inf` or `nan`, is not a number.
+fn text_to_num(text: &str) -> f64 {
+    let t = text.trim();
+    if t.is_empty() {
+        return 0.0;
+    }
+    let radix: u32 = match t.get(..2) {
+        Some("0x" | "0X") => 16,
+        Some("0o" | "0O") => 8,
+        Some("0b" | "0B") => 2,
+        _ => 0,
+    };
+    if radix != 0 {
+        let digits = &t[2..];
+        if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+            return f64::NAN;
+        }
+        return digits.chars().fold(0.0, |acc, c| {
+            acc * f64::from(radix) + f64::from(c.to_digit(radix).unwrap_or(0))
+        });
+    }
+    match t {
+        "Infinity" | "+Infinity" => f64::INFINITY,
+        "-Infinity" => f64::NEG_INFINITY,
+        _ if t
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E')) =>
+        {
+            t.parse::<f64>().unwrap_or(f64::NAN)
+        }
+        _ => f64::NAN,
+    }
+}
+
+/// `String(error)` for an error object, which `make_error` gives `name`, `message` and `stack`. Any other object
+/// prints as `[object Object]`.
+fn error_text(o: &ObjRef) -> Option<String> {
+    let props = o.borrow();
+    let get = |key: &str| props.iter().find(|(k, _)| &**k == key).map(|(_, v)| v);
+    get("stack")?;
+    let name = to_str(get("name")?);
+    let message = to_str(get("message")?);
+    Some(match (name.is_empty(), message.is_empty()) {
+        (_, true) => name,
+        (true, false) => message,
+        (false, false) => format!("{}: {}", name, message),
+    })
+}
+
+/// The positions of an object's properties in the order JavaScript lists them: keys that are array indices come
+/// first, in ascending order, and the others keep their insertion order.
+pub fn key_order(props: &Props) -> Vec<usize> {
+    let mut indices = Vec::new();
+    let mut names = Vec::new();
+    for (i, (k, _)) in props.iter().enumerate() {
+        match array_index(k) {
+            Some(n) => indices.push((n, i)),
+            None => names.push(i),
+        }
+    }
+    indices.sort_unstable();
+    indices.into_iter().map(|(_, i)| i).chain(names).collect()
+}
+
+/// An array index spelled the way JavaScript spells it: digits with no leading zero, below 2^32 - 1.
+fn array_index(key: &str) -> Option<u32> {
+    let bytes = key.as_bytes();
+    if bytes.is_empty() || bytes.len() > 10 || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if bytes.len() > 1 && bytes[0] == b'0' {
+        return None;
+    }
+    let n: u64 = key.parse().ok()?;
+    (n < u64::from(u32::MAX)).then_some(n as u32)
 }
 
 /// The `+` operator: numeric addition, or string concatenation when either side is not a number.
@@ -328,6 +453,14 @@ pub fn loose_eq(a: &Value, b: &Value) -> bool {
             Value::Num(_) | Value::Str(_) | Value::Bool(_),
             Value::Num(_) | Value::Str(_) | Value::Bool(_),
         ) => to_num(a) == to_num(b),
+        (
+            Value::Arr(_) | Value::Obj(_) | Value::Func(_),
+            Value::Num(_) | Value::Str(_) | Value::Bool(_),
+        ) => loose_eq(&Value::str(&to_str(a)), b),
+        (
+            Value::Num(_) | Value::Str(_) | Value::Bool(_),
+            Value::Arr(_) | Value::Obj(_) | Value::Func(_),
+        ) => loose_eq(a, &Value::str(&to_str(b))),
         _ => strict_eq(a, b),
     }
 }

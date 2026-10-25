@@ -1,7 +1,7 @@
 //! The `JSON` object: `JSON.stringify` and `JSON.parse`.
 
 use crate::builtins::{arg, table_object};
-use crate::value::{num_to_string, obj_set, to_str, NativeDef, Value};
+use crate::value::{key_order, num_to_string, obj_set, to_str, NativeDef, Value};
 use crate::vm::Vm;
 
 pub static METHODS: &[NativeDef] = &[
@@ -78,7 +78,8 @@ fn write_value(
         Value::Obj(o) => {
             let props = o.borrow().clone();
             let mut parts = Vec::new();
-            for (k, val) in props.iter() {
+            for i in key_order(&props) {
+                let (k, val) = &props[i];
                 let mut text = String::new();
                 if write_value(val, indent, depth + 1, &mut text)? {
                     let mut key = String::new();

@@ -1649,13 +1649,16 @@ impl Vm {
             }
             Op::JumpIfNotLt(t) => {
                 let less = match self.num_pair() {
-                    Some((x, y)) => x < y,
+                    Some((x, y)) => {
+                        self.stack.truncate(self.stack.len() - 2);
+                        x < y
+                    }
+                    // `pop_pair` already removed both operands, so nothing is left to truncate.
                     None => {
                         let (a, b) = self.pop_pair();
                         compare(&a, &b) == Some(Ordering::Less)
                     }
                 };
-                self.stack.truncate(self.stack.len() - 2);
                 if !less {
                     return Ok(t as usize);
                 }
@@ -1797,7 +1800,11 @@ impl Vm {
             Op::ToKeys => {
                 let v = self.pop();
                 let keys: Vec<Value> = match &v {
-                    Value::Obj(o) => o.borrow().iter().map(|(k, _)| Value::str(k)).collect(),
+                    Value::Obj(o) => {
+                        let props = o.borrow();
+                        let order = key_order(&props);
+                        order.into_iter().map(|i| Value::str(&props[i].0)).collect()
+                    }
                     Value::Arr(a) => (0..a.borrow().len())
                         .map(|i| Value::str(&i.to_string()))
                         .collect(),

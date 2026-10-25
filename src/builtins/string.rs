@@ -136,43 +136,81 @@ fn str_arg(args: &[Value], i: usize) -> String {
     to_str(&arg(args, i))
 }
 
+/// A character index argument: NaN counts as 0 and a fraction is cut off. A negative index names no character.
+fn index_arg(v: &Value) -> Option<usize> {
+    let n = to_num(v);
+    let n = if n.is_nan() { 0.0 } else { n.trunc() };
+    (n >= 0.0).then(|| n as usize)
+}
+
+/// A character position argument, cut to a whole number and kept within `0..=len`. A missing argument gives
+/// `default`, and NaN gives 0.
+fn position_arg(args: &[Value], i: usize, default: usize, len: usize) -> usize {
+    match args.get(i) {
+        None | Some(Value::Undef) => default,
+        Some(v) => {
+            let n = to_num(v);
+            if n.is_nan() {
+                0
+            } else {
+                n.trunc().clamp(0.0, len as f64) as usize
+            }
+        }
+    }
+}
+
+/// The byte offset of character `pos`, which is at most the length of `s` in characters.
+fn byte_offset(s: &str, pos: usize) -> usize {
+    s.char_indices().nth(pos).map_or(s.len(), |(b, _)| b)
+}
+
 fn char_at_method(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_str(&this);
-    let i = to_num(&arg(args, 0));
-    let i = if i.is_nan() { 0 } else { i as usize };
+    let i = index_arg(&arg(args, 0));
     Ok(Value::str(
-        &char_at(&s, i).map(String::from).unwrap_or_default(),
+        &i.and_then(|i| char_at(&s, i))
+            .map(String::from)
+            .unwrap_or_default(),
     ))
 }
 
 fn char_code_at(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_str(&this);
-    let i = to_num(&arg(args, 0));
-    let i = if i.is_nan() { 0 } else { i as usize };
+    let i = index_arg(&arg(args, 0));
     Ok(Value::Num(
-        char_at(&s, i).map_or(f64::NAN, |c| c as u32 as f64),
+        i.and_then(|i| char_at(&s, i))
+            .map_or(f64::NAN, |c| c as u32 as f64),
     ))
 }
 
 fn index_of(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_str(&this);
-    let found = match s.find(&str_arg(args, 0)) {
-        Some(byte) => s[..byte].chars().count() as f64,
+    let from = position_arg(args, 1, 0, s.chars().count());
+    let start = byte_offset(&s, from);
+    let found = match s[start..].find(&str_arg(args, 0)) {
+        Some(byte) => s[..start + byte].chars().count() as f64,
         None => -1.0,
     };
     Ok(Value::Num(found))
 }
 
 fn includes(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Bool(this_str(&this).contains(&str_arg(args, 0))))
+    let s = this_str(&this);
+    let start = byte_offset(&s, position_arg(args, 1, 0, s.chars().count()));
+    Ok(Value::Bool(s[start..].contains(&str_arg(args, 0))))
 }
 
 fn starts_with(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Bool(this_str(&this).starts_with(&str_arg(args, 0))))
+    let s = this_str(&this);
+    let start = byte_offset(&s, position_arg(args, 1, 0, s.chars().count()));
+    Ok(Value::Bool(s[start..].starts_with(&str_arg(args, 0))))
 }
 
 fn ends_with(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Bool(this_str(&this).ends_with(&str_arg(args, 0))))
+    let s = this_str(&this);
+    let len = s.chars().count();
+    let end = byte_offset(&s, position_arg(args, 1, len, len));
+    Ok(Value::Bool(s[..end].ends_with(&str_arg(args, 0))))
 }
 
 fn slice(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {

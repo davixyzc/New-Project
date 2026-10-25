@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::builtins::{arg, fs, table_object};
-use crate::value::{obj_set, to_num, to_str, truthy, NativeDef, Value};
+use crate::value::{key_order, obj_set, to_num, to_str, truthy, NativeDef, Value};
 use crate::vm::Vm;
 
 pub static FUNCTIONS: &[NativeDef] = &[
@@ -408,7 +408,11 @@ fn clear_timer(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value
 /// Own keys of an object, or the indices of an array, as strings.
 fn keys_of(v: &Value) -> Vec<String> {
     match v {
-        Value::Obj(o) => o.borrow().iter().map(|(k, _)| k.to_string()).collect(),
+        Value::Obj(o) => {
+            let props = o.borrow();
+            let order = key_order(&props);
+            order.into_iter().map(|i| props[i].0.to_string()).collect()
+        }
         Value::Arr(a) => (0..a.borrow().len()).map(|i| i.to_string()).collect(),
         _ => Vec::new(),
     }
@@ -485,6 +489,20 @@ fn process_cwd(_vm: &mut Vm, _this: Value, _args: &[Value]) -> Result<Value, Val
 
 // ----- Math --------------------------------------------------------------------
 
+/// `Math.round`: a half goes up, and a result of zero keeps the sign of its input, so `-0.4` gives `-0`.
+fn round_half_up(x: f64) -> f64 {
+    if !x.is_finite() || x == x.trunc() {
+        return x;
+    }
+    let floor = x.floor();
+    let r = if x - floor >= 0.5 { floor + 1.0 } else { floor };
+    if r == 0.0 && x < 0.0 {
+        -0.0
+    } else {
+        r
+    }
+}
+
 macro_rules! unary_math {
     ($($name:ident => $f:expr),* $(,)?) => {
         $(
@@ -499,7 +517,7 @@ macro_rules! unary_math {
 unary_math! {
     floor => f64::floor,
     ceil => f64::ceil,
-    round => |x| (x + 0.5).floor(),
+    round => round_half_up,
     trunc => f64::trunc,
     abs => f64::abs,
     sqrt => f64::sqrt,
@@ -517,6 +535,24 @@ fn pow(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     ))
 }
 
+/// One step of `Math.min`, which orders -0 below +0 as JavaScript does.
+fn min_step(best: f64, n: f64) -> f64 {
+    if n < best || (n == 0.0 && best == 0.0 && n.is_sign_negative()) {
+        n
+    } else {
+        best
+    }
+}
+
+/// One step of `Math.max`, which orders +0 above -0.
+fn max_step(best: f64, n: f64) -> f64 {
+    if n > best || (n == 0.0 && best == 0.0 && n.is_sign_positive()) {
+        n
+    } else {
+        best
+    }
+}
+
 fn min(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let mut best = f64::INFINITY;
     for v in args {
@@ -524,7 +560,7 @@ fn min(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
         if n.is_nan() {
             return Ok(Value::Num(f64::NAN));
         }
-        best = best.min(n);
+        best = min_step(best, n);
     }
     Ok(Value::Num(best))
 }
@@ -536,7 +572,7 @@ fn max(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
         if n.is_nan() {
             return Ok(Value::Num(f64::NAN));
         }
-        best = best.max(n);
+        best = max_step(best, n);
     }
     Ok(Value::Num(best))
 }
