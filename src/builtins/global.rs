@@ -102,7 +102,51 @@ pub static OBJECT: &[NativeDef] = &[
         name: "assign",
         func: object_assign,
     },
+    NativeDef {
+        name: "is",
+        func: object_is,
+    },
+    NativeDef {
+        name: "getPrototypeOf",
+        func: object_get_prototype_of,
+    },
+    NativeDef {
+        name: "create",
+        func: object_create,
+    },
 ];
+
+/// `Object.is(a, b)`: like `===`, except that NaN is the same as NaN and -0 is not the same as +0.
+fn object_is(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let (a, b) = (arg(args, 0), arg(args, 1));
+    let same = match (&a, &b) {
+        (Value::Num(x), Value::Num(y)) => {
+            (x.is_nan() && y.is_nan()) || (x == y && x.is_sign_negative() == y.is_sign_negative())
+        }
+        _ => crate::value::strict_eq(&a, &b),
+    };
+    Ok(Value::Bool(same))
+}
+
+/// `Object.getPrototypeOf(obj)`: the prototype of an object, or null when it has none.
+fn object_get_prototype_of(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(match arg(args, 0) {
+        Value::Obj(o) => o.borrow().proto.clone().map_or(Value::Null, Value::Obj),
+        _ => Value::Null,
+    })
+}
+
+/// `Object.create(proto)`: a new object whose prototype is `proto`, which may be null.
+fn object_create(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    match arg(args, 0) {
+        Value::Obj(proto) => Ok(Value::obj_with_proto(proto)),
+        Value::Null => Ok(Value::Obj(crate::value::new_obj(None))),
+        _ => Err(vm.make_error(
+            "TypeError",
+            "Object prototype may only be an Object or null",
+        )),
+    }
+}
 
 /// The methods that every object has, from the built-in `Object.prototype`. A lookup finds them after the chain of the
 /// object, so a class can replace them.
