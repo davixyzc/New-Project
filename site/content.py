@@ -15,15 +15,15 @@ Se um exemplo falhar, o build para. Os blocos são tuplas:
 """
 
 HOME = {
-    "lede": "A sintaxe do JavaScript e o modelo de execução do Node.js, num binário de 963 KB que abre em 3,4 ms.",
+    "lede": "A sintaxe do JavaScript e o modelo de execução do Node.js, num binário de 1,1 MB que abre em 3,4 ms.",
     "badges": ["versão 0.1.0", "sem dependências", "binário de 963 KB"],
     "resumo": [
         ("leve", "Um executável de 963 KB, sem dependências e sem node_modules. Cabe em um pendrive."),
         ("rápido", "Código nativo x86-64 para funções e laços com números, e callbacks de array em lote. Os números estão logo abaixo."),
         ("familiar", "let, const, arrow functions, template strings, spread, switch, try com finally e require. Quem conhece JavaScript lê o código sem aprender outra sintaxe."),
     ],
-    "desempenho": "Os mesmos algoritmos em cada linguagem, com a mediana de 15 execuções intercaladas, em 4 vCPU. Barras menores são mais rápidas. Os tempos incluem o início de cada processo.",
-    "como_ler": "O fly fica na frente do Bun e do Node nas cinco cargas. A menor margem é a do array, com cerca de 1,35× sobre o Bun. Diferenças menores que 10% dependem da máquina.",
+    "desempenho": "Os mesmos programas em cada runtime, com a mediana de 5 execuções intercaladas, em 4 vCPU. Barras menores são mais rápidas. Os tempos incluem o início de cada processo.",
+    "como_ler": "De 24 programas, o fly é mais rápido que o Bun e o Node em 10. Nos outros 14 ainda perde, em geral nos programas com acessos a propriedades e elementos de arrays e chamadas de função. Diferenças menores que 10% dependem da máquina.",
     "limites": [
         "Não há classes, Promises, async/await, expressões regulares nem destructuring.",
         "Strings são indexadas por caractere Unicode, não por unidade UTF-16. Por isso `\"😀\".length` é 1.",
@@ -592,7 +592,6 @@ page(
             "const { a } = { a: 1 };",
             "async function f() {}",
             '/a/.test("a");',
-            "1 & 2;",
             "outer: for (;;) break outer;",
             "const o = { get x() { return 1; } };",
             "[] instanceof Array;",
@@ -602,15 +601,11 @@ page(
             "new Set();",
             'Symbol("x");',
             "function f() { return arguments.length; } f(1);",
-            'Object.assign({}, { a: 1 });',
-            "Number.isInteger(2);",
-            "console.log(Number.MAX_SAFE_INTEGER);",
         ]),
         ("h2", "Comportamento diferente", "diferente"),
         ("p", "Estes trechos rodam nos dois, mas dão resultados diferentes."),
         ("probe", "both", [
             'console.log("😀".length);',
-            "console.log((255).toString(16));",
             'console.log(JSON.stringify({ a: 1, b: 2 }, ["a"]));',
             "console.log(-0);",
             "{ var v = 1; }\nconsole.log(v);",

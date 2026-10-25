@@ -24,19 +24,36 @@ import content  # noqa: E402
 FLY = os.environ.get("FLY", os.path.join(HERE, "..", "target", "release", "fly"))
 NODE = os.environ.get("NODE_BIN", "node")
 
-# Medidas com execuções intercaladas e mediana de 15. O script que as mediu, com Bun, não está no repositório;
-# benchmarks/bench.py mede fly, Node e Python, em sequência e com 5 execuções por padrão.
+# Medidas de benchmarks/bench.py: fly, Node 22 e Bun 1.4, execuções intercaladas, mediana de 5 execuções.
 BENCH = [
-    ("fib(30), recursão", {"fly": 13.4, "node": 70.2, "bun": 26.8, "python": 213.2}, "ms"),
-    ("laço de 20M com %", {"fly": 32.0, "node": 105.6, "bun": 77.9, "python": 2799.3}, "ms"),
-    ("1M push + map / filter / reduce", {"fly": 67.8, "node": 177.8, "bun": 91.2, "python": 276.0}, "ms"),
-    ("1M objetos literais", {"fly": 5.8, "node": 53.7, "bun": 34.9, "python": 389.3}, "ms"),
-    ("200k concatenações", {"fly": 9.1, "node": 68.1, "bun": 29.2, "python": 42.0}, "ms"),
+    ("array", {"fly": 65.2, "node": 159.9, "bun": 84.7}, "ms"),
+    ("binary_trees", {"fly": 178.2, "node": 85.8, "bun": 65.2}, "ms"),
+    ("char_codes", {"fly": 159.6, "node": 75.7, "bun": 48.1}, "ms"),
+    ("closures", {"fly": 172.0, "node": 51.5, "bun": 68.4}, "ms"),
+    ("console_lines", {"fly": 35.5, "node": 710.0, "bun": 145.8}, "ms"),
+    ("dict_keys", {"fly": 17.9, "node": 61.7, "bun": 28.3}, "ms"),
+    ("exceptions", {"fly": 57.6, "node": 414.7, "bun": 69.2}, "ms"),
+    ("fib", {"fly": 11.7, "node": 55.2, "bun": 19.2}, "ms"),
+    ("json", {"fly": 274.3, "node": 217.0, "bun": 110.0}, "ms"),
+    ("life", {"fly": 2200.3, "node": 393.4, "bun": 214.3}, "ms"),
+    ("loop", {"fly": 36.8, "node": 114.3, "bun": 56.2}, "ms"),
+    ("mandelbrot", {"fly": 21.8, "node": 61.3, "bun": 24.1}, "ms"),
+    ("matrix", {"fly": 123.6, "node": 55.4, "bun": 28.2}, "ms"),
+    ("method_calls", {"fly": 197.7, "node": 60.6, "bun": 19.7}, "ms"),
+    ("nbody_objects", {"fly": 492.1, "node": 70.6, "bun": 31.1}, "ms"),
+    ("num_to_string", {"fly": 246.9, "node": 99.0, "bun": 104.1}, "ms"),
+    ("objects", {"fly": 5.7, "node": 52.8, "bun": 33.9}, "ms"),
+    ("sieve", {"fly": 628.7, "node": 268.8, "bun": 160.3}, "ms"),
+    ("sort_cmp", {"fly": 208.1, "node": 209.8, "bun": 106.6}, "ms"),
+    ("split_join", {"fly": 107.0, "node": 115.7, "bun": 78.3}, "ms"),
+    ("str_index", {"fly": 13.9, "node": 56.7, "bun": 15.1}, "ms"),
+    ("string", {"fly": 10.4, "node": 60.3, "bun": 27.6}, "ms"),
+    ("string_builder", {"fly": 121.8, "node": 155.5, "bun": 93.3}, "ms"),
+    ("tak", {"fly": 111.5, "node": 79.3, "bun": 27.9}, "ms"),
 ]
 OTHER = [
-    ("inicialização", {"fly": 3.4, "node": 42.7, "bun": 8.6, "python": 20.6}, "ms"),
-    ("memória, 1M inteiros", {"fly": 19.0, "node": 80.7, "bun": 56.7, "python": 49.2}, "MB"),
-    ("tamanho do executável", {"fly": 963, "node": 123405, "bun": 107309}, "KB", {"node": "123 MB", "bun": "107 MB"}),
+    ("inicialização", {"fly": 3.4, "node": 45.7, "bun": 8.5}, "ms"),
+    ("tamanho do executável", {"fly": 1086, "node": 123405, "bun": 107309}, "KB", {"fly": "1,1 MB", "node": "123 MB", "bun": "107 MB"}),
 ]
 BAR_CLASS = {"fly": "bar-fly", "node": "bar-node", "bun": "bar-bun", "python": "bar-python"}
 

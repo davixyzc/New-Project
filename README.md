@@ -45,7 +45,7 @@ Argumentos depois do arquivo chegam em `process.argv` (como no Node: `argv[0]` �
 - **Objetos e funções**: literais de objeto (com métodos e atalhos `{ x }`), `this` em métodos e arrows, `new` com funções construtoras.
 - **Strings**: aspas simples e duplas, template strings (`` `olá ${nome}` ``).
 - **Spread**: `[...a, ...b]` e `f(...args)`.
-- **Operadores**: aritméticos (`+ - * / % **`), comparação (`== != === !== < <= > >=`), lógicos (`&& || ??`), ternário, `typeof`, `++`/`--`, atribuição composta (`+=` etc.).
+- **Operadores**: aritméticos (`+ - * / % **`), comparação (`== != === !== < <= > >=`), `in`, lógicos (`&& || ??`), atribuição lógica (`&&= ||= ??=`, com alvo que é um nome ou uma propriedade de um nome), bit a bit (`& | ^ ~ << >> >>>`), ternário, `typeof`, `void`, vírgula, `++`/`--`, atribuição composta (`+=`, `&=` etc.).
 
 ## Biblioteca padrão
 
@@ -58,20 +58,20 @@ Argumentos depois do arquivo chegam em `process.argv` (como no Node: `argv[0]` �
 | `fs` | `readFileSync`, `writeFileSync`, `appendFileSync`, `existsSync`, `readdirSync`, `mkdirSync`, `unlinkSync`, `readFile(path, cb)`, `writeFile(path, data, cb)` |
 | `path` | `join`, `resolve`, `basename`, `dirname`, `extname`, `sep` |
 | `JSON` | `stringify(valor, _, indentação)` e `parse(texto)` |
-| `Math` | `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `pow`, `min`, `max`, `sign`, `log`, `exp`, `sin`, `cos`, `tan`, `random`, `PI`, `E` |
-| conversões | `Number`, `String`, `Boolean`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`, `NaN`, `Infinity` |
+| `Math` | `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `cbrt`, `pow`, `min`, `max`, `hypot`, `imul`, `clz32`, `fround`, `sign`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `random`, `PI`, `E`, `LN2`, `LN10`, `LOG2E`, `LOG10E`, `SQRT2`, `SQRT1_2` |
+| conversões | `Number` (com `isInteger`, `isSafeInteger`, `isFinite`, `isNaN`, `parseFloat`, `parseInt` e as constantes `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `EPSILON`, `MAX_VALUE`, `MIN_VALUE`), `String` (com `fromCharCode`), `Boolean`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`, `NaN`, `Infinity` |
 | erros | `Error`, `TypeError`, `RangeError`, `SyntaxError`, `ReferenceError` |
-| `Object`, `Array`, `Date` | `Object.keys/values/entries`, `Array.isArray/from`, `Date.now()` |
+| `Object`, `Array`, `Date` | `Object.keys/values/entries/assign`, `Array.isArray/from`, `Date.now()` |
 
-Métodos de **array**: `push pop shift unshift slice indexOf includes join concat reverse map filter forEach reduce find findIndex some every sort` (`sort` é estável e aceita comparador).
+Métodos de **array**: `push pop shift unshift slice splice indexOf lastIndexOf includes join concat reverse map filter forEach reduce reduceRight find findIndex some every sort flat at fill toString` (`sort` é estável e aceita comparador).
 
-Métodos de **string**: `length`, `charAt charCodeAt indexOf includes startsWith endsWith slice substring toUpperCase toLowerCase trim trimStart trimEnd split repeat padStart padEnd concat`, e `replace` (só com padrão de texto, trocando a primeira ocorrência).
+Métodos de **string**: `length`, `charAt charCodeAt indexOf includes startsWith endsWith slice substring toUpperCase toLowerCase trim trimStart trimEnd split repeat padStart padEnd concat at codePointAt`, `fromCharCode` estático, e `replace` (só com padrão de texto, trocando a primeira ocorrência).
 
-Métodos de **number**: `toFixed`, `toString`.
+Métodos de **number**: `toFixed`, `toString` (com radix de 2 a 36).
 
 ## O que ainda não existe (e diferenças do JavaScript)
 
-- Sem **classes**, **Promises**, **async/await**, **expressões regulares**, **destructuring**, **getters/setters**, **generators**, **labels**, **operadores bit a bit**, objeto `arguments` e `new Array(...)`.
+- Sem **classes**, **Map** e **Set**, **Promises**, **async/await**, **expressões regulares**, **destructuring**, **getters/setters** em literais, **generators**, **labels** (`rótulo:`), **`?.`**, **`delete`**, **`instanceof`**, **Symbol**, **BigInt**, arrays tipados, objeto `arguments`, `call`/`apply`/`bind`, `Array(n)` e `new Array(...)`, `globalThis`, e o construtor de `Date` (só `Date.now()`).
 - `var` tem escopo de bloco, como `let`.
 - Strings são indexadas por **caractere Unicode**, não por unidade UTF-16 (então `"😀".length` é 1, e no Node é 2).
 - Os métodos de `fs` com callback fazem o I/O de forma síncrona e entregam o resultado pelo event loop. `readFileSync` retorna sempre uma string (o Node retorna `Buffer` sem encoding).
@@ -80,27 +80,47 @@ Métodos de **number**: `toFixed`, `toString`.
 
 ## Desempenho (medido)
 
-Medido nesta máquina (Xeon 2,1 GHz, 4 vCPU), em tempo de parede. Cada número é a mediana de execuções intercaladas entre os runtimes, então a variação da máquina atinge todos igual, e o mesmo algoritmo roda em cada linguagem com a mesma saída. `benchmarks/bench.py` roda os programas com Node e Python e confere as saídas; o Bun foi medido com o mesmo critério num script à parte. **A máquina varia bastante entre sessões**: compare as colunas dentro de uma mesma tabela, nunca tabelas de sessões diferentes.
+Medido nesta máquina (Xeon 2,1 GHz, 4 vCPU), em tempo de parede do processo inteiro, inicialização incluída. `benchmarks/bench.py` roda os 24 programas de `benchmarks/` com o fly, o Node 22 e o Bun 1.4, intercalados, e confere que as três saídas são iguais. Cada número é a mediana de 5 execuções. Cada programa existe em duas versões com o mesmo código, `.fly` e `.js`. Os números são do `cargo build --release` comum, sem PGO.
 
-A coluna **fly** usa o binário com PGO (`scripts/pgo-build.sh`), com código nativo ligado. A coluna **interpretador** é o mesmo binário com `FLY_JIT=0` (mediana de 7 execuções). O melhor de cada linha está em negrito.
+**A máquina varia bastante, até dentro de uma mesma sessão**: o `tak` foi de 98 a 147 ms em medições diferentes. Compare as colunas de uma mesma tabela, nunca tabelas de medições diferentes. Acima de 1× o fly ganha; abaixo, perde.
 
-| carga | fly (JIT) | interpretador | Bun 1.4 | Node 22 | Python 3 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `fib(30)`, recursão | **13,4 ms** | 225 ms | 26,8 ms | 70,2 ms | 213 ms |
-| laço de 20M com `%` | **32,0 ms** | 896 ms | 77,9 ms | 105,6 ms | 2799 ms |
-| 1M `push`, depois `map`/`filter`/`reduce` | **67,8 ms** | 419 ms | 91,2 ms | 177,8 ms | 276 ms |
-| 1M objetos literais | **5,8 ms** | 75 ms | 34,9 ms | 53,7 ms | 389 ms |
-| 200k concatenações de string | **9,1 ms** | 13 ms | 29,2 ms | 68,1 ms | 42 ms |
+| benchmark | fly ms | Node ms | Bun ms | fly em relação ao melhor dos outros | resultado |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `array` | 65,2 | 159,9 | 84,7 | 1,30× | fly ganha |
+| `binary_trees` | 178,2 | 85,8 | 65,2 | 0,37× | perde |
+| `char_codes` | 159,6 | 75,7 | 48,1 | 0,30× | perde |
+| `closures` | 172,0 | 51,5 | 68,4 | 0,30× | perde |
+| `console_lines` | 35,5 | 710,0 | 145,8 | 4,11× | fly ganha |
+| `dict_keys` | 17,9 | 61,7 | 28,3 | 1,58× | fly ganha |
+| `exceptions` | 57,6 | 414,7 | 69,2 | 1,20× | fly ganha |
+| `fib` | 11,7 | 55,2 | 19,2 | 1,64× | fly ganha |
+| `json` | 274,3 | 217,0 | 110,0 | 0,40× | perde |
+| `life` | 2200,3 | 393,4 | 214,3 | 0,10× | perde |
+| `loop` | 36,8 | 114,3 | 56,2 | 1,53× | fly ganha |
+| `mandelbrot` | 21,8 | 61,3 | 24,1 | 1,11× | fly ganha |
+| `matrix` | 123,6 | 55,4 | 28,2 | 0,23× | perde |
+| `method_calls` | 197,7 | 60,6 | 19,7 | 0,10× | perde |
+| `nbody_objects` | 492,1 | 70,6 | 31,1 | 0,06× | perde |
+| `num_to_string` | 246,9 | 99,0 | 104,1 | 0,40× | perde |
+| `objects` | 5,7 | 52,8 | 33,9 | 5,95× | fly ganha |
+| `sieve` | 628,7 | 268,8 | 160,3 | 0,25× | perde |
+| `sort_cmp` | 208,1 | 209,8 | 106,6 | 0,51× | perde |
+| `split_join` | 107,0 | 115,7 | 78,3 | 0,73× | perde |
+| `str_index` | 13,9 | 56,7 | 15,1 | 1,09× | fly ganha |
+| `string` | 10,4 | 60,3 | 27,6 | 2,65× | fly ganha |
+| `string_builder` | 121,8 | 155,5 | 93,3 | 0,77× | perde |
+| `tak` | 111,5 | 79,3 | 27,9 | 0,25× | perde |
 
-Outras medidas, com o mesmo binário (a inicialização é a mediana de 15 execuções):
+**Leitura**: o fly é mais rápido que o Node e o Bun em **10 de 24** programas. Ganha na inicialização (3,4 ms, contra 8,5 ms do Bun e 45,7 ms do Node), na saída de muitas linhas, nas exceções, em objetos que não escapam (substituição escalar), na recursão e nos laços numéricos, em `mandelbrot`, num objeto usado como dicionário (`dict_keys`, depois do índice por nome) e em strings.
 
-| | fly | Bun 1.4 | Node 22 | Python 3 |
-| --- | ---: | ---: | ---: | ---: |
-| tamanho do executável | **963 KB** | 107 MB | 123 MB | 6,5 MB |
-| inicialização (`-e 'console.log(1)'`) | **3,4 ms** | 8,6 ms | 42,7 ms | 20,6 ms |
-| memória de pico, 1M inteiros em array | **19 MB** | 57 MB | 81 MB | 49 MB |
+Perde nos programas em que o tempo está em acessos a propriedades e elementos de arrays e em chamadas de função: `life` e `nbody_objects` ficam em 0,10× e 0,06× do melhor dos outros, `method_calls` em 0,10×, e `matrix` e `sieve` perto de 0,25×. Pelo `callgrind`, o custo está nos auxiliares que cada acesso chama, que copiam e soltam valores com contagem de referências, e na busca de propriedade sem cache.
 
-**Leitura**: o fly ficou na frente do Bun e do Node em todas as cargas. A menor margem é a do `array`, com cerca de 1,35× sobre o Bun na mediana acima e cerca de 1,25× numa segunda medição, de 25 rodadas intercaladas (72 ms contra 90 ms). `fib` e o laço ficam perto de 2× e 2,4× sobre o Bun. Diferenças desse tamanho ainda dependem da máquina, então a medida mais estável é a contagem de instruções (`callgrind`), que não depende dela: sem PGO, o `array` caiu de 477 para 251 milhões de instruções (−47%) nesta etapa.
+**O objetivo de ser mais rápido em qualquer situação ainda não foi atingido**: 14 das 24 cargas ficam atrás de pelo menos um dos dois. O próximo passo para essas cargas é um JIT que compile acessos a arrays e propriedades para código nativo, com caches inline de propriedade e sem uma contagem de referências por leitura.
+
+| | fly | Bun 1.4 | Node 22 |
+| --- | ---: | ---: | ---: |
+| tamanho do executável | **1,1 MB** | 107 MB | 123 MB |
+| inicialização (`-e 'console.log(1)'`) | **3,4 ms** | 8,5 ms | 45,7 ms |
 
 **Build com PGO**: `scripts/pgo-build.sh` treina o binário com os próprios benchmarks e fixtures e recompila com esse perfil. Precisa do componente `llvm-tools` do rustup (`rustup component add llvm-tools`). Nesta etapa o ganho foi pequeno e desigual: cerca de 6% a 13% no `array`, e nenhum ganho claro em `fib` e no laço. O `cargo build --release` comum já fica perto.
 
