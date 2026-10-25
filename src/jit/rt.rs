@@ -43,6 +43,23 @@ unsafe fn enter(vm: &mut Vm, next_ip: usize, depth: usize) -> (*const Proto, usi
     (proto, base)
 }
 
+/// The helper's return for a call that ran its code to `status` (0 returned, 1 threw). The caller's
+/// frame is on top again, and native code continues from its base.
+///
+/// # Safety
+/// The frame of the caller must still be on the stack.
+unsafe fn finish_status(vm: &mut Vm, status: u64) -> HelperRet {
+    let base = vm.frames.last().map_or(0, |f| f.base);
+    HelperRet {
+        status: if status == 0 {
+            STATUS_DONE
+        } else {
+            STATUS_THREW
+        },
+        base: vm.stack.as_mut_ptr().add(base),
+    }
+}
+
 /// Turns an instruction's result into the helper's return value. `result` is the instruction
 /// that runs next, so anything other than `next` is a jump the native code must take. An
 /// exception is kept in `vm.pending` for the dispatcher to take.
@@ -91,6 +108,11 @@ pub unsafe extern "C" fn call(
 ) -> HelperRet {
     let vm = &mut *vm;
     enter(vm, ip + 1, depth);
+    if flags == 0 {
+        if let Some(status) = vm.call_in_place(argc) {
+            return finish_status(vm, status);
+        }
+    }
     let is_new = flags & (CALL_NEW as usize) != 0;
     let spread = flags & (CALL_SPREAD as usize) != 0;
     let result = vm.call_op(argc, is_new, spread).map(|()| ip + 1);

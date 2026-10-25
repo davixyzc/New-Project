@@ -133,7 +133,9 @@ fn same_value_zero(a: &Value, b: &Value) -> bool {
 }
 
 fn push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
-    let a = array_of(vm, &this)?;
+    let Value::Arr(a) = &this else {
+        return Err(vm.make_error("TypeError", "Array method called on a non-array"));
+    };
     let mut items = a.borrow_mut();
     match args {
         [v] => items.push(v.clone()),

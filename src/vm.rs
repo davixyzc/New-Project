@@ -135,7 +135,10 @@ impl Session {
             self.push_frame(vm);
         }
         // Between calls the stack ends at `base`, so the arguments and locals are pushed afresh.
-        for (i, v) in args.into_iter().enumerate() {
+        let args = std::mem::ManuallyDrop::new(args);
+        for i in 0..N {
+            // SAFETY: each argument is read once here, and `args` is never dropped.
+            let v = unsafe { std::ptr::read(&args[i]) };
             if i < self.nparams {
                 vm.stack.push(v);
             } else {
@@ -765,28 +768,41 @@ impl Vm {
     /// where `Session::call` takes it.
     #[inline]
     pub(crate) fn do_return(&mut self) {
-        let v = self.pop();
-        if let Some(top) = self.frames.last() {
-            if top.session {
-                let base = top.base;
-                self.truncate_stack(base);
-                forget_scalar(std::mem::replace(&mut self.stack[base - 2], v));
-                return;
-            }
-        }
-        let (base, ctor) = {
+        let (base, session, ctor) = {
             let top = self.frames.last().unwrap();
-            (top.base, top.ctor)
+            (top.base, top.session, top.ctor)
         };
+        if session {
+            let v = self.pop();
+            self.truncate_stack(base);
+            forget_scalar(std::mem::replace(&mut self.stack[base - 2], v));
+            return;
+        }
+        let len = self.stack.len();
         self.frames.pop();
-        // A constructor returns the object it was given, unless it returned an object itself.
-        let v = if ctor && !v.is_object() {
-            self.stack[base - 1].clone()
-        } else {
-            v
-        };
-        self.truncate_stack(base - 2);
-        self.stack.push(v);
+        // SAFETY: the result is the value at `len - 1`. The slots from the callee slot (`base - 2`)
+        // up to it belong to the frame: the owning ones are dropped, and the result is written into
+        // the callee slot, which the length then ends after.
+        unsafe {
+            let p = self.stack.as_mut_ptr();
+            let v = std::ptr::read(p.add(len - 1));
+            // A constructor returns the object it was given, unless it returned an object itself.
+            let v = if ctor && !v.is_object() {
+                let obj = (*p.add(base - 1)).clone();
+                drop(v);
+                obj
+            } else {
+                v
+            };
+            for i in (base - 2)..(len - 1) {
+                let slot = p.add(i);
+                if (*slot).owns_ref() {
+                    std::ptr::drop_in_place(slot);
+                }
+            }
+            std::ptr::write(p.add(base - 2), v);
+            self.stack.set_len(base - 1);
+        }
     }
 
     /// Runs the frame that is on top, and the frames it calls, until the frame at `base_depth`
@@ -829,6 +845,46 @@ impl Vm {
     }
 
     /// `Call`, `New` and the spread forms, for native code. The callee has finished when this returns.
+    /// A plain call (no `new`, no spread) of compiled code that takes exactly `argc` arguments, which
+    /// is the common case. Pushes the callee's frame and runs it. Returns the status the code
+    /// reported, or `None` when the call needs the general path.
+    #[inline(always)]
+    pub(crate) fn call_in_place(&mut self, argc: usize) -> Option<u64> {
+        let idx = self.stack.len() - argc - 2;
+        let closure: *const Closure = match &self.stack[idx] {
+            Value::Func(c) if c.proto.nparams as usize == argc && !c.proto.has_rest => {
+                Rc::as_ptr(c)
+            }
+            _ => return None,
+        };
+        if self.frames.len() >= MAX_FRAMES {
+            return None;
+        }
+        // SAFETY: the callee slot holds the closure, which owns its prototype, for as long as the
+        // frame runs.
+        let proto: *const Proto = unsafe { Rc::as_ptr(&(*closure).proto) };
+        let code = unsafe { (*proto).native() }?;
+        let base = idx + 2;
+        self.frames.push(Frame {
+            closure,
+            ip: 0,
+            base,
+            handlers: Vec::new(),
+            ctor: false,
+            session: false,
+        });
+        let target = base + unsafe { (*proto).nlocals as usize };
+        while self.stack.len() < target {
+            self.stack.push(Value::Undef);
+        }
+        let need = base + code.frame_len();
+        if need > self.stack.capacity() {
+            self.stack.reserve(need - self.stack.len());
+        }
+        // SAFETY: the stack has room for the frame, which was reserved above.
+        Some(unsafe { code.call(self as *mut Vm, self.stack.as_mut_ptr().add(base), 0) })
+    }
+
     pub(crate) fn call_op(&mut self, argc: usize, is_new: bool, spread: bool) -> Result<(), Value> {
         let argc = if spread {
             let list = self.pop();
