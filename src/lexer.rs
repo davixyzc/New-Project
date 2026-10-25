@@ -153,6 +153,11 @@ impl Lexer {
         Err(self.err(&format!("unexpected character '{}'", c)))
     }
 
+    /// True at a digit, or at an underscore between two digits (`1_000`).
+    fn digit_or_separator(&self) -> bool {
+        self.peek(0).is_ascii_digit() || (self.peek(0) == '_' && self.peek(1).is_ascii_digit())
+    }
+
     fn number(&mut self) -> Result<Tok, String> {
         if self.peek(0) == '0' && matches!(self.peek(1), 'b' | 'B' | 'o' | 'O') {
             let radix: u32 = if matches!(self.peek(1), 'b' | 'B') {
@@ -162,10 +167,15 @@ impl Lexer {
             };
             self.pos += 2;
             let start = self.pos;
-            while self.peek(0).is_digit(radix) {
+            while self.peek(0).is_digit(radix)
+                || (self.peek(0) == '_' && self.peek(1).is_digit(radix))
+            {
                 self.pos += 1;
             }
-            let digits: String = self.chars[start..self.pos].iter().collect();
+            let digits: String = self.chars[start..self.pos]
+                .iter()
+                .filter(|c| **c != '_')
+                .collect();
             return u64::from_str_radix(&digits, radix)
                 .map(|n| Tok::Num(n as f64))
                 .map_err(|_| self.err("invalid binary or octal literal"));
@@ -173,21 +183,26 @@ impl Lexer {
         if self.peek(0) == '0' && matches!(self.peek(1), 'x' | 'X') {
             self.pos += 2;
             let start = self.pos;
-            while self.peek(0).is_ascii_hexdigit() {
+            while self.peek(0).is_ascii_hexdigit()
+                || (self.peek(0) == '_' && self.peek(1).is_ascii_hexdigit())
+            {
                 self.pos += 1;
             }
-            let digits: String = self.chars[start..self.pos].iter().collect();
+            let digits: String = self.chars[start..self.pos]
+                .iter()
+                .filter(|c| **c != '_')
+                .collect();
             return u64::from_str_radix(&digits, 16)
                 .map(|n| Tok::Num(n as f64))
                 .map_err(|_| self.err("invalid hex literal"));
         }
         let start = self.pos;
-        while self.peek(0).is_ascii_digit() {
+        while self.digit_or_separator() {
             self.pos += 1;
         }
         if self.peek(0) == '.' {
             self.pos += 1;
-            while self.peek(0).is_ascii_digit() {
+            while self.digit_or_separator() {
                 self.pos += 1;
             }
         }
@@ -197,11 +212,15 @@ impl Lexer {
                 || (matches!(after_e, '+' | '-') && self.peek(2).is_ascii_digit()));
         if exp_ok {
             self.pos += 2;
-            while self.peek(0).is_ascii_digit() {
+            while self.digit_or_separator() {
                 self.pos += 1;
             }
         }
-        let mut text: String = self.chars[start..self.pos].iter().collect();
+        // Underscores only separate digits (`1_000`), so they are dropped before the number is read.
+        let mut text: String = self.chars[start..self.pos]
+            .iter()
+            .filter(|c| **c != '_')
+            .collect();
         if text.ends_with('.') {
             text.push('0');
         }

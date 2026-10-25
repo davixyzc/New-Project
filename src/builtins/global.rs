@@ -102,6 +102,39 @@ pub static OBJECT: &[NativeDef] = &[
     },
 ];
 
+/// The methods that every object has, from the built-in `Object.prototype`. A lookup finds them after the chain of the
+/// object, so a class can replace them.
+const OBJECT_METHODS: &[NativeDef] = &[
+    NativeDef {
+        name: "hasOwnProperty",
+        func: has_own_property,
+    },
+    NativeDef {
+        name: "toString",
+        func: object_to_string,
+    },
+];
+
+/// The method called `name` of `Object.prototype`, if there is one.
+pub fn object_method(name: &str) -> Option<&'static NativeDef> {
+    OBJECT_METHODS.iter().find(|d| d.name == name)
+}
+
+fn has_own_property(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let key = to_str(&arg(args, 0));
+    Ok(Value::Bool(match &this {
+        Value::Obj(o) => o.borrow().position(&key).is_some(),
+        Value::Arr(a) => {
+            key == "length" || key.parse::<usize>().is_ok_and(|i| i < a.borrow().len())
+        }
+        _ => false,
+    }))
+}
+
+fn object_to_string(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::from_string(to_str(&this)))
+}
+
 pub static ARRAY: &[NativeDef] = &[
     NativeDef {
         name: "isArray",

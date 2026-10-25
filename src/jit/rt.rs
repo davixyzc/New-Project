@@ -612,6 +612,7 @@ fn array_prop(a: &ArrRef, name: &str) -> Value {
         Value::Num(a.borrow().len() as f64)
     } else {
         builtins::array::method(name)
+            .or_else(|| builtins::global::object_method(name))
             .map(Value::Native)
             .unwrap_or(Value::Undef)
     }

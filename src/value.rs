@@ -433,8 +433,16 @@ pub fn lookup(obj: &ObjRef, name: &str) -> Lookup {
         };
         match next {
             Some(p) => cur = p,
-            None => return Lookup::Missing,
+            None => return end_of_chain(name),
         }
+    }
+}
+
+/// What a lookup finds once the prototype chain of an object has ended: the methods of `Object.prototype`.
+fn end_of_chain(name: &str) -> Lookup {
+    match crate::builtins::global::object_method(name) {
+        Some(def) => Lookup::Data(Value::Native(def)),
+        None => Lookup::Missing,
     }
 }
 
@@ -454,7 +462,7 @@ pub fn lookup_hinted(obj: &ObjRef, key: &Rc<str>, hint: &Cell<u32>) -> Lookup {
     };
     match next {
         Some(p) => lookup(&p, key),
-        None => Lookup::Missing,
+        None => end_of_chain(key),
     }
 }
 

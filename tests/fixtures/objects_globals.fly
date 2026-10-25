@@ -1,0 +1,17 @@
+console.log(1_000_000, 0.000_1, 1e1_0, 0xff_ff);
+{
+  const o = { a: 1 };
+  console.log(o.hasOwnProperty("a"), o.hasOwnProperty("b"), [1].hasOwnProperty(0), [1].hasOwnProperty("length"), [1].hasOwnProperty(3));
+  console.log({}.toString(), String({}), new Map().toString());
+  class A {
+    toString() {
+      return "A!";
+    }
+  }
+  console.log(new A().toString(), `${new A()}`, new A().hasOwnProperty("toString"));
+}
+console.log(typeof globalThis.Math, globalThis.Math.PI > 3, typeof globalThis.console, typeof globalThis.nothingHere);
+function check(arr) {
+  return arr.hasOwnProperty(0);
+}
+for (let i = 0; i < 3; i++) console.log(check([i]));

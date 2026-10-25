@@ -32,6 +32,17 @@ pub fn install(vm: &mut Vm) {
     vm.set_global("require", Value::Native(&global::REQUIRE));
     vm.set_global("NaN", Value::Num(f64::NAN));
     vm.set_global("Infinity", Value::Num(f64::INFINITY));
+    // `globalThis` holds the built-in globals. Its properties are copies, so assigning to it does not change a global.
+    let mut props = crate::value::Props::default();
+    for (name, value) in vm.globals.iter() {
+        if !name.starts_with('%') {
+            props.push(name.clone(), value.clone());
+        }
+    }
+    vm.set_global(
+        "globalThis",
+        Value::Obj(std::rc::Rc::new(std::cell::RefCell::new(props))),
+    );
 }
 
 /// The definition called `name` in a table of built-in methods. `index` holds the table sorted by name. It is built
