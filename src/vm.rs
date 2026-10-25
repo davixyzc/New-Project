@@ -458,6 +458,21 @@ fn put(slot: &mut Value, v: Value) {
     }
 }
 
+/// The array index a property name spells, such as "2" but not "02" or "-1": digits without a leading zero,
+/// below the array size limit.
+fn array_key_index(name: &str) -> Option<usize> {
+    let digits = name.as_bytes();
+    let canonical = !digits.is_empty()
+        && digits.len() <= 10
+        && digits.iter().all(u8::is_ascii_digit)
+        && (digits[0] != b'0' || digits.len() == 1);
+    if canonical {
+        name.parse::<usize>().ok().filter(|&i| i < MAX_ARRAY_GROW)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn index_of(n: f64) -> Option<usize> {
     if n >= 0.0 && n < MAX_ARRAY_GROW as f64 && n as usize as f64 == n {
         Some(n as usize)
@@ -1897,13 +1912,14 @@ impl Vm {
             Value::Num(_) => string::number_method(name)
                 .map(Value::Native)
                 .unwrap_or(Value::Undef),
-            Value::Func(c) => {
-                if name == "name" {
-                    Value::str(&c.proto.name)
-                } else {
-                    Value::Undef
+            Value::Func(c) => match name {
+                "name" => Value::str(&c.proto.name),
+                // The parameters before a rest parameter, which is what `length` counts.
+                "length" => {
+                    Value::Num(c.proto.nparams.saturating_sub(u32::from(c.proto.has_rest)) as f64)
                 }
-            }
+                _ => Value::Undef,
+            },
             Value::Native(d) => {
                 if name == "name" {
                     Value::str(d.name)
@@ -1942,6 +1958,11 @@ impl Vm {
     }
 
     pub fn get_index(&mut self, obj: &Value, key: &Value) -> Result<Value, Value> {
+        if let (Value::Arr(a), Value::Str(k)) = (obj, key) {
+            if let Some(i) = array_key_index(k) {
+                return Ok(a.borrow().get(i).cloned().unwrap_or(Value::Undef));
+            }
+        }
         match (obj, key) {
             (Value::Arr(a), Value::Num(n)) => {
                 let a = a.borrow();
@@ -1965,6 +1986,11 @@ impl Vm {
     }
 
     pub fn set_index(&mut self, obj: &Value, key: &Value, v: Value) -> Result<(), Value> {
+        if let (Value::Arr(_), Value::Str(k)) = (obj, key) {
+            if let Some(i) = array_key_index(k) {
+                return self.set_index(obj, &Value::Num(i as f64), v);
+            }
+        }
         if let (Value::Arr(a), Value::Num(n)) = (obj, key) {
             let i = match index_of(*n) {
                 Some(i) => i,

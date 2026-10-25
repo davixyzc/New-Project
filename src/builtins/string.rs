@@ -426,6 +426,102 @@ fn to_fixed_text(x: f64, digits: usize) -> String {
     }
 }
 
-fn number_to_string(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
-    Ok(Value::str(&num_to_string(to_num(&this))))
+fn number_to_string(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let n = to_num(&this);
+    let radix = match arg(args, 0) {
+        Value::Undef => 10.0,
+        r => to_num(&r).trunc(),
+    };
+    if !(2.0..=36.0).contains(&radix) {
+        return Err(vm.make_error(
+            "RangeError",
+            "toString() radix argument must be between 2 and 36",
+        ));
+    }
+    if radix == 10.0 {
+        return Ok(Value::str(&num_to_string(n)));
+    }
+    Ok(Value::str(&num_to_radix(n, radix as u32)))
+}
+
+/// `Number.prototype.toString(radix)` for a radix other than 10, as V8 writes it: the integer digits are exact, and
+/// the fraction gets digits only until they name the number to within half the gap to the next double.
+fn num_to_radix(value: f64, radix: u32) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    let base = f64::from(radix);
+    let magnitude = value.abs();
+    let mut integer = magnitude.floor();
+    let mut fraction = magnitude - integer;
+    let mut delta =
+        (0.5 * (f64::from_bits(magnitude.to_bits() + 1) - magnitude)).max(f64::from_bits(1));
+    let mut frac_digits: Vec<u8> = Vec::new();
+    if fraction >= delta {
+        loop {
+            fraction *= base;
+            delta *= base;
+            let digit = fraction as u32;
+            frac_digits.push(DIGITS[digit as usize]);
+            fraction -= f64::from(digit);
+            if (fraction > 0.5 || (fraction == 0.5 && digit & 1 == 1)) && fraction + delta > 1.0 {
+                // Round up, carrying through the digits that are already written.
+                loop {
+                    match frac_digits.pop() {
+                        None => {
+                            integer += 1.0;
+                            break;
+                        }
+                        Some(c) => {
+                            let d = if c > b'9' {
+                                u32::from(c - b'a') + 10
+                            } else {
+                                u32::from(c - b'0')
+                            };
+                            if d + 1 < radix {
+                                frac_digits.push(DIGITS[(d + 1) as usize]);
+                                break;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            if fraction < delta {
+                break;
+            }
+        }
+    }
+    // Digits a double cannot tell apart (beyond 2^53) are written as zeros, as V8 does.
+    let mut int_digits: Vec<u8> = Vec::new();
+    while integer / base >= 9_007_199_254_740_992.0 {
+        integer /= base;
+        int_digits.push(b'0');
+    }
+    loop {
+        let remainder = integer % base;
+        int_digits.push(DIGITS[remainder as usize]);
+        integer = (integer - remainder) / base;
+        if integer <= 0.0 {
+            break;
+        }
+    }
+    int_digits.reverse();
+    let mut text = String::new();
+    if value < 0.0 {
+        text.push('-');
+    }
+    text.push_str(std::str::from_utf8(&int_digits).unwrap_or("0"));
+    if !frac_digits.is_empty() {
+        text.push('.');
+        text.push_str(std::str::from_utf8(&frac_digits).unwrap_or(""));
+    }
+    text
 }

@@ -463,13 +463,31 @@ fn is_array(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> 
     Ok(Value::Bool(matches!(arg(args, 0), Value::Arr(_))))
 }
 
-fn array_from(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+/// `Array.from(source, mapFn)`: the items of an array or string, or the first `length` properties of an
+/// array-like object. A mapping function then replaces each item by its result.
+fn array_from(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let items = match arg(args, 0) {
         Value::Arr(a) => a.borrow().clone(),
-        Value::Str(s) => s.chars().map(|c| Value::str(&c.to_string())).collect(),
+        Value::Str(s) => s.chars().map(crate::value::char_value).collect(),
+        Value::Obj(o) => {
+            let len = to_num(&crate::value::obj_get(&o, "length").unwrap_or(Value::Undef));
+            let len = if len.is_nan() {
+                0.0
+            } else {
+                len.trunc().clamp(0.0, crate::vm::MAX_ARRAY_GROW as f64)
+            };
+            (0..len as usize)
+                .map(|i| crate::value::obj_get(&o, &i.to_string()).unwrap_or(Value::Undef))
+                .collect()
+        }
         _ => Vec::new(),
     };
-    Ok(Value::arr(items))
+    match arg(args, 1) {
+        f @ (Value::Func(_) | Value::Native(_)) => {
+            crate::builtins::array::map_items(vm, Value::arr(items), &f)
+        }
+        _ => Ok(Value::arr(items)),
+    }
 }
 
 fn date_now(_vm: &mut Vm, _this: Value, _args: &[Value]) -> Result<Value, Value> {

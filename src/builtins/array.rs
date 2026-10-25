@@ -275,6 +275,11 @@ fn reverse(vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(this)
 }
 
+/// `map` of an array held in `items`, with `f` as the callback. Used by `Array.from` for its mapping function.
+pub fn map_items(vm: &mut Vm, items: Value, f: &Value) -> Result<Value, Value> {
+    map(vm, items, &[f.clone()])
+}
+
 fn map(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let a = array_of(vm, &this)?;
     let mut cb = Callback::new(vm, &arg(args, 0), arg(args, 1));
