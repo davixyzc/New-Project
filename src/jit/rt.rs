@@ -7,7 +7,9 @@ use std::rc::Rc;
 
 use crate::builtins;
 use crate::bytecode::Proto;
-use crate::value::{obj_get_hinted, obj_put, obj_put_hinted, ArrRef, JsStr, Value};
+use crate::value::{
+    find_setter, lookup_hinted, obj_put, obj_put_hinted, ArrRef, JsStr, Lookup, Value,
+};
 use crate::vm::Vm;
 
 use super::{call_numbers, numbers_arity, MAX_NUMBER_ARGS};
@@ -287,11 +289,18 @@ pub unsafe extern "C" fn get_prop_into(
     hint: *const Cell<u32>,
 ) -> bool {
     match &*src {
-        Value::Obj(o) => {
-            let v = obj_get_hinted(o, &*name, &*hint).unwrap_or(Value::Undef);
-            ptr::write(dst, v);
-            true
-        }
+        Value::Obj(o) => match lookup_hinted(o, &*name, &*hint) {
+            Lookup::Data(v) => {
+                ptr::write(dst, v);
+                true
+            }
+            Lookup::Missing => {
+                ptr::write(dst, Value::Undef);
+                true
+            }
+            // A getter is run by the interpreter, which the caller falls back to.
+            Lookup::Getter(_) => false,
+        },
         Value::Arr(a) => {
             ptr::write(dst, array_prop(a, &*name));
             true
@@ -315,7 +324,11 @@ pub unsafe extern "C" fn get_prop_top(
     hint: *const Cell<u32>,
 ) -> bool {
     let v = match &*slot {
-        Value::Obj(o) => obj_get_hinted(o, &*name, &*hint).unwrap_or(Value::Undef),
+        Value::Obj(o) => match lookup_hinted(o, &*name, &*hint) {
+            Lookup::Data(v) => v,
+            Lookup::Missing => Value::Undef,
+            Lookup::Getter(_) => return false,
+        },
         Value::Arr(a) => array_prop(a, &*name),
         Value::Str(s) => string_prop(s, &*name),
         _ => return false,
@@ -370,6 +383,10 @@ pub unsafe extern "C" fn set_prop_top(
     let Value::Obj(o) = &*obj else {
         return false;
     };
+    // An assignment that a setter on the prototype chain catches runs in the interpreter.
+    if o.borrow().proto.is_some() && find_setter(o, &**name).is_some() {
+        return false;
+    }
     obj_put_hinted(o, &*name, (*val).clone(), &*hint);
     *obj = ptr::read(val);
     true

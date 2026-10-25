@@ -97,6 +97,15 @@ const SET_METHODS: &[NativeDef] = &[
     },
 ];
 
+/// Whether `props` is a Map, for the constructor `Map`, or a Set, for `Set`. Any other pair is false.
+pub fn is_instance(props: &Props, ctor: &NativeDef) -> bool {
+    match props.collection.as_deref() {
+        Some(c) if std::ptr::eq(ctor, &MAP) => !c.is_set,
+        Some(c) if std::ptr::eq(ctor, &SET) => c.is_set,
+        _ => false,
+    }
+}
+
 /// The property `name` of an object that is a Map or a Set and has no own property of that name: its `size`, or one of
 /// its methods.
 pub fn property(props: &Props, name: &str) -> Option<Value> {

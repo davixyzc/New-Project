@@ -1,7 +1,7 @@
 //! `console.*` and the value formatting used by `console.log`.
 
 use crate::collection::Collection;
-use crate::value::{num_to_string, obj_get, NativeDef, Value};
+use crate::value::{class_name, num_to_string, obj_get, NativeDef, Value};
 use crate::vm::Vm;
 
 pub static METHODS: &[NativeDef] = &[
@@ -87,14 +87,16 @@ pub fn inspect(v: &Value, top: bool, depth: usize) -> String {
             if let Some(c) = &props.collection {
                 return collection_text(c, depth);
             }
+            // An instance is printed with the name of its class, as Node.js prints it.
+            let prefix = class_name(&props).map_or(String::new(), |n| format!("{} ", n));
             if props.is_empty() {
-                return "{}".to_string();
+                return format!("{}{{}}", prefix);
             }
             let parts: Vec<String> = props
                 .iter()
                 .map(|(k, val)| format!("{}: {}", key_text(k), inspect(val, false, depth + 1)))
                 .collect();
-            format!("{{ {} }}", parts.join(", "))
+            format!("{}{{ {} }}", prefix, parts.join(", "))
         }
         Value::Func(c) => {
             if c.proto.name.is_empty() {

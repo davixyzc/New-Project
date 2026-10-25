@@ -284,7 +284,18 @@ fn scan_expr(e: &Expr, nested: bool, out: &mut HashSet<String>) {
                 scan_expr(a, nested, out);
             }
         }
-        Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::Undef | Expr::This => {}
+        Expr::SuperCall(args) => {
+            for a in args {
+                scan_expr(a, nested, out);
+            }
+        }
+        Expr::SuperMember(_)
+        | Expr::Num(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undef
+        | Expr::This => {}
     }
 }
 
@@ -308,7 +319,12 @@ fn is_pure(e: &Expr) -> bool {
         }
         Expr::Cond(a, b, c) => is_pure(a) && is_pure(b) && is_pure(c),
         Expr::Sequence(items) => items.iter().all(is_pure),
-        Expr::Update { .. } | Expr::Assign(..) | Expr::Call(..) | Expr::New(..) => false,
+        Expr::Update { .. }
+        | Expr::Assign(..)
+        | Expr::Call(..)
+        | Expr::New(..)
+        | Expr::SuperMember(_)
+        | Expr::SuperCall(_) => false,
     }
 }
 
@@ -337,6 +353,8 @@ fn may_assign(e: &Expr) -> bool {
         Expr::Call(callee, args) | Expr::New(callee, args) => {
             may_assign(callee) || args.iter().any(may_assign)
         }
+        Expr::SuperCall(args) => args.iter().any(may_assign),
+        Expr::SuperMember(_) => false,
     }
 }
 
@@ -374,6 +392,7 @@ fn binop(op: &str) -> Op {
         ">>" => Op::Shr,
         ">>>" => Op::UShr,
         "in" => Op::In,
+        "instanceof" => Op::InstanceOf,
         _ => unreachable!("unknown binary operator {}", op),
     }
 }
@@ -1454,6 +1473,12 @@ impl Compiler {
                             }
                         }
                     }
+                    Expr::SuperMember(name) => {
+                        // A method of `super` runs with the `this` of the running method.
+                        let c = self.name_const(name);
+                        self.emit(Op::GetSuper(c));
+                        self.emit(Op::This);
+                    }
                     Expr::Index(obj, key) => {
                         self.expr(obj)?;
                         self.emit(Op::Dup);
@@ -1472,6 +1497,16 @@ impl Compiler {
                 self.expr(callee)?;
                 self.emit(Op::Undef);
                 self.call_args(args, Op::New, Op::NewSpread)?;
+            }
+            Expr::SuperMember(name) => {
+                let c = self.name_const(name);
+                self.emit(Op::GetSuper(c));
+            }
+            Expr::SuperCall(args) => {
+                // The superclass is called with this object as `this`, as the constructor of a derived class does.
+                self.emit(Op::GetSuperCtor);
+                self.emit(Op::This);
+                self.call_args(args, Op::Call, Op::CallSpread)?;
             }
             Expr::Spread(_) => {
                 return Err(

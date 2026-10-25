@@ -1,6 +1,8 @@
 //! Array methods. Callbacks run through `Vm::call`, and no `RefCell` borrow is held across a call.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::rc::Rc;
 
 use crate::builtins::arg;
 use crate::value::{join_items, strict_eq, to_num, to_str, truthy, ArrRef, NativeDef, Value};
@@ -228,6 +230,20 @@ fn join(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
         Value::Undef => ",".to_string(),
         v => to_str(&v),
     };
+    // Objects are converted by their `toString` (see `Vm::to_text`), so an array that holds one is converted first.
+    let has_objects = a.borrow().iter().any(|v| matches!(v, Value::Obj(_)));
+    if has_objects {
+        let items = a.borrow().clone();
+        let mut texts = Vec::with_capacity(items.len());
+        for v in &items {
+            texts.push(match v {
+                Value::Obj(_) => Value::from_string(vm.to_text(v)?),
+                other => other.clone(),
+            });
+        }
+        let converted: ArrRef = Rc::new(RefCell::new(texts));
+        return Ok(Value::from_string(join_items(&converted, &sep, None)));
+    }
     Ok(Value::from_string(join_items(&a, &sep, None)))
 }
 

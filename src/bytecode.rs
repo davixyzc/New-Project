@@ -143,6 +143,12 @@ pub enum Op {
     /// Replaces a Map or a Set by the items that `for...of` walks (see `collection::items_of`). An array or a string
     /// stays as it is, and any other value that is not iterable throws.
     ToItems,
+    /// `super.name`: the property `name` on the prototype of the object that the running method was defined on.
+    GetSuper(u32),
+    /// `super(...)`: pushes the superclass of the running constructor. The call gets the same `this`.
+    GetSuperCtor,
+    /// `value instanceof ctor`: pops the constructor and the value, and pushes whether the value is an instance.
+    InstanceOf,
     // exceptions
     Throw,
     PushHandler(u32),

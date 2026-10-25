@@ -1,6 +1,6 @@
 //! Runtime values and the conversion and comparison rules that operate on them.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, RefMut};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
@@ -18,6 +18,18 @@ pub struct Props {
     index: Option<NameMap<usize>>,
     /// The entries of a Map or a Set, for an object that is one (see `builtins::collections`).
     pub collection: Option<Box<Collection>>,
+    /// The object that a lookup continues with when this one does not have the name: the prototype of an instance.
+    pub proto: Option<ObjRef>,
+    /// The accessor properties, which a lookup finds after the data properties of the object.
+    pub accessors: Option<Box<Vec<Accessor>>>,
+}
+
+/// A getter and a setter under one name. Either of them may be missing.
+#[derive(Clone)]
+pub struct Accessor {
+    pub name: Rc<str>,
+    pub get: Option<Value>,
+    pub set: Option<Value>,
 }
 
 /// From this many properties on, an object gets an index by name.
@@ -29,6 +41,8 @@ impl Props {
             items: Vec::with_capacity(capacity),
             index: None,
             collection: None,
+            proto: None,
+            accessors: None,
         }
     }
 
@@ -81,6 +95,33 @@ impl Props {
         Some(i)
     }
 
+    /// The accessor property called `name` of this object, not of its prototype.
+    pub fn accessor(&self, name: &str) -> Option<&Accessor> {
+        self.accessors.as_ref()?.iter().find(|a| &*a.name == name)
+    }
+
+    /// Sets the getter, or the setter when `setter` is true, of the accessor property `name`, which is made when it is
+    /// not there yet.
+    pub fn set_accessor(&mut self, name: &Rc<str>, setter: bool, f: Value) {
+        let list = self.accessors.get_or_insert_with(Default::default);
+        let i = match list.iter().position(|a| *a.name == **name) {
+            Some(i) => i,
+            None => {
+                list.push(Accessor {
+                    name: name.clone(),
+                    get: None,
+                    set: None,
+                });
+                list.len() - 1
+            }
+        };
+        if setter {
+            list[i].set = Some(f);
+        } else {
+            list[i].get = Some(f);
+        }
+    }
+
     /// Adds a property, which the caller has checked is not there yet.
     pub fn push(&mut self, key: Rc<str>, v: Value) {
         if let Some(index) = &mut self.index {
@@ -124,6 +165,55 @@ pub struct Closure {
     pub upvals: Vec<Rc<RefCell<Value>>>,
     /// `this` captured at creation time; only used by arrow functions.
     pub this: Value,
+    /// What the function holds as a class or as a constructor (see `ClassInfo`). Most functions hold none.
+    pub class: RefCell<Option<Box<ClassInfo>>>,
+}
+
+/// What a class, or a function that is used as a constructor, holds beyond its code.
+#[derive(Default)]
+pub struct ClassInfo {
+    /// The object that the method was defined on: the prototype for an instance method, and the statics for a static
+    /// one. `super` looks up the property on the prototype of this object.
+    pub home: Option<ObjRef>,
+    /// The prototype of the objects that `new` makes, which holds the methods. It is made when it is first needed.
+    pub prototype: Option<ObjRef>,
+    /// The static members, which are looked up on the function.
+    pub statics: Option<ObjRef>,
+    /// The superclass, which `super(...)` calls.
+    pub parent: Option<Value>,
+}
+
+impl Closure {
+    /// The class data, made when it is first changed.
+    pub fn info_mut(&self) -> RefMut<'_, ClassInfo> {
+        RefMut::map(self.class.borrow_mut(), |c| {
+            &mut **c.get_or_insert_with(Default::default)
+        })
+    }
+
+    /// The prototype of the objects that `new` makes with this function. It is made when it is first needed, and it
+    /// has the function as its `constructor`.
+    pub fn instance_proto(self: &Rc<Self>) -> ObjRef {
+        let existing = self.info_mut().prototype.clone();
+        if let Some(p) = existing {
+            return p;
+        }
+        let p = new_obj(None);
+        obj_put(&p, &intern_name("constructor"), Value::Func(self.clone()));
+        self.info_mut().prototype = Some(p.clone());
+        p
+    }
+
+    /// The static members of the function, made when they are first set.
+    pub fn statics(&self) -> ObjRef {
+        let existing = self.info_mut().statics.clone();
+        if let Some(s) = existing {
+            return s;
+        }
+        let s = new_obj(None);
+        self.info_mut().statics = Some(s.clone());
+        s
+    }
 }
 
 /// The text of a string value. It keeps its character count and whether every character is ASCII, so `length` and
@@ -243,6 +333,11 @@ impl Value {
         Value::Obj(Rc::new(RefCell::new(Props::with_capacity(capacity))))
     }
 
+    /// A new object whose prototype is `proto`, which is what `new` makes for a constructor.
+    pub fn obj_with_proto(proto: ObjRef) -> Value {
+        Value::Obj(new_obj(Some(proto)))
+    }
+
     pub fn is_object(&self) -> bool {
         matches!(
             self,
@@ -282,13 +377,108 @@ pub fn obj_put(obj: &ObjRef, key: &Rc<str>, v: Value) {
     }
 }
 
-/// Reads an own property using a shared key, trying the position in `hint` first (see `Props::position_hinted`).
-/// Names from the same source share one allocation (see `intern_name`), so the pointer decides almost every lookup.
-pub fn obj_get_hinted(obj: &ObjRef, key: &Rc<str>, hint: &Cell<u32>) -> Option<Value> {
-    let props = obj.borrow();
-    match props.position_hinted(key, hint) {
-        Some(i) => Some(props.value(i).clone()),
-        None => crate::builtins::collections::property(&props, key),
+/// What a property lookup finds along a prototype chain.
+pub enum Lookup {
+    /// A data property, or the method or the size of a Map or a Set.
+    Data(Value),
+    /// An accessor with a getter. The caller runs it, with the object the lookup started from as `this`.
+    Getter(Value),
+    /// No object on the chain has the name.
+    Missing,
+}
+
+/// The property `name` of one object, not counting its prototype. None when the object does not have it.
+fn own_lookup(props: &Props, name: &str) -> Option<Lookup> {
+    if let Some(i) = props.position(name) {
+        return Some(Lookup::Data(props.value(i).clone()));
+    }
+    if let Some(v) = crate::builtins::collections::property(props, name) {
+        return Some(Lookup::Data(v));
+    }
+    let accessor = props.accessor(name)?;
+    Some(match &accessor.get {
+        Some(getter) => Lookup::Getter(getter.clone()),
+        None => Lookup::Data(Value::Undef),
+    })
+}
+
+/// The property `name` of `obj`, looked up on the object and then along its prototype chain.
+pub fn lookup(obj: &ObjRef, name: &str) -> Lookup {
+    let mut cur = obj.clone();
+    loop {
+        let next = {
+            let props = cur.borrow();
+            if let Some(found) = own_lookup(&props, name) {
+                return found;
+            }
+            props.proto.clone()
+        };
+        match next {
+            Some(p) => cur = p,
+            None => return Lookup::Missing,
+        }
+    }
+}
+
+/// `lookup` for a property read by native code, which tries the position in `hint` first on `obj` itself (see
+/// `Props::position_hinted`). Names from the same source share one allocation (see `intern_name`), so the pointer
+/// decides almost every lookup.
+pub fn lookup_hinted(obj: &ObjRef, key: &Rc<str>, hint: &Cell<u32>) -> Lookup {
+    let next = {
+        let props = obj.borrow();
+        if let Some(i) = props.position_hinted(key, hint) {
+            return Lookup::Data(props.value(i).clone());
+        }
+        if let Some(found) = own_lookup(&props, key) {
+            return found;
+        }
+        props.proto.clone()
+    };
+    match next {
+        Some(p) => lookup(&p, key),
+        None => Lookup::Missing,
+    }
+}
+
+/// The setter that an assignment to `name` on `obj` runs, when the name is an accessor on the object or on its chain
+/// before any data property of that name. `Some(None)` is an accessor without a setter, which ignores the assignment.
+/// None means that the assignment stores a data property on `obj` itself.
+pub fn find_setter(obj: &ObjRef, name: &str) -> Option<Option<Value>> {
+    let mut cur = obj.clone();
+    loop {
+        let next = {
+            let props = cur.borrow();
+            if props.position(name).is_some() {
+                return None;
+            }
+            if let Some(accessor) = props.accessor(name) {
+                return Some(accessor.set.clone());
+            }
+            props.proto.clone()
+        };
+        match next {
+            Some(p) => cur = p,
+            None => return None,
+        }
+    }
+}
+
+/// A new object with no own properties, whose prototype is `proto`.
+pub fn new_obj(proto: Option<ObjRef>) -> ObjRef {
+    Rc::new(RefCell::new(Props {
+        proto,
+        ..Props::default()
+    }))
+}
+
+/// The name of the class of an object, which is the name of the `constructor` of its prototype. None when the object
+/// has no prototype with a named constructor.
+pub fn class_name(props: &Props) -> Option<String> {
+    let proto = props.proto.as_ref()?;
+    let p = proto.borrow();
+    match p.position("constructor").map(|i| p.value(i)) {
+        Some(Value::Func(c)) if !c.proto.name.is_empty() => Some(c.proto.name.clone()),
+        _ => None,
     }
 }
 

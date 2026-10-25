@@ -139,6 +139,8 @@ pub(super) fn delta(op: Op) -> i32 {
         | Op::GetLocal(_)
         | Op::GetBoxed(_)
         | Op::GetLocalProp(..)
+        | Op::GetSuper(_)
+        | Op::GetSuperCtor
         | Op::AddLK(..)
         | Op::SubLK(..)
         | Op::MulLK(..)
@@ -174,6 +176,7 @@ pub(super) fn delta(op: Op) -> i32 {
         | Op::Shr
         | Op::UShr
         | Op::In
+        | Op::InstanceOf
         | Op::Eq
         | Op::Ne
         | Op::StrictEq

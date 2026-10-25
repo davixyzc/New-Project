@@ -627,6 +627,7 @@ impl Vm {
             proto: Rc::new(proto),
             upvals: Vec::new(),
             this: Value::Undef,
+            class: Default::default(),
         }));
         let args = [
             exports,
@@ -841,7 +842,7 @@ impl Vm {
             Value::Func(c) => {
                 if is_new {
                     let n = self.stack.len();
-                    self.stack[n - argc - 1] = Value::obj();
+                    self.stack[n - argc - 1] = Value::obj_with_proto(c.instance_proto());
                 }
                 self.enter(c, argc, is_new)
             }
@@ -1463,7 +1464,12 @@ impl Vm {
                 let name: &str = &proto.names[n as usize];
                 let idx = base + s as usize;
                 let direct = match self.local(idx) {
-                    Value::Obj(o) => Some(obj_get(o, name).unwrap_or(Value::Undef)),
+                    Value::Obj(o) => match lookup(o, name) {
+                        Lookup::Data(v) => Some(v),
+                        Lookup::Missing => Some(Value::Undef),
+                        // A getter runs through `get_prop`, below.
+                        Lookup::Getter(_) => None,
+                    },
                     _ => None,
                 };
                 let v = match direct {
@@ -1594,6 +1600,30 @@ impl Vm {
                 self.local_set_index(base + s as usize, &key, v.clone())?;
                 self.stack.push(v);
             }
+            Op::GetSuper(i) => {
+                self.sync_ip(ip);
+                let v = self.super_prop(&proto.names[i as usize])?;
+                self.stack.push(v);
+            }
+            Op::GetSuperCtor => {
+                let parent = match self.frames.last() {
+                    Some(f) => f
+                        .closure()
+                        .class
+                        .borrow()
+                        .as_ref()
+                        .and_then(|i| i.parent.clone()),
+                    None => None,
+                };
+                self.stack.push(parent.unwrap_or(Value::Undef));
+            }
+            Op::InstanceOf => {
+                self.sync_ip(ip);
+                let ctor = self.pop();
+                let v = self.pop();
+                let found = self.instance_of(&v, &ctor)?;
+                self.stack.push(Value::Bool(found));
+            }
             Op::SetIndex2Local(s) => {
                 self.sync_ip(ip);
                 let v = self.pop();
@@ -1606,7 +1636,14 @@ impl Vm {
             Op::Add => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Num(x + y)),
                 None => {
-                    let (a, b) = self.pop_pair();
+                    self.sync_ip(ip);
+                    let (mut a, mut b) = self.pop_pair();
+                    if matches!(a, Value::Obj(_)) {
+                        a = Value::from_string(self.to_text(&a)?);
+                    }
+                    if matches!(b, Value::Obj(_)) {
+                        b = Value::from_string(self.to_text(&b)?);
+                    }
                     if joins_too_long(&a, &b) {
                         return Err(self.make_error("RangeError", "Invalid string length"));
                     }
@@ -1649,7 +1686,7 @@ impl Vm {
                 let (key, target) = self.pop_pair();
                 let name = to_str(&key);
                 let found = match &target {
-                    Value::Obj(o) => o.borrow().position(&name).is_some(),
+                    Value::Obj(o) => !matches!(lookup(o, &name), Lookup::Missing),
                     Value::Arr(a) => {
                         let len = a.borrow().len();
                         match &key {
@@ -1752,10 +1789,11 @@ impl Vm {
                 self.stack.push(Value::str(type_of(&a)));
             }
             Op::ToStr => {
+                self.sync_ip(ip);
                 let a = self.pop();
                 let s = match a {
                     Value::Str(_) => a,
-                    other => Value::str(&to_str(&other)),
+                    other => Value::from_string(self.to_text(&other)?),
                 };
                 self.stack.push(s);
             }
@@ -1891,6 +1929,7 @@ impl Vm {
                     proto: child,
                     upvals,
                     this,
+                    class: Default::default(),
                 })));
             }
             Op::NewArray => self.stack.push(Value::arr(Vec::new())),
@@ -1980,9 +2019,111 @@ impl Vm {
 
     // ----- properties -------------------------------------------------------
 
+    /// `super.name` for the running method: the property `name` on the prototype of the object that the method was
+    /// defined on. A getter runs with the `this` of the running method.
+    fn super_prop(&mut self, name: &str) -> Result<Value, Value> {
+        let home = match self.frames.last() {
+            Some(f) => f
+                .closure()
+                .class
+                .borrow()
+                .as_ref()
+                .and_then(|i| i.home.clone()),
+            None => None,
+        };
+        let parent = match home {
+            Some(h) => {
+                let p = h.borrow().proto.clone();
+                p
+            }
+            None => None,
+        };
+        let Some(parent) = parent else {
+            return Ok(Value::Undef);
+        };
+        match lookup(&parent, name) {
+            Lookup::Data(v) => Ok(v),
+            Lookup::Getter(g) => {
+                let this = self
+                    .frames
+                    .last()
+                    .map(|f| self.stack[f.base - 1].clone())
+                    .unwrap_or(Value::Undef);
+                self.call(&g, this, &[])
+            }
+            Lookup::Missing => Ok(Value::Undef),
+        }
+    }
+
+    /// The text of a value where a string is needed, by `+`, a template literal or `String`. An object whose class, or
+    /// one of its prototypes, has a `toString` method gets that method called, as Node.js does. Any other value
+    /// converts as `to_str` does.
+    pub fn to_text(&mut self, v: &Value) -> Result<String, Value> {
+        if let Value::Obj(o) = v {
+            if o.borrow().collection.is_none() {
+                if let Lookup::Data(method @ Value::Func(_)) = lookup(o, "toString") {
+                    let result = self.call(&method, v.clone(), &[])?;
+                    return Ok(to_str(&result));
+                }
+            }
+        }
+        Ok(to_str(v))
+    }
+
+    /// `v instanceof ctor`: whether the prototype chain of `v` holds the prototype of `ctor`. Functions and classes
+    /// have one, and a Map or a Set is checked by its kind. Any other object is false, since the built-in tables have
+    /// no prototypes.
+    fn instance_of(&mut self, v: &Value, ctor: &Value) -> Result<bool, Value> {
+        match ctor {
+            Value::Func(c) => {
+                let Value::Obj(o) = v else {
+                    return Ok(false);
+                };
+                let proto = c.instance_proto();
+                let mut cur = o.borrow().proto.clone();
+                while let Some(p) = cur {
+                    if Rc::ptr_eq(&p, &proto) {
+                        return Ok(true);
+                    }
+                    cur = p.borrow().proto.clone();
+                }
+                Ok(false)
+            }
+            Value::Native(d) => Ok(match v {
+                Value::Obj(o) => builtins::collections::is_instance(&o.borrow(), d),
+                _ => false,
+            }),
+            // The built-in tables stand for `Object` and `Array`, which every object and every array is an instance of.
+            Value::Obj(table) => {
+                let is_global = |name: &str, vm: &Vm| matches!(vm.globals.get(name), Some(Value::Obj(t)) if Rc::ptr_eq(t, table));
+                Ok(if is_global("Object", self) {
+                    matches!(
+                        v,
+                        Value::Obj(_) | Value::Arr(_) | Value::Func(_) | Value::Native(_)
+                    )
+                } else if is_global("Array", self) {
+                    matches!(v, Value::Arr(_))
+                } else {
+                    false
+                })
+            }
+            Value::Undef | Value::Null | Value::Bool(_) | Value::Num(_) | Value::Str(_) => {
+                Err(self.make_error(
+                    "TypeError",
+                    "Right-hand side of 'instanceof' is not callable",
+                ))
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub fn get_prop(&mut self, obj: &Value, name: &str) -> Result<Value, Value> {
         Ok(match obj {
-            Value::Obj(o) => obj_get(o, name).unwrap_or(Value::Undef),
+            Value::Obj(o) => match lookup(o, name) {
+                Lookup::Data(v) => v,
+                Lookup::Getter(g) => return self.call(&g, obj.clone(), &[]),
+                Lookup::Missing => Value::Undef,
+            },
             Value::Arr(a) => {
                 if name == "length" {
                     Value::Num(a.borrow().len() as f64)
@@ -2010,7 +2151,15 @@ impl Vm {
                 "length" => {
                     Value::Num(c.proto.nparams.saturating_sub(u32::from(c.proto.has_rest)) as f64)
                 }
-                _ => Value::Undef,
+                "prototype" => Value::Obj(c.instance_proto()),
+                _ => {
+                    let statics = c.class.borrow().as_ref().and_then(|i| i.statics.clone());
+                    match statics.map(|s| lookup(&s, name)) {
+                        Some(Lookup::Data(v)) => v,
+                        Some(Lookup::Getter(g)) => return self.call(&g, obj.clone(), &[]),
+                        _ => Value::Undef,
+                    }
+                }
             },
             Value::Native(d) => {
                 if name == "name" {
@@ -2033,8 +2182,16 @@ impl Vm {
 
     pub fn set_prop(&mut self, obj: &Value, name: &str, v: Value) -> Result<(), Value> {
         match obj {
-            Value::Obj(o) => {
-                obj_set(o, name, v);
+            Value::Obj(o) => match find_setter(o, name) {
+                Some(Some(setter)) => self.call(&setter, obj.clone(), &[v]).map(|_| ()),
+                Some(None) => Ok(()),
+                None => {
+                    obj_set(o, name, v);
+                    Ok(())
+                }
+            },
+            Value::Func(c) => {
+                obj_set(&c.statics(), name, v);
                 Ok(())
             }
             Value::Arr(a) if name == "length" => {

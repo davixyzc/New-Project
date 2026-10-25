@@ -188,6 +188,125 @@ impl Parser {
         Err(self.unexpected("';'"))
     }
 
+    /// Parses a class after its name, if it has one. The result is the expression that makes the class: a call of
+    /// `%class` with the name, the superclass (or undefined), the constructor and the members. Instance fields become
+    /// assignments at the start of the constructor, or just after its `super(...)` call. Static fields are assigned
+    /// once the class exists, in order.
+    fn class_rest(&mut self, name: Option<String>, line: u32) -> Result<Expr, String> {
+        let parent = if self.eat_word("extends") {
+            self.chain(true)?
+        } else {
+            Expr::Undef
+        };
+        let derived = !matches!(parent, Expr::Undef);
+        self.expect("{")?;
+        let class_name = name.unwrap_or_default();
+        let mut ctor = None;
+        let mut members = Vec::new();
+        let mut statics = Vec::new();
+        let mut instance = Vec::new();
+        let mut field_fns = false;
+        while !self.eat("}") {
+            if self.eat(";") {
+                continue;
+            }
+            let member_line = self.line();
+            let is_static = self.is_word("static")
+                && !matches!(self.peek_at(1), Tok::Punct("(") | Tok::Punct("="));
+            if is_static {
+                self.pos += 1;
+            }
+            let kind = if (self.is_word("get") || self.is_word("set"))
+                && matches!(self.peek_at(1), Tok::Ident(_))
+            {
+                let kind = if self.is_word("get") { "get" } else { "set" };
+                self.pos += 1;
+                kind
+            } else {
+                "method"
+            };
+            let key = self.ident()?;
+            if self.is_punct("(") {
+                let def = self.function_rest(Some(key.clone()), member_line)?;
+                if key == "constructor" && !is_static && kind == "method" {
+                    ctor = Some(def);
+                } else {
+                    members.push(Expr::Array(vec![
+                        Expr::Str(kind.to_string()),
+                        Expr::Str(key),
+                        Expr::Func(Box::new(def)),
+                        Expr::Bool(is_static),
+                    ]));
+                }
+            } else {
+                let before = self.fn_seq;
+                let init = if self.eat("=") {
+                    Some(self.assign()?)
+                } else {
+                    None
+                };
+                field_fns |= self.fn_seq != before;
+                self.semi()?;
+                if is_static {
+                    statics.push((key, init));
+                } else {
+                    instance.push((key, init));
+                }
+            }
+        }
+        let mut ctor = match ctor {
+            Some(mut def) => {
+                def.name = Some(class_name.clone()).filter(|n| !n.is_empty());
+                def
+            }
+            None => default_ctor(&class_name, derived, line),
+        };
+        if !instance.is_empty() {
+            let assigns: Vec<Stmt> = instance
+                .into_iter()
+                .map(|(key, init)| {
+                    let target = Expr::Member(Box::new(Expr::This), key);
+                    let value = init.unwrap_or(Expr::Undef);
+                    Stmt::Expr(Expr::Assign("=", Box::new(target), Box::new(value)), line)
+                })
+                .collect();
+            let at = ctor
+                .body
+                .iter()
+                .position(|s| matches!(s, Stmt::Expr(Expr::SuperCall(_), _)))
+                .map_or(0, |i| i + 1);
+            let rest = ctor.body.split_off(at);
+            ctor.body.extend(assigns);
+            ctor.body.extend(rest);
+            ctor.has_inner |= field_fns;
+        }
+        let made = Expr::Call(
+            Box::new(Expr::Ident("%class".to_string())),
+            vec![
+                Expr::Str(class_name),
+                parent,
+                Expr::Func(Box::new(ctor)),
+                Expr::Array(members),
+            ],
+        );
+        if statics.is_empty() {
+            return Ok(made);
+        }
+        let t = self.hidden_temp();
+        let mut parts = vec![Expr::Assign(
+            "=",
+            Box::new(Expr::Ident(t.clone())),
+            Box::new(made),
+        )];
+        for (key, init) in statics {
+            let target = Expr::Member(Box::new(Expr::Ident(t.clone())), key);
+            let value = init.unwrap_or(Expr::Undef);
+            parts.push(Expr::Assign("=", Box::new(target), Box::new(value)));
+        }
+        parts.push(Expr::Ident(t));
+        Ok(Expr::Sequence(parts))
+    }
+
     /// A new name for a temporary. Source code cannot write it, so it cannot clash with a name in the program.
     fn fresh(&mut self) -> String {
         self.temps += 1;
@@ -414,6 +533,12 @@ impl Parser {
             let def = self.function_rest(Some(name), line)?;
             return Ok(Stmt::Func(Box::new(def)));
         }
+        if self.is_word("class") && matches!(self.peek_at(1), Tok::Ident(_)) {
+            self.pos += 1;
+            let name = self.ident()?;
+            let made = self.class_rest(Some(name.clone()), line)?;
+            return Ok(Stmt::Var(VarKind::Let, vec![(name, Some(made))], line));
+        }
         if self.eat_word("if") {
             self.expect("(")?;
             let cond = self.expression()?;
@@ -508,7 +633,9 @@ impl Parser {
             }
             let name = self.ident()?;
             let init = if self.eat("=") {
-                Some(self.assign()?)
+                let mut value = self.assign()?;
+                name_anonymous_class(&mut value, &name);
+                Some(value)
             } else {
                 None
             };
@@ -907,6 +1034,7 @@ impl Parser {
             let op: &'static str = match self.peek() {
                 Tok::Punct(p) => *p,
                 Tok::Ident(s) if s.as_str() == "in" => "in",
+                Tok::Ident(s) if s.as_str() == "instanceof" => "instanceof",
                 _ => break,
             };
             let prec = match binop_prec(op) {
@@ -1055,7 +1183,7 @@ impl Parser {
             Tok::Ident(name) => {
                 let literal = matches!(
                     name.as_str(),
-                    "true" | "false" | "null" | "this" | "function"
+                    "true" | "false" | "null" | "this" | "function" | "class" | "super"
                 );
                 if !literal && RESERVED.contains(&name.as_str()) {
                     return Err(self.unexpected("expression"));
@@ -1075,6 +1203,30 @@ impl Parser {
                             None
                         };
                         Expr::Func(Box::new(self.function_rest(name, line)?))
+                    }
+                    "class" => {
+                        let line = self.line();
+                        let name = match self.peek() {
+                            Tok::Ident(s) if s.as_str() != "extends" => Some(s.clone()),
+                            _ => None,
+                        };
+                        if name.is_some() {
+                            self.pos += 1;
+                        }
+                        self.class_rest(name, line)?
+                    }
+                    "super" => {
+                        if self.eat("(") {
+                            Expr::SuperCall(self.args()?)
+                        } else {
+                            self.expect(".")?;
+                            let name = match self.peek() {
+                                Tok::Ident(s) => s.clone(),
+                                _ => return Err(self.unexpected("property name")),
+                            };
+                            self.pos += 1;
+                            Expr::SuperMember(name)
+                        }
                     }
                     _ => Expr::Ident(name),
                 })
@@ -1163,6 +1315,53 @@ fn is_plain_target(e: &Expr) -> bool {
             matches!(&**obj, Expr::Ident(_)) && matches!(&**key, Expr::Ident(_) | Expr::Num(_))
         }
         _ => false,
+    }
+}
+
+/// Gives an anonymous class the name of the variable that it is assigned to, as Node.js does. `init` is the value of
+/// the declaration: a class made by `class_rest`, or a sequence that starts with one when it has static fields.
+fn name_anonymous_class(init: &mut Expr, name: &str) {
+    match init {
+        Expr::Sequence(parts) => {
+            if let Some(Expr::Assign(_, _, made)) = parts.first_mut() {
+                name_anonymous_class(made, name);
+            }
+        }
+        Expr::Call(callee, args) if matches!(&**callee, Expr::Ident(n) if n == "%class") => {
+            if let Some(Expr::Str(class_name)) = args.first_mut() {
+                if class_name.is_empty() {
+                    class_name.push_str(name);
+                }
+            }
+            if let Some(Expr::Func(ctor)) = args.get_mut(2) {
+                if ctor.name.is_none() {
+                    ctor.name = Some(name.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The constructor of a class that has none. A derived class passes its arguments on to the superclass.
+fn default_ctor(name: &str, derived: bool, line: u32) -> FuncDef {
+    let (rest, body) = if derived {
+        let args = vec![Expr::Spread(Box::new(Expr::Ident("%args".to_string())))];
+        (
+            Some("%args".to_string()),
+            vec![Stmt::Expr(Expr::SuperCall(args), line)],
+        )
+    } else {
+        (None, Vec::new())
+    };
+    FuncDef {
+        name: Some(name.to_string()).filter(|n| !n.is_empty()),
+        params: Vec::new(),
+        rest,
+        body,
+        is_arrow: false,
+        has_inner: false,
+        line,
     }
 }
 
@@ -1275,7 +1474,7 @@ fn binop_prec(op: &str) -> Option<u8> {
         "^" => 5,
         "&" => 6,
         "==" | "!=" | "===" | "!==" => 7,
-        "<" | "<=" | ">" | ">=" | "in" => 8,
+        "<" | "<=" | ">" | ">=" | "in" | "instanceof" => 8,
         "<<" | ">>" | ">>>" => 9,
         "+" | "-" => 10,
         "*" | "/" | "%" => 11,

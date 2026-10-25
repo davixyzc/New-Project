@@ -162,6 +162,9 @@ fn keeps_locals(op: Op) -> bool {
             | Op::InitProp(_)
             | Op::ToKeys
             | Op::ToItems
+            | Op::GetSuper(_)
+            | Op::GetSuperCtor
+            | Op::InstanceOf
             | Op::Closure(_)
             | Op::Pow
     )

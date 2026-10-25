@@ -514,10 +514,12 @@ fn number(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     }))
 }
 
-fn string(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(Value::from_string(
-        args.first().map(to_str).unwrap_or_default(),
-    ))
+fn string(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let text = match args.first() {
+        Some(v) => vm.to_text(v)?,
+        None => String::new(),
+    };
+    Ok(Value::from_string(text))
 }
 
 fn boolean(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {

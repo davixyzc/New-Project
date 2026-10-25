@@ -102,4 +102,8 @@ pub enum Expr {
     Spread(Box<Expr>),
     /// `a, b, c`: each item is evaluated in turn, and the value is the last item's.
     Sequence(Vec<Expr>),
+    /// `super.name`, inside a method of a class.
+    SuperMember(String),
+    /// `super(...)`, inside the constructor of a derived class.
+    SuperCall(Vec<Expr>),
 }
