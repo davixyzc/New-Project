@@ -1,8 +1,10 @@
 //! String and number methods. Strings are UTF-8; indices count characters, not bytes.
 
+use std::rc::Rc;
+
 use crate::builtins::arg;
 use crate::builtins::array::bounds;
-use crate::value::{num_to_string, to_num, to_str, NativeDef, Value, MAX_STRING_LEN};
+use crate::value::{num_to_string, to_num, to_str, JsStr, NativeDef, Value, MAX_STRING_LEN};
 use crate::vm::Vm;
 
 pub static METHODS: &[NativeDef] = &[
@@ -112,16 +114,12 @@ pub fn number_method(name: &str) -> Option<&'static NativeDef> {
 }
 
 /// Length in characters.
-pub fn char_len(s: &str) -> usize {
-    if s.is_ascii() {
-        s.len()
-    } else {
-        s.chars().count()
-    }
+pub fn char_len(s: &JsStr) -> usize {
+    s.char_count()
 }
 
 /// The character at a character index.
-pub fn char_at(s: &str, i: usize) -> Option<char> {
+pub fn char_at(s: &JsStr, i: usize) -> Option<char> {
     if s.is_ascii() {
         s.as_bytes().get(i).map(|b| *b as char)
     } else {
@@ -129,10 +127,12 @@ pub fn char_at(s: &str, i: usize) -> Option<char> {
     }
 }
 
-fn this_str(this: &Value) -> String {
+/// The receiver as a string. A string receiver is shared, not copied, so a loop over `s.charCodeAt(i)` costs
+/// the same per call whatever the length of `s`.
+fn this_str(this: &Value) -> Rc<JsStr> {
     match this {
-        Value::Str(s) => s.to_string(),
-        other => to_str(other),
+        Value::Str(s) => Rc::clone(s),
+        other => Rc::new(JsStr::new(to_str(other))),
     }
 }
 
@@ -202,11 +202,10 @@ fn last_index_of(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Val
 fn char_at_method(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_str(&this);
     let i = index_arg(&arg(args, 0));
-    Ok(Value::str(
-        &i.and_then(|i| char_at(&s, i))
-            .map(String::from)
-            .unwrap_or_default(),
-    ))
+    Ok(match i.and_then(|i| char_at(&s, i)) {
+        Some(c) => crate::value::char_value(c),
+        None => Value::str(""),
+    })
 }
 
 fn char_code_at(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -248,23 +247,33 @@ fn ends_with(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> 
     Ok(Value::Bool(s[..end].ends_with(&str_arg(args, 0))))
 }
 
+/// The text between two character positions, which are in range. ASCII text is cut by byte, so a short slice of a
+/// long string costs only its own length.
+fn char_range(s: &JsStr, from: usize, to: usize) -> &str {
+    if s.is_ascii() {
+        &s[from..to]
+    } else {
+        &s[byte_offset(s, from)..byte_offset(s, to)]
+    }
+}
+
 fn slice(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
-    let chars: Vec<char> = this_str(&this).chars().collect();
-    let (s, e) = bounds(chars.len(), &arg(args, 0), &arg(args, 1));
-    Ok(Value::str(&chars[s..e].iter().collect::<String>()))
+    let s = this_str(&this);
+    let (from, to) = bounds(char_len(&s), &arg(args, 0), &arg(args, 1));
+    Ok(Value::str(char_range(&s, from, to)))
 }
 
 fn substring(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
-    let chars: Vec<char> = this_str(&this).chars().collect();
-    let len = chars.len() as f64;
+    let s = this_str(&this);
+    let len = char_len(&s) as f64;
     let clamp = |v: f64| if v.is_nan() { 0.0 } else { v.clamp(0.0, len) } as usize;
     let a = clamp(to_num(&arg(args, 0)));
     let b = match arg(args, 1) {
-        Value::Undef => chars.len(),
+        Value::Undef => len as usize,
         v => clamp(to_num(&v)),
     };
-    let (s, e) = if a <= b { (a, b) } else { (b, a) };
-    Ok(Value::str(&chars[s..e].iter().collect::<String>()))
+    let (from, to) = if a <= b { (a, b) } else { (b, a) };
+    Ok(Value::str(char_range(&s, from, to)))
 }
 
 fn to_upper(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
@@ -356,7 +365,11 @@ fn pad(vm: &mut Vm, this: &Value, args: &[Value], at_start: bool) -> Result<Valu
         return Err(vm.make_error("RangeError", "Invalid string length"));
     }
     let padding: String = fill.chars().cycle().take(width as usize - len).collect();
-    let text = if at_start { padding + &s } else { s + &padding };
+    let text = if at_start {
+        format!("{padding}{s}")
+    } else {
+        format!("{s}{padding}")
+    };
     Ok(Value::str(&text))
 }
 
@@ -369,7 +382,7 @@ fn pad_end(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 fn concat(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
-    let mut s = this_str(&this);
+    let mut s = this_str(&this).to_string();
     for v in args {
         s.push_str(&to_str(v));
         if s.len() > MAX_STRING_LEN {

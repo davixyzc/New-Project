@@ -425,7 +425,7 @@ impl Compiler {
             return i;
         }
         let i = fs.names.len() as u32;
-        fs.names.push(Rc::from(s));
+        fs.names.push(crate::value::intern_name(s));
         fs.name_index.insert(s.to_string(), i);
         i
     }

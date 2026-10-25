@@ -458,7 +458,7 @@ fn put(slot: &mut Value, v: Value) {
     }
 }
 
-fn index_of(n: f64) -> Option<usize> {
+pub(crate) fn index_of(n: f64) -> Option<usize> {
     if n >= 0.0 && n < MAX_ARRAY_GROW as f64 && n as usize as f64 == n {
         Some(n as usize)
     } else {
@@ -494,7 +494,7 @@ impl Vm {
     }
 
     pub fn set_global(&mut self, name: &str, v: Value) {
-        self.globals.insert(Rc::from(name), v);
+        self.globals.insert(crate::value::intern_name(name), v);
     }
 
     pub fn write_out(&mut self, s: &str) {
@@ -1951,7 +1951,7 @@ impl Vm {
             }
             (Value::Str(s), Value::Num(n)) => Ok(index_of(*n)
                 .and_then(|i| string::char_at(s, i))
-                .map(|c| Value::str(&c.to_string()))
+                .map(crate::value::char_value)
                 .unwrap_or(Value::Undef)),
             (Value::Obj(_) | Value::Arr(_) | Value::Func(_) | Value::Native(_), Value::Str(k)) => {
                 let k = k.clone();

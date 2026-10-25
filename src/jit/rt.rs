@@ -313,6 +313,109 @@ pub unsafe extern "C" fn get_prop_top(slot: *mut Value, name: *const Rc<str>) ->
     true
 }
 
+/// Reads the global `name` into `dst`. A name that is not defined writes nothing and returns false, so the
+/// instruction's own path reports the error.
+///
+/// # Safety
+/// `vm` must be the running VM, `name` as for `get_prop_top`, and `dst` a dead slot.
+pub unsafe extern "C" fn get_global_into(
+    vm: *mut Vm,
+    name: *const Rc<str>,
+    dst: *mut Value,
+) -> bool {
+    match (*vm).globals.get(&**name) {
+        Some(v) => {
+            ptr::write(dst, v.clone());
+            true
+        }
+        None => false,
+    }
+}
+
+/// `obj.name = v` for an object: the object in `obj` is replaced by `v`, which is moved out of `val`, and the
+/// property keeps a copy. Anything else writes nothing and returns false, so the instruction's own path runs it.
+///
+/// # Safety
+/// `obj` and `val` must point at valid values that the instruction pops, and `name` is as for `get_prop_top`.
+pub unsafe extern "C" fn set_prop_top(
+    obj: *mut Value,
+    name: *const Rc<str>,
+    val: *mut Value,
+) -> bool {
+    let Value::Obj(o) = &*obj else {
+        return false;
+    };
+    obj_put(o, &*name, (*val).clone());
+    *obj = ptr::read(val);
+    true
+}
+
+/// `a % b` for two numbers: `a` is replaced by the remainder. Anything else writes nothing and returns false.
+///
+/// # Safety
+/// `a` and `b` must point at valid values that the instruction pops.
+pub unsafe extern "C" fn mod_top(a: *mut Value, b: *const Value) -> bool {
+    let (Value::Num(x), Value::Num(y)) = (&*a, &*b) else {
+        return false;
+    };
+    let rem = crate::value::js_mod(*x, *y);
+    *a = Value::Num(rem);
+    true
+}
+
+/// `obj[key]` for an array and a number in range: the array in `obj` is replaced by the element. Anything else
+/// writes nothing and returns false, so the instruction's own path runs it.
+///
+/// # Safety
+/// `obj` and `key` must point at valid values that the instruction pops.
+pub unsafe extern "C" fn get_index_top(obj: *mut Value, key: *const Value) -> bool {
+    let (Value::Arr(a), Value::Num(n)) = (&*obj, &*key) else {
+        return false;
+    };
+    let Some(i) = crate::vm::index_of(*n) else {
+        return false;
+    };
+    let Ok(items) = a.try_borrow() else {
+        return false;
+    };
+    let Some(element) = items.get(i).cloned() else {
+        return false;
+    };
+    drop(items);
+    *obj = element;
+    true
+}
+
+/// `obj[key] = v` for an array and a number of an existing element: the element takes a copy of `v`, and the
+/// array in `obj` is replaced by `v`, which is moved out of `val`. Growing the array is left to the instruction's
+/// own path, as is anything that is not an array and a number, which writes nothing and returns false.
+///
+/// # Safety
+/// `obj`, `key` and `val` must point at valid values that the instruction pops. `val` is dead afterwards.
+pub unsafe extern "C" fn set_index_top(
+    obj: *mut Value,
+    key: *const Value,
+    val: *mut Value,
+) -> bool {
+    let (Value::Arr(a), Value::Num(n)) = (&*obj, &*key) else {
+        return false;
+    };
+    let Some(i) = crate::vm::index_of(*n) else {
+        return false;
+    };
+    let Ok(mut items) = a.try_borrow_mut() else {
+        return false;
+    };
+    if i >= items.len() {
+        return false;
+    }
+    let old = std::mem::replace(&mut items[i], (*val).clone());
+    drop(items);
+    drop(old);
+    *obj = ptr::read(val);
+    true
+}
+
 /// The property `name` of an array: its length, or one of its methods.
 fn array_prop(a: &ArrRef, name: &str) -> Value {
     if name == "length" {

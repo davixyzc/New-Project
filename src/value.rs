@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::fmt;
 use std::rc::Rc;
 
 use crate::bytecode::Proto;
@@ -27,6 +28,76 @@ pub struct Closure {
     pub this: Value,
 }
 
+/// The text of a string value. It keeps its character count and whether every character is ASCII, so `length` and
+/// indexing take constant time for ASCII text, which is the usual case.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct JsStr {
+    text: String,
+    chars: usize,
+    ascii: bool,
+}
+
+impl JsStr {
+    pub fn new(text: String) -> JsStr {
+        let ascii = text.is_ascii();
+        let chars = if ascii {
+            text.len()
+        } else {
+            text.chars().count()
+        };
+        JsStr { text, chars, ascii }
+    }
+
+    /// The length in characters.
+    pub fn char_count(&self) -> usize {
+        self.chars
+    }
+
+    /// Whether every character is ASCII, so that a character index is also a byte index.
+    pub fn is_ascii(&self) -> bool {
+        self.ascii
+    }
+
+    /// Appends `more`, keeping the counts up to date.
+    pub fn push_str(&mut self, more: &str) {
+        self.chars += if more.is_ascii() {
+            more.len()
+        } else {
+            more.chars().count()
+        };
+        self.ascii = self.ascii && more.is_ascii();
+        self.text.push_str(more);
+    }
+}
+
+impl std::ops::Deref for JsStr {
+    type Target = String;
+
+    fn deref(&self) -> &String {
+        &self.text
+    }
+}
+
+impl fmt::Display for JsStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// The one-character string for `c`. ASCII characters share cached values, so indexing a string does not allocate.
+pub fn char_value(c: char) -> Value {
+    thread_local! {
+        static ASCII: Vec<Rc<JsStr>> = (0u8..128)
+            .map(|b| Rc::new(JsStr::new((b as char).to_string())))
+            .collect();
+    }
+    if c.is_ascii() {
+        ASCII.with(|table| Value::Str(Rc::clone(&table[c as usize])))
+    } else {
+        Value::str(c.encode_utf8(&mut [0; 4]))
+    }
+}
+
 #[derive(Clone)]
 #[repr(u8)]
 pub enum Value {
@@ -34,7 +105,7 @@ pub enum Value {
     Null,
     Bool(bool),
     Num(f64),
-    Str(Rc<String>),
+    Str(Rc<JsStr>),
     Arr(ArrRef),
     Obj(ObjRef),
     Func(Rc<Closure>),
@@ -45,7 +116,7 @@ pub enum Value {
 
 impl Value {
     pub fn str(s: &str) -> Value {
-        Value::Str(Rc::new(s.to_string()))
+        Value::Str(Rc::new(JsStr::new(s.to_string())))
     }
 
     pub fn arr(items: Vec<Value>) -> Value {
@@ -93,22 +164,42 @@ pub fn obj_set(obj: &ObjRef, name: &str, v: Value) {
 /// Sets an own property using a key that is already shared, so no string is copied.
 pub fn obj_put(obj: &ObjRef, key: &Rc<str>, v: Value) {
     let mut props = obj.borrow_mut();
-    match props
-        .iter()
-        .position(|(k, _)| Rc::ptr_eq(k, key) || **k == **key)
-    {
+    match position_of_key(&props, key) {
         Some(i) => props[i].1 = v,
         None => props.push((key.clone(), v)),
     }
 }
 
-/// Reads an own property using a shared key. Keys from one prototype share their allocation,
-/// so the pointer usually matches before any text is compared.
+/// Reads an own property using a shared key. Names from the same source share one allocation (see `intern_name`),
+/// so the pointer decides almost every lookup, and the text is compared only when the pointer finds nothing.
 pub fn obj_get_key(obj: &ObjRef, key: &Rc<str>) -> Option<Value> {
-    obj.borrow()
+    let props = obj.borrow();
+    position_of_key(&props, key).map(|i| props[i].1.clone())
+}
+
+fn position_of_key(props: &Props, key: &Rc<str>) -> Option<usize> {
+    props
         .iter()
-        .find(|(k, _)| Rc::ptr_eq(k, key) || **k == **key)
-        .map(|(_, v)| v.clone())
+        .position(|(k, _)| Rc::ptr_eq(k, key))
+        .or_else(|| props.iter().position(|(k, _)| **k == **key))
+}
+
+thread_local! {
+    static NAMES: RefCell<std::collections::HashMap<Box<str>, Rc<str>>> = RefCell::new(Default::default());
+}
+
+/// The shared allocation for a name in the source, so that every use of `name` is the same `Rc`, and a property
+/// lookup by pointer finds it. Only names in the source are interned: their number is bounded by the program text.
+pub fn intern_name(name: &str) -> Rc<str> {
+    NAMES.with(|names| {
+        let mut names = names.borrow_mut();
+        if let Some(shared) = names.get(name) {
+            return shared.clone();
+        }
+        let shared: Rc<str> = Rc::from(name);
+        names.insert(Box::from(name), shared.clone());
+        shared
+    })
 }
 
 /// Reads an own property of a plain object.
@@ -121,7 +212,10 @@ pub fn obj_get(obj: &ObjRef, name: &str) -> Option<Value> {
 
 /// Builds a plain object from name/value pairs.
 pub fn make_obj(pairs: Vec<(&str, Value)>) -> Value {
-    let props: Props = pairs.into_iter().map(|(k, v)| (Rc::from(k), v)).collect();
+    let props: Props = pairs
+        .into_iter()
+        .map(|(k, v)| (intern_name(k), v))
+        .collect();
     Value::Obj(Rc::new(RefCell::new(props)))
 }
 
@@ -415,7 +509,7 @@ pub fn concat_owned(old: Value, rhs: Value) -> Value {
             if Rc::get_mut(&mut s).is_none() {
                 let mut copy = String::with_capacity(s.len() * 2 + 16);
                 copy.push_str(&s);
-                s = Rc::new(copy);
+                s = Rc::new(JsStr::new(copy));
             }
             let buf = Rc::get_mut(&mut s).unwrap();
             match &rhs {

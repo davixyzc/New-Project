@@ -948,6 +948,65 @@ impl<'a> Gen<'a> {
                 self.a.bind(done);
                 Fast::Guarded
             }
+            Op::GetIndex => {
+                // Replaces an array and a number in range by the element. Other operands take the slow path.
+                let (obj, key) = (self.temp(d - 2), self.temp(d - 1));
+                let get = rt::get_index_top as *const () as usize;
+                self.direct_call(get, &[Arg::Addr(obj), Arg::Addr(key)]);
+                self.a.test8(RAX, RAX);
+                self.a.jcc(CC_E, slow);
+                Fast::Guarded
+            }
+            Op::SetIndex => {
+                // Replaces an array, a number and a value by the value, of which the element keeps a copy.
+                let (obj, key, val) = (self.temp(d - 3), self.temp(d - 2), self.temp(d - 1));
+                let set = rt::set_index_top as *const () as usize;
+                self.direct_call(set, &[Arg::Addr(obj), Arg::Addr(key), Arg::Addr(val)]);
+                self.a.test8(RAX, RAX);
+                self.a.jcc(CC_E, slow);
+                Fast::Guarded
+            }
+            Op::GetGlobal(i) => {
+                // Pushes a global. A name that is not defined takes the slow path, which reports it.
+                let name = &self.proto.names[i as usize] as *const Rc<str> as usize;
+                let dst = self.temp(d);
+                let get = rt::get_global_into as *const () as usize;
+                self.direct_call(get, &[Arg::Vm, Arg::Imm(name as u64), Arg::Addr(dst)]);
+                self.a.test8(RAX, RAX);
+                self.a.jcc(CC_E, slow);
+                Fast::Guarded
+            }
+            Op::SetProp(i) => {
+                // Replaces an object and a value by the value, which the property keeps a copy of. Other operands
+                // take the slow path.
+                let name = &self.proto.names[i as usize] as *const Rc<str> as usize;
+                let (obj, val) = (self.temp(d - 2), self.temp(d - 1));
+                let set = rt::set_prop_top as *const () as usize;
+                self.direct_call(
+                    set,
+                    &[Arg::Addr(obj), Arg::Imm(name as u64), Arg::Addr(val)],
+                );
+                self.a.test8(RAX, RAX);
+                self.a.jcc(CC_E, slow);
+                Fast::Guarded
+            }
+            Op::Dup => {
+                // Copies the top value. A plain value is copied here, and any other is cloned by a helper.
+                let (src, dst) = (self.temp(d - 1), self.temp(d));
+                self.check_plain(src, slow);
+                self.copy(src, dst);
+                let clone = rt::clone_into as *const () as usize;
+                Fast::Direct(clone, vec![Arg::Addr(src), Arg::Addr(dst)])
+            }
+            Op::Mod => {
+                // Replaces two numbers by their remainder. Other operands take the slow path.
+                let (a, b) = (self.temp(d - 2), self.temp(d - 1));
+                let rem = rt::mod_top as *const () as usize;
+                self.direct_call(rem, &[Arg::Addr(a), Arg::Addr(b)]);
+                self.a.test8(RAX, RAX);
+                self.a.jcc(CC_E, slow);
+                Fast::Guarded
+            }
             Op::GetBoxed(i) => {
                 let (src, dst) = (self.local(i), self.temp(d));
                 let boxed = rt::boxed_into as *const () as usize;
