@@ -148,6 +148,10 @@ fn keeps_locals(op: Op) -> bool {
             | Op::SetProp(_)
             | Op::GetIndex
             | Op::SetIndex
+            | Op::GetIndexLocal(_)
+            | Op::GetIndex2Local(_)
+            | Op::SetIndexLocal(_)
+            | Op::SetIndex2Local(_)
             | Op::GetLocalProp(..)
             | Op::GetBoxed(_)
             | Op::SetBoxed(_)

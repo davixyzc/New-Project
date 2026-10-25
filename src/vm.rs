@@ -1574,6 +1574,34 @@ impl Vm {
                 self.set_index(&obj, &key, v.clone())?;
                 self.stack.push(v);
             }
+            Op::GetIndexLocal(s) => {
+                self.sync_ip(ip);
+                let key = self.pop();
+                let v = self.local_index(base + s as usize, &key)?;
+                self.stack.push(v);
+            }
+            Op::GetIndex2Local(s) => {
+                self.sync_ip(ip);
+                let k2 = self.pop();
+                let k1 = self.pop();
+                let v = self.local_index2(base + s as usize, &k1, &k2)?;
+                self.stack.push(v);
+            }
+            Op::SetIndexLocal(s) => {
+                self.sync_ip(ip);
+                let v = self.pop();
+                let key = self.pop();
+                self.local_set_index(base + s as usize, &key, v.clone())?;
+                self.stack.push(v);
+            }
+            Op::SetIndex2Local(s) => {
+                self.sync_ip(ip);
+                let v = self.pop();
+                let k2 = self.pop();
+                let k1 = self.pop();
+                self.local_set_index2(base + s as usize, &k1, &k2, v.clone())?;
+                self.stack.push(v);
+            }
 
             Op::Add => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Num(x + y)),
@@ -2056,6 +2084,74 @@ impl Vm {
         }
         let k = to_str(key);
         self.set_prop(obj, &k, v)
+    }
+
+    /// `local[key]` for a plain local at `slot`. An array is read in place, not cloned.
+    fn local_index(&mut self, slot: usize, key: &Value) -> Result<Value, Value> {
+        if let (Value::Arr(a), Value::Num(n)) = (&self.stack[slot], key) {
+            let a = a.borrow();
+            return Ok(index_of(*n)
+                .and_then(|i| a.get(i).cloned())
+                .unwrap_or(Value::Undef));
+        }
+        let obj = self.stack[slot].clone();
+        self.get_index(&obj, key)
+    }
+
+    /// `local[k1][k2]` for a plain local at `slot`. Both levels are read in place.
+    fn local_index2(&mut self, slot: usize, k1: &Value, k2: &Value) -> Result<Value, Value> {
+        if let (Value::Arr(a), Value::Num(n1), Value::Num(n2)) = (&self.stack[slot], k1, k2) {
+            let a = a.borrow();
+            if let Some(Value::Arr(row)) = index_of(*n1).and_then(|i| a.get(i)) {
+                let row = row.borrow();
+                return Ok(index_of(*n2)
+                    .and_then(|i| row.get(i).cloned())
+                    .unwrap_or(Value::Undef));
+            }
+        }
+        let obj = self.stack[slot].clone();
+        let row = self.get_index(&obj, k1)?;
+        self.get_index(&row, k2)
+    }
+
+    /// `local[key] = v` for a plain local at `slot`. An element that already exists is written
+    /// in place; growing the array takes the generic path.
+    fn local_set_index(&mut self, slot: usize, key: &Value, v: Value) -> Result<(), Value> {
+        if let (Value::Arr(a), Value::Num(n)) = (&self.stack[slot], key) {
+            if let Some(i) = index_of(*n) {
+                let mut a = a.borrow_mut();
+                if i < a.len() {
+                    a[i] = v;
+                    return Ok(());
+                }
+            }
+        }
+        let obj = self.stack[slot].clone();
+        self.set_index(&obj, key, v)
+    }
+
+    /// `local[k1][k2] = v` for a plain local at `slot`. The row is cloned as an `Rc` before it is
+    /// borrowed, so a row that is the outer array itself cannot clash with the borrow.
+    fn local_set_index2(
+        &mut self,
+        slot: usize,
+        k1: &Value,
+        k2: &Value,
+        v: Value,
+    ) -> Result<(), Value> {
+        if let (Value::Arr(a), Value::Num(n1), Value::Num(n2)) = (&self.stack[slot], k1, k2) {
+            let row = index_of(*n1).and_then(|i| a.borrow().get(i).cloned());
+            if let (Some(Value::Arr(row)), Some(i2)) = (row, index_of(*n2)) {
+                let mut cells = row.borrow_mut();
+                if i2 < cells.len() {
+                    cells[i2] = v;
+                    return Ok(());
+                }
+            }
+        }
+        let obj = self.stack[slot].clone();
+        let row = self.get_index(&obj, k1)?;
+        self.set_index(&row, k2, v)
     }
 
     // ----- errors -----------------------------------------------------------

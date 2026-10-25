@@ -63,6 +63,16 @@ pub enum Op {
     SetProp(u32),
     GetIndex,
     SetIndex,
+    // indexing of a plain local (operand: slot). The array is read in place, not copied, and the keys are
+    // numbers or other values pushed by the instruction's operands. Each falls back to the generic path.
+    /// `local[key]`: pops the key, and pushes the element.
+    GetIndexLocal(u32),
+    /// `local[k1][k2]`: pops both keys, and pushes the element.
+    GetIndex2Local(u32),
+    /// `local[key] = value`: pops the value and the key, and pushes the value.
+    SetIndexLocal(u32),
+    /// `local[k1][k2] = value`: pops the value and both keys, and pushes the value.
+    SetIndex2Local(u32),
     // operators
     Add,
     Sub,

@@ -1,0 +1,126 @@
+// Indexing a local array, string or object with one key or two, in functions called in loops (so the JIT compiles
+// them) and in plain code. Covers in-range reads and writes, the cases that take the generic path, and the errors.
+function reads(arr) {
+  let out = "";
+  for (let i = -1; i < 4; i++) {
+    const v = arr[i];
+    out = out + (v === undefined ? "u" : v) + ",";
+  }
+  return out;
+}
+const a = [10, 20, 30];
+console.log(reads(a));
+function oddKeys(arr) {
+  const frac = 0.5;
+  const nan = NaN;
+  const str = "1";
+  const padded = "01";
+  return [arr[frac], arr[nan], arr[str], arr[padded], arr[true], arr[null]].map((v) => v === undefined ? "u" : v).join(" ");
+}
+console.log(oddKeys(a));
+function writes(arr) {
+  for (let i = 0; i < arr.length; i++) arr[i] = arr[i] + 1;
+  arr[arr.length] = 99;
+  arr[arr.length + 2] = 7;
+  return arr.length + " " + arr[3] + " " + arr[4] + " " + arr[5];
+}
+console.log(writes([1, 2, 3]));
+function fill(m, n) {
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) m[i][j] = i * n + j;
+  }
+  return m;
+}
+const grid = fill([[0, 0, 0], [0, 0, 0], [0, 0, 0]], 3);
+console.log(JSON.stringify(grid));
+function readRow(m, r, c) {
+  try {
+    return m[r][c];
+  } catch (e) {
+    return e.name;
+  }
+}
+console.log(readRow(grid, 1, 2), readRow(grid, 7, 0), readRow(grid, 0, 9));
+function setRow(m, r, c, v) {
+  try {
+    m[r][c] = v;
+    return "ok";
+  } catch (e) {
+    return e.name;
+  }
+}
+console.log(setRow(grid, 1, 1, 5), setRow(grid, 7, 0, 5), setRow(grid, 0, 9, 1), grid[0][9], grid[0].length);
+const self = [1, 2];
+self[0] = self;
+self[0][1] = 7;
+console.log(self[1], self[0][0] === self);
+let idx = 0;
+const order = [0, 0];
+order[idx] = (idx = 1);
+console.log(order[0], idx);
+const pairs = [[1, 2], [3, 4]];
+let j = 0;
+const got = pairs[0][j = 1];
+console.log(got, j);
+function mutate(arr) {
+  arr[0] = 100;
+  return 1;
+}
+function callValue(arr) {
+  arr[0] = mutate(arr);
+  return arr[0];
+}
+console.log(callValue([5]));
+function charAt(s, i) {
+  return s[i];
+}
+console.log(charAt("héllo", 1), charAt("abc", 5) === undefined, charAt("abc", -1) === undefined);
+function objKeys() {
+  const o = {};
+  o[1] = "one";
+  o[2] = "two";
+  return o[1] + o[2] + o["1"];
+}
+console.log(objKeys());
+function boxedRead() {
+  const box = [1, 2, 3];
+  const get = () => box[2];
+  box[0] = 9;
+  return get() + box[0];
+}
+console.log(boxedRead());
+function matmul(a, b, n) {
+  const c = [];
+  for (let i = 0; i < n; i++) {
+    c[i] = [];
+    for (let j = 0; j < n; j++) {
+      let s = 0;
+      for (let k = 0; k < n; k++) s += a[i][k] * b[k][j];
+      c[i][j] = s;
+    }
+  }
+  return c;
+}
+let check = 0;
+for (let rep = 0; rep < 3; rep++) {
+  const n = 12;
+  const x = [];
+  const y = [];
+  for (let i = 0; i < n; i++) {
+    x[i] = [];
+    y[i] = [];
+    for (let k = 0; k < n; k++) {
+      x[i][k] = (i * 7 + k * rep) % 11;
+      y[i][k] = (k * 3 + i) % 5;
+    }
+  }
+  const z = matmul(x, y, n);
+  check = check + z[n - 1][n - 1] + z[0][n - 2];
+}
+console.log(check);
+function grow(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) out[out.length] = i * i;
+  return out;
+}
+console.log(grow(6).join(" "));

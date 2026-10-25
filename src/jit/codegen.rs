@@ -155,6 +155,8 @@ pub(super) fn delta(op: Op) -> i32 {
         | Op::ConcatLocal(_)
         | Op::SetProp(_)
         | Op::GetIndex
+        | Op::GetIndex2Local(_)
+        | Op::SetIndexLocal(_)
         | Op::ArrayPush
         | Op::ArrayExtend
         | Op::InitProp(_)
@@ -179,7 +181,7 @@ pub(super) fn delta(op: Op) -> i32 {
         | Op::Le
         | Op::Gt
         | Op::Ge => -1,
-        Op::SetIndex | Op::CallSpread | Op::NewSpread => -2,
+        Op::SetIndex | Op::SetIndex2Local(_) | Op::CallSpread | Op::NewSpread => -2,
         Op::Call(argc) | Op::New(argc) => -(argc as i32) - 1,
         Op::Swap
         | Op::SetLocal(_)
@@ -193,6 +195,7 @@ pub(super) fn delta(op: Op) -> i32 {
         | Op::SetGlobal(_)
         | Op::ConstAssign(_)
         | Op::GetProp(_)
+        | Op::GetIndexLocal(_)
         | Op::Neg
         | Op::Not
         | Op::BitNot
@@ -632,9 +635,9 @@ impl<'a> Gen<'a> {
         self.after_helper(jump);
     }
 
-    /// Calls a value helper, with its arguments in rdi, rsi and rdx.
+    /// Calls a value helper, with its arguments in rdi, rsi, rdx and rcx.
     fn direct_call(&mut self, func: usize, args: &[Arg]) {
-        const REGS: [u8; 3] = [RDI, RSI, RDX];
+        const REGS: [u8; 4] = [RDI, RSI, RDX, RCX];
         for (&reg, arg) in REGS.iter().zip(args) {
             match *arg {
                 Arg::Vm => self.a.mov_rr(reg, RBX),
@@ -970,6 +973,50 @@ impl<'a> Gen<'a> {
                 let (obj, key, val) = (self.temp(d - 3), self.temp(d - 2), self.temp(d - 1));
                 let set = rt::set_index_top as *const () as usize;
                 self.direct_call(set, &[Arg::Addr(obj), Arg::Addr(key), Arg::Addr(val)]);
+                self.a.test8(RAX, RAX);
+                self.a.jcc(CC_E, slow);
+                Fast::Guarded
+            }
+            Op::GetIndexLocal(i) => {
+                // Replaces the key by the element of an array or string in a local. Other operands take the slow path.
+                let (obj, key) = (self.local(i), self.temp(d - 1));
+                let get = rt::get_index_local as *const () as usize;
+                self.direct_call(get, &[Arg::Addr(obj), Arg::Addr(key)]);
+                self.a.test8(RAX, RAX);
+                self.a.jcc(CC_E, slow);
+                Fast::Guarded
+            }
+            Op::GetIndex2Local(i) => {
+                // Replaces the two keys by an element of a row of an array in a local. Other operands take the slow path.
+                let (obj, k1, k2) = (self.local(i), self.temp(d - 2), self.temp(d - 1));
+                let get = rt::get_index2_local as *const () as usize;
+                self.direct_call(get, &[Arg::Addr(obj), Arg::Addr(k1), Arg::Addr(k2)]);
+                self.a.test8(RAX, RAX);
+                self.a.jcc(CC_E, slow);
+                Fast::Guarded
+            }
+            Op::SetIndexLocal(i) => {
+                // Replaces the key and the value by the value, of which the element keeps a copy.
+                let (obj, key, val) = (self.local(i), self.temp(d - 2), self.temp(d - 1));
+                let set = rt::set_index_local as *const () as usize;
+                self.direct_call(set, &[Arg::Addr(obj), Arg::Addr(key), Arg::Addr(val)]);
+                self.a.test8(RAX, RAX);
+                self.a.jcc(CC_E, slow);
+                Fast::Guarded
+            }
+            Op::SetIndex2Local(i) => {
+                // Replaces the two keys and the value by the value, of which the element keeps a copy.
+                let (obj, k1, k2, val) = (
+                    self.local(i),
+                    self.temp(d - 3),
+                    self.temp(d - 2),
+                    self.temp(d - 1),
+                );
+                let set = rt::set_index2_local as *const () as usize;
+                self.direct_call(
+                    set,
+                    &[Arg::Addr(obj), Arg::Addr(k1), Arg::Addr(k2), Arg::Addr(val)],
+                );
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
                 Fast::Guarded

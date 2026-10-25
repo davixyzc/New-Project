@@ -311,6 +311,34 @@ fn is_pure(e: &Expr) -> bool {
     }
 }
 
+/// Whether evaluating `e` may assign a variable. Only assignments and updates can change a plain local of the
+/// running frame: a closure that reaches a local makes it a cell, and cells are not plain locals, so calls cannot.
+fn may_assign(e: &Expr) -> bool {
+    match e {
+        Expr::Num(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undef
+        | Expr::This
+        | Expr::Ident(_)
+        | Expr::Func(_) => false,
+        Expr::Template(_, parts) | Expr::Array(parts) | Expr::Sequence(parts) => {
+            parts.iter().any(may_assign)
+        }
+        Expr::Object(props) => props.iter().any(|(_, v)| may_assign(v)),
+        Expr::Unary(_, x) | Expr::Spread(x) | Expr::Member(x, _) => may_assign(x),
+        Expr::Update { .. } | Expr::Assign(..) => true,
+        Expr::Binary(_, a, b) | Expr::Logical(_, a, b) | Expr::Index(a, b) => {
+            may_assign(a) || may_assign(b)
+        }
+        Expr::Cond(a, b, c) => may_assign(a) || may_assign(b) || may_assign(c),
+        Expr::Call(callee, args) | Expr::New(callee, args) => {
+            may_assign(callee) || args.iter().any(may_assign)
+        }
+    }
+}
+
 /// For `x += e` and `x = x + e`, returns `e`.
 fn concat_rhs<'a>(op: &str, name: &str, value: &'a Expr) -> Option<&'a Expr> {
     match (op, value) {
@@ -589,6 +617,23 @@ impl Compiler {
                 is_const: false,
             } if !self.slot_is_boxed(slot) => Some(slot),
             _ => None,
+        }
+    }
+
+    /// Whether `e` is a literal, a plain local, or arithmetic on those. Such an expression cannot throw and cannot
+    /// assign, so it may run before the operands that come first without changing what the program does.
+    fn simple_operand(&mut self, e: &Expr) -> bool {
+        match e {
+            Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::Undef | Expr::This => {
+                true
+            }
+            Expr::Ident(_) => self.local_operand(e).is_some(),
+            Expr::Binary(op, a, b) => {
+                matches!(*op, "+" | "-" | "*" | "/" | "%")
+                    && self.simple_operand(a)
+                    && self.simple_operand(b)
+            }
+            _ => false,
         }
     }
 
@@ -1442,6 +1487,25 @@ impl Compiler {
                 }
             }
             Expr::Index(obj, key) => {
+                // `local[key]` and `local[k1][k2]` read the array in its slot, without copying it (see `GetIndexLocal`).
+                // The second key of the two-level form must not call anything, since the first read may throw.
+                if let Some(slot) = self.local_operand(obj) {
+                    if !may_assign(key) {
+                        self.expr(key)?;
+                        self.emit(Op::GetIndexLocal(slot));
+                        return Ok(());
+                    }
+                }
+                if let Expr::Index(inner, k1) = &**obj {
+                    if let Some(slot) = self.local_operand(inner) {
+                        if !may_assign(k1) && self.simple_operand(key) {
+                            self.expr(k1)?;
+                            self.expr(key)?;
+                            self.emit(Op::GetIndex2Local(slot));
+                            return Ok(());
+                        }
+                    }
+                }
                 self.expr(obj)?;
                 self.expr(key)?;
                 self.emit(Op::GetIndex);
@@ -1642,6 +1706,32 @@ impl Compiler {
                 self.emit(Op::SetProp(c));
             }
             Expr::Index(obj, key) => {
+                if compound.is_none() {
+                    // `local[key] = value` and `local[k1][k2] = value` write in place (see `SetIndexLocal`). The
+                    // two-level form needs simple operands, since the first read may throw before they run.
+                    if let Some(slot) = self.local_operand(obj) {
+                        if !may_assign(key) && !may_assign(value) {
+                            self.expr(key)?;
+                            self.expr(value)?;
+                            self.emit(Op::SetIndexLocal(slot));
+                            return Ok(());
+                        }
+                    }
+                    if let Expr::Index(inner, k1) = &**obj {
+                        if let Some(slot) = self.local_operand(inner) {
+                            if !may_assign(k1)
+                                && self.simple_operand(key)
+                                && self.simple_operand(value)
+                            {
+                                self.expr(k1)?;
+                                self.expr(key)?;
+                                self.expr(value)?;
+                                self.emit(Op::SetIndex2Local(slot));
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 self.expr(obj)?;
                 self.expr(key)?;
                 if let Some(b) = compound {

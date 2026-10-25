@@ -440,6 +440,136 @@ pub unsafe extern "C" fn set_index_top(
     true
 }
 
+/// `local[key]` for a number `key`, on an array or a string in `obj`: the key is replaced by the element, and an
+/// index past the end gives `undefined`. Anything else writes nothing and returns false, so the instruction's own
+/// path runs it.
+///
+/// # Safety
+/// `obj` must point at a valid value that the instruction does not pop, and `key` at one that it pops.
+pub unsafe extern "C" fn get_index_local(obj: *const Value, key: *mut Value) -> bool {
+    let Value::Num(n) = &*key else {
+        return false;
+    };
+    let element = match &*obj {
+        Value::Arr(a) => {
+            let Ok(items) = a.try_borrow() else {
+                return false;
+            };
+            crate::vm::index_of(*n).and_then(|i| items.get(i).cloned())
+        }
+        Value::Str(s) => crate::vm::index_of(*n)
+            .and_then(|i| builtins::string::char_at(s, i))
+            .map(crate::value::char_value),
+        _ => return false,
+    };
+    *key = element.unwrap_or(Value::Undef);
+    true
+}
+
+/// `local[k1][k2]` for numbers, on an array of arrays in `obj`: `k1` is replaced by the element. A row that is not
+/// an array, which includes one past the end of the outer array, writes nothing and returns false, so the
+/// instruction's own path runs it and reports the error.
+///
+/// # Safety
+/// `obj` must point at a valid value that the instruction does not pop, and `k1` and `k2` at values that it pops.
+pub unsafe extern "C" fn get_index2_local(
+    obj: *const Value,
+    k1: *mut Value,
+    k2: *const Value,
+) -> bool {
+    let (Value::Arr(a), Value::Num(n1), Value::Num(n2)) = (&*obj, &*k1, &*k2) else {
+        return false;
+    };
+    let Ok(items) = a.try_borrow() else {
+        return false;
+    };
+    let Some(Value::Arr(row)) = crate::vm::index_of(*n1).and_then(|i| items.get(i)) else {
+        return false;
+    };
+    let Ok(cells) = row.try_borrow() else {
+        return false;
+    };
+    let element = crate::vm::index_of(*n2).and_then(|i| cells.get(i).cloned());
+    drop(cells);
+    drop(items);
+    *k1 = element.unwrap_or(Value::Undef);
+    true
+}
+
+/// `local[key] = v` for a number `key`, on an array in `obj`, where the element exists: the element takes a copy of
+/// `v`, and `key` is replaced by `v`, which is moved out of `val`. Growing the array, and anything else, writes
+/// nothing and returns false, so the instruction's own path runs it.
+///
+/// # Safety
+/// `obj` must point at a valid value that the instruction does not pop, and `key` and `val` at valid values that it
+/// pops. `val` is dead afterwards when this returns true.
+pub unsafe extern "C" fn set_index_local(
+    obj: *const Value,
+    key: *mut Value,
+    val: *const Value,
+) -> bool {
+    let (Value::Arr(a), Value::Num(n)) = (&*obj, &*key) else {
+        return false;
+    };
+    let Some(i) = crate::vm::index_of(*n) else {
+        return false;
+    };
+    let Ok(mut items) = a.try_borrow_mut() else {
+        return false;
+    };
+    if i >= items.len() {
+        return false;
+    }
+    let old = std::mem::replace(&mut items[i], (*val).clone());
+    drop(items);
+    drop(old);
+    ptr::write(key, ptr::read(val));
+    true
+}
+
+/// `local[k1][k2] = v` for numbers, on an array of arrays in `obj`, where the row and the element exist: the element
+/// takes a copy of `v`, and `k1` is replaced by `v`, which is moved out of `val`. Anything else writes nothing and
+/// returns false, so the instruction's own path runs it.
+///
+/// # Safety
+/// `obj` must point at a valid value that the instruction does not pop, and `k1`, `k2` and `val` at valid values
+/// that it pops. `val` is dead afterwards when this returns true.
+pub unsafe extern "C" fn set_index2_local(
+    obj: *const Value,
+    k1: *mut Value,
+    k2: *const Value,
+    val: *const Value,
+) -> bool {
+    let (Value::Arr(a), Value::Num(n1), Value::Num(n2)) = (&*obj, &*k1, &*k2) else {
+        return false;
+    };
+    let (Some(i1), Some(i2)) = (crate::vm::index_of(*n1), crate::vm::index_of(*n2)) else {
+        return false;
+    };
+    // The row is cloned out, so that no borrow of the outer array is held while the row is written.
+    let row = {
+        let Ok(items) = a.try_borrow() else {
+            return false;
+        };
+        match items.get(i1) {
+            Some(Value::Arr(row)) => row.clone(),
+            _ => return false,
+        }
+    };
+    let Ok(mut cells) = row.try_borrow_mut() else {
+        return false;
+    };
+    if i2 >= cells.len() {
+        return false;
+    }
+    let old = std::mem::replace(&mut cells[i2], (*val).clone());
+    drop(cells);
+    drop(row);
+    drop(old);
+    ptr::write(k1, ptr::read(val));
+    true
+}
+
 /// The property `name` of a string: its length, or one of its methods.
 fn string_prop(s: &JsStr, name: &str) -> Value {
     if name == "length" {
