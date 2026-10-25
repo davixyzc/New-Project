@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::builtins::{self, console, string};
 use crate::bytecode::{Op, Proto};
 use crate::compiler::compile_module;
+use crate::jit::Native;
 use crate::value::*;
 
 /// Maximum nesting of JavaScript-level calls before a RangeError is thrown.
@@ -57,6 +58,8 @@ pub struct Vm {
     nested_calls: usize,
     /// Buffer that carries the arguments of a native call, reused from call to call.
     arg_buf: Vec<Value>,
+    /// The exception that native code reported, waiting for the dispatcher to take it.
+    pub(crate) pending: Option<Value>,
     pub argv: Vec<String>,
 }
 
@@ -116,6 +119,7 @@ impl Vm {
             rng: seed | 1,
             nested_calls: 0,
             arg_buf: Vec::new(),
+            pending: None,
             argv,
         };
         builtins::install(&mut vm);
@@ -273,6 +277,21 @@ impl Vm {
         this: Value,
         args: [Value; N],
     ) -> Result<Value, Value> {
+        if let Value::Func(c) = f {
+            let proto: *const Proto = Rc::as_ptr(&c.proto);
+            // SAFETY: `c` owns the prototype, and it is borrowed for the whole call.
+            let (has_rest, nlocals) = unsafe { ((*proto).has_rest, (*proto).nlocals as usize) };
+            let code = if has_rest {
+                None
+            } else {
+                unsafe { (*proto).native() }
+            };
+            if let Some(code) = code {
+                if self.nested_calls < MAX_NESTED_CALLS && self.frames.len() < MAX_FRAMES {
+                    return self.call_compiled(c, code, nlocals, this, args);
+                }
+            }
+        }
         match f {
             Value::Func(c) => {
                 if self.nested_calls >= MAX_NESTED_CALLS {
@@ -280,11 +299,19 @@ impl Vm {
                 }
                 self.nested_calls += 1;
                 let depth = self.frames.len();
+                // Arguments past the declared parameters have no name to bind to, so they are
+                // dropped here, unless a rest parameter collects them.
+                let fixed = c.proto.nparams as usize;
+                let keep = if c.proto.has_rest { N } else { N.min(fixed) };
                 self.stack.push(Value::Undef);
                 self.stack.push(this);
-                self.stack.extend(args);
-                let result = match self.enter(c.clone(), N, None) {
-                    Ok(()) => self.execute(depth).map(|_| self.pop()),
+                for (i, v) in args.into_iter().enumerate() {
+                    if i < keep {
+                        self.stack.push(v);
+                    }
+                }
+                let result = match self.enter(c.clone(), keep, None) {
+                    Ok(()) => self.run_entered(depth),
                     Err(e) => Err(e),
                 };
                 self.nested_calls -= 1;
@@ -292,6 +319,54 @@ impl Vm {
             }
             _ => self.call(f, this, &args),
         }
+    }
+
+    /// Calls a closure whose prototype has native code and no rest parameter. Frames are set up
+    /// directly, without the general path: arguments past the parameters are dropped, and missing
+    /// ones are padded with `undefined`.
+    fn call_compiled<const N: usize>(
+        &mut self,
+        c: &Rc<Closure>,
+        code: &Native,
+        nlocals: usize,
+        this: Value,
+        args: [Value; N],
+    ) -> Result<Value, Value> {
+        self.nested_calls += 1;
+        let depth = self.frames.len();
+        let base = self.stack.len() + 2;
+        let fixed = c.proto.nparams as usize;
+        self.stack.push(Value::Undef);
+        self.stack.push(this);
+        for (i, v) in args.into_iter().enumerate() {
+            if i < fixed {
+                self.stack.push(v);
+            }
+        }
+        while self.stack.len() < base + nlocals {
+            self.stack.push(Value::Undef);
+        }
+        self.frames.push(Frame {
+            closure: c.clone(),
+            ip: 0,
+            base,
+            handlers: Vec::new(),
+            ctor: None,
+        });
+        let result = match self.run_native(code, 0) {
+            Ok(()) => Ok(self.pop()),
+            Err(e) => self.resume_after_error(e, depth),
+        };
+        self.nested_calls -= 1;
+        result
+    }
+
+    /// Finishes a frame that raised `exc` in native code: unwinds to a handler above `depth` and
+    /// runs on from there, or returns the exception when no handler catches it.
+    fn resume_after_error(&mut self, exc: Value, depth: usize) -> Result<Value, Value> {
+        self.unwind(exc, depth)?;
+        self.execute(depth)?;
+        Ok(self.pop())
     }
 
     fn call_closure(
@@ -305,6 +380,19 @@ impl Vm {
         self.stack.push(this);
         self.stack.extend_from_slice(args);
         self.enter(c, args.len(), None)?;
+        self.run_entered(depth)
+    }
+
+    /// Runs the frame that `enter` pushed above `depth` to completion, and returns its result.
+    fn run_entered(&mut self, depth: usize) -> Result<Value, Value> {
+        let proto: *const Proto = Rc::as_ptr(&self.frames.last().unwrap().closure.proto);
+        // SAFETY: the frame holds the closure that owns the prototype.
+        if let Some(code) = unsafe { (*proto).native() } {
+            match self.run_native(code, 0) {
+                Ok(()) => return Ok(self.pop()),
+                Err(e) => self.unwind(e, depth)?,
+            }
+        }
         self.execute(depth)?;
         Ok(self.pop())
     }
@@ -509,11 +597,153 @@ impl Vm {
         unsafe { self.stack.set_len(len) }
     }
 
-    /// The dispatch loop. Returns Ok when the frame at `base_depth` returns, Err on a thrown value.
+    /// Pops the running frame, leaving its result on the caller's stack.
+    #[inline]
+    pub(crate) fn do_return(&mut self) {
+        let v = self.pop();
+        let f = self.frames.pop().unwrap();
+        self.truncate_stack(f.base - 2);
+        match f.ctor {
+            Some(obj) if !v.is_object() => self.stack.push(obj),
+            _ => self.stack.push(v),
+        }
+    }
+
+    /// Runs the frame that is on top, and the frames it calls, until the frame at `base_depth`
+    /// returns. Each frame runs as native code when it has been compiled.
     ///
-    /// The instruction pointer lives in a local. It is written back to the frame before
-    /// anything that may call, return or raise, because those paths read it from the frame.
+    /// Returns Err with the exception still on the frame stack. The caller unwinds from there.
     fn run(&mut self, base_depth: usize) -> Result<(), Value> {
+        while self.frames.len() > base_depth {
+            let (proto, ip) = {
+                let f = self.frames.last().unwrap();
+                (f.closure.proto.clone(), f.ip)
+            };
+            match proto.native() {
+                Some(code) => self.run_native(code, ip)?,
+                None => return self.run_interp(base_depth),
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs the innermost frame as native code from instruction `ip`. Returns Ok when the frame
+    /// returned, which pops it. Returns Err when an exception left it, and it stays on the stack.
+    fn run_native(&mut self, code: &Native, ip: usize) -> Result<(), Value> {
+        let base = self.frames.last().unwrap().base;
+        let need = base + code.frame_len();
+        if need > self.stack.capacity() {
+            self.stack.reserve(need - self.stack.len());
+        }
+        // SAFETY: the stack has room for the whole frame (reserved above), and it holds the
+        // operands that native code expects at `ip`. Helpers update the frame pointer they return.
+        let status = unsafe {
+            let frame = self.stack.as_mut_ptr().add(base);
+            code.call(self, frame, ip)
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(self.pending.take().unwrap_or(Value::Undef))
+        }
+    }
+
+    /// `Call`, `New` and the spread forms, for native code. The callee has finished when this returns.
+    pub(crate) fn call_op(&mut self, argc: usize, is_new: bool, spread: bool) -> Result<(), Value> {
+        let argc = if spread {
+            let list = self.pop();
+            let items: Vec<Value> = match &list {
+                Value::Arr(a) => a.borrow().clone(),
+                _ => Vec::new(),
+            };
+            let n = items.len();
+            self.stack.extend(items);
+            n
+        } else {
+            argc
+        };
+        let idx = self.stack.len() - argc - 2;
+        // Fast path: a plain call of compiled code that takes exactly these arguments.
+        if !is_new {
+            let fast = match &self.stack[idx] {
+                Value::Func(c) if c.proto.nparams as usize == argc && !c.proto.has_rest => {
+                    Some(c.clone())
+                }
+                _ => None,
+            };
+            if let Some(closure) = fast {
+                // The frame keeps `closure` alive, so the prototype needs no reference count of its own.
+                let proto: *const Proto = Rc::as_ptr(&closure.proto);
+                // SAFETY: `proto` is owned by `closure`, which the frame pushed below holds.
+                if let Some(code) = unsafe { (*proto).native() } {
+                    if self.frames.len() < MAX_FRAMES {
+                        let base = idx + 2;
+                        let target = base + unsafe { (*proto).nlocals as usize };
+                        self.frames.push(Frame {
+                            closure,
+                            ip: 0,
+                            base,
+                            handlers: Vec::new(),
+                            ctor: None,
+                        });
+                        while self.stack.len() < target {
+                            self.stack.push(Value::Undef);
+                        }
+                        return self.run_native(code, 0);
+                    }
+                }
+            }
+        }
+        if !is_new {
+            if let Value::Native(def) = &self.stack[idx] {
+                let def = *def;
+                return self.call_native(def, idx, argc);
+            }
+        }
+        let callee = self.stack[idx].clone();
+        let depth = self.frames.len();
+        self.invoke(callee, argc, is_new)?;
+        if self.frames.len() > depth {
+            self.run(depth)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Calls a built-in whose callee is at `idx`, with `this` above it and `argc` arguments above
+    /// that. The arguments move into the call instead of being copied.
+    fn call_native(
+        &mut self,
+        def: &'static NativeDef,
+        idx: usize,
+        argc: usize,
+    ) -> Result<(), Value> {
+        let this = std::mem::replace(&mut self.stack[idx + 1], Value::Undef);
+        let mut args = std::mem::take(&mut self.arg_buf);
+        args.clear();
+        args.reserve(argc);
+        // SAFETY: the `argc` values above `idx + 1` are initialized and move into `args`. Then the
+        // stack is cut to `idx` without dropping anything: the callee is a built-in, and `this`
+        // was replaced by `Undef`, so no slot in between owns a reference.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.stack.as_ptr().add(idx + 2),
+                args.as_mut_ptr(),
+                argc,
+            );
+            args.set_len(argc);
+            self.stack.set_len(idx);
+        }
+        let result = (def.func)(self, this, &args);
+        args.clear();
+        self.arg_buf = args;
+        self.stack.push(result?);
+        Ok(())
+    }
+
+    /// The interpreter. It runs until the frame at `base_depth` returns, or an exception escapes.
+    /// It is the fallback for functions without native code.
+    fn run_interp(&mut self, base_depth: usize) -> Result<(), Value> {
         let (mut proto, mut base, mut ip) = self.frame_state();
         loop {
             debug_assert!(ip < proto.code.len());
@@ -522,465 +752,6 @@ impl Vm {
             let op = unsafe { *proto.code.get_unchecked(ip) };
             ip += 1;
             match op {
-                Op::Const(i) => {
-                    let v = proto.consts[i as usize].clone();
-                    self.stack.push(v);
-                }
-                Op::Undef => self.stack.push(Value::Undef),
-                Op::Null => self.stack.push(Value::Null),
-                Op::True => self.stack.push(Value::Bool(true)),
-                Op::False => self.stack.push(Value::Bool(false)),
-                Op::This => {
-                    let this = if proto.is_arrow {
-                        self.frames.last().unwrap().closure.this.clone()
-                    } else {
-                        self.stack[base - 1].clone()
-                    };
-                    self.stack.push(this);
-                }
-                Op::Pop => {
-                    if let Some(v) = self.stack.pop() {
-                        forget_scalar(v);
-                    }
-                }
-                Op::Dup => {
-                    let v = self.top().clone();
-                    self.stack.push(v);
-                }
-                Op::Swap => {
-                    let n = self.stack.len();
-                    self.stack.swap(n - 1, n - 2);
-                }
-                Op::Dup2 => {
-                    let n = self.stack.len();
-                    let a = self.stack[n - 2].clone();
-                    let b = self.stack[n - 1].clone();
-                    self.stack.push(a);
-                    self.stack.push(b);
-                }
-
-                Op::GetLocal(i) => {
-                    let v = self.local(base + i as usize).clone();
-                    self.stack.push(v);
-                }
-                Op::SetLocal(i) => {
-                    let v = self.top().clone();
-                    put(self.local_mut(base + i as usize), v);
-                }
-                Op::PopToLocal(i) => {
-                    let v = self.pop();
-                    put(self.local_mut(base + i as usize), v);
-                }
-                Op::IncLocal(i) => self.step_local(base + i as usize, 1.0),
-                Op::DecLocal(i) => self.step_local(base + i as usize, -1.0),
-                Op::NewCell(i) => {
-                    self.stack[base + i as usize] =
-                        Value::Cell(Rc::new(RefCell::new(Value::Undef)));
-                }
-                Op::GetBoxed(i) => {
-                    let v = match &self.stack[base + i as usize] {
-                        Value::Cell(c) => c.borrow().clone(),
-                        other => other.clone(),
-                    };
-                    self.stack.push(v);
-                }
-                Op::SetBoxed(i) => {
-                    let idx = base + i as usize;
-                    let v = self.top().clone();
-                    match &self.stack[idx] {
-                        Value::Cell(c) => *c.borrow_mut() = v,
-                        _ => self.stack[idx] = Value::Cell(Rc::new(RefCell::new(v))),
-                    }
-                }
-                Op::BoxParam(i) => {
-                    let idx = base + i as usize;
-                    let v = std::mem::replace(&mut self.stack[idx], Value::Undef);
-                    self.stack[idx] = Value::Cell(Rc::new(RefCell::new(v)));
-                }
-                Op::Rebox(i) => {
-                    let idx = base + i as usize;
-                    let v = match &self.stack[idx] {
-                        Value::Cell(c) => c.borrow().clone(),
-                        other => other.clone(),
-                    };
-                    self.stack[idx] = Value::Cell(Rc::new(RefCell::new(v)));
-                }
-                Op::AddToLocal(i) => {
-                    let rhs = self.pop();
-                    let idx = base + i as usize;
-                    // Moving the value out first lets a string be extended in place.
-                    let old = std::mem::replace(self.local_mut(idx), Value::Undef);
-                    let result = match (&old, &rhs) {
-                        (Value::Num(x), Value::Num(y)) => {
-                            let sum = Value::Num(x + y);
-                            forget_scalar(old);
-                            forget_scalar(rhs);
-                            sum
-                        }
-                        _ => concat_owned(old, rhs),
-                    };
-                    put(self.local_mut(idx), result);
-                }
-                Op::ConcatLocal(i) => {
-                    let rhs = self.pop();
-                    let old = self.pop();
-                    let idx = base + i as usize;
-                    let result = match (&old, &rhs) {
-                        (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
-                        _ => {
-                            // Drop the variable's own reference first, so `old` can be extended in place.
-                            let released = match &mut self.stack[idx] {
-                                Value::Cell(c) => {
-                                    std::mem::replace(&mut *c.borrow_mut(), Value::Undef)
-                                }
-                                slot => std::mem::replace(slot, Value::Undef),
-                            };
-                            drop(released);
-                            concat_owned(old, rhs)
-                        }
-                    };
-                    match &mut self.stack[idx] {
-                        Value::Cell(c) => *c.borrow_mut() = result.clone(),
-                        slot => *slot = result.clone(),
-                    }
-                    self.stack.push(result);
-                }
-                Op::GetLocalProp(s, n) => {
-                    let name: &str = &proto.names[n as usize];
-                    let idx = base + s as usize;
-                    let direct = match self.local(idx) {
-                        Value::Obj(o) => Some(obj_get(o, name).unwrap_or(Value::Undef)),
-                        _ => None,
-                    };
-                    let v = match direct {
-                        Some(v) => v,
-                        None => {
-                            self.sync_ip(ip);
-                            let obj = self.stack[idx].clone();
-                            self.get_prop(&obj, name)?
-                        }
-                    };
-                    self.stack.push(v);
-                }
-                Op::AddLK(s, k) => {
-                    let r = match (self.local(base + s as usize), konst(&proto, k)) {
-                        (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
-                        (a, b) => add(a, b),
-                    };
-                    self.stack.push(r);
-                }
-                Op::SubLK(s, k) => {
-                    let r = match (self.local(base + s as usize), konst(&proto, k)) {
-                        (Value::Num(x), Value::Num(y)) => x - y,
-                        (a, b) => to_num(a) - to_num(b),
-                    };
-                    self.stack.push(Value::Num(r));
-                }
-                Op::MulLK(s, k) => {
-                    let r = match (self.local(base + s as usize), konst(&proto, k)) {
-                        (Value::Num(x), Value::Num(y)) => x * y,
-                        (a, b) => to_num(a) * to_num(b),
-                    };
-                    self.stack.push(Value::Num(r));
-                }
-                Op::ModLK(s, k) => {
-                    let r = match (self.local(base + s as usize), konst(&proto, k)) {
-                        (Value::Num(x), Value::Num(y)) => js_mod(*x, *y),
-                        (a, b) => js_mod(to_num(a), to_num(b)),
-                    };
-                    self.stack.push(Value::Num(r));
-                }
-
-                Op::GetUpval(i) => {
-                    let v = self.frames.last().unwrap().closure.upvals[i as usize]
-                        .borrow()
-                        .clone();
-                    self.stack.push(v);
-                }
-                Op::SetUpval(i) => {
-                    let v = self.top().clone();
-                    *self.frames.last().unwrap().closure.upvals[i as usize].borrow_mut() = v;
-                }
-
-                Op::GetGlobal(i) => {
-                    self.sync_ip(ip);
-                    let name: &str = &proto.names[i as usize];
-                    let found = self.globals.get(name).cloned();
-                    match found {
-                        Some(v) => self.stack.push(v),
-                        None => {
-                            return Err(self
-                                .make_error("ReferenceError", &format!("{} is not defined", name)))
-                        }
-                    }
-                }
-                Op::GetGlobalOrUndef(i) => {
-                    let v = self
-                        .globals
-                        .get(&*proto.names[i as usize])
-                        .cloned()
-                        .unwrap_or(Value::Undef);
-                    self.stack.push(v);
-                }
-                Op::SetGlobal(i) => {
-                    let name = proto.names[i as usize].clone();
-                    let v = self.top().clone();
-                    self.globals.insert(name, v);
-                }
-                Op::ConstAssign(_) => {
-                    self.sync_ip(ip);
-                    return Err(self.make_error("TypeError", "Assignment to constant variable."));
-                }
-
-                Op::GetProp(i) => {
-                    self.sync_ip(ip);
-                    let obj = self.pop();
-                    let v = self.get_prop(&obj, &proto.names[i as usize])?;
-                    self.stack.push(v);
-                }
-                Op::SetProp(i) => {
-                    self.sync_ip(ip);
-                    let v = self.pop();
-                    let obj = self.pop();
-                    self.set_prop(&obj, &proto.names[i as usize], v.clone())?;
-                    self.stack.push(v);
-                }
-                Op::GetIndex => {
-                    self.sync_ip(ip);
-                    let (obj, key) = self.pop_pair();
-                    let v = self.get_index(&obj, &key)?;
-                    self.stack.push(v);
-                }
-                Op::SetIndex => {
-                    self.sync_ip(ip);
-                    let v = self.pop();
-                    let key = self.pop();
-                    let obj = self.pop();
-                    self.set_index(&obj, &key, v.clone())?;
-                    self.stack.push(v);
-                }
-
-                Op::Add => match self.num_pair() {
-                    Some((x, y)) => self.replace_top2(Value::Num(x + y)),
-                    None => {
-                        let (a, b) = self.pop_pair();
-                        self.stack.push(add(&a, &b));
-                    }
-                },
-                Op::Sub => match self.num_pair() {
-                    Some((x, y)) => self.replace_top2(Value::Num(x - y)),
-                    None => {
-                        let (a, b) = self.pop_pair();
-                        self.stack.push(Value::Num(to_num(&a) - to_num(&b)));
-                    }
-                },
-                Op::Mul => match self.num_pair() {
-                    Some((x, y)) => self.replace_top2(Value::Num(x * y)),
-                    None => {
-                        let (a, b) = self.pop_pair();
-                        self.stack.push(Value::Num(to_num(&a) * to_num(&b)));
-                    }
-                },
-                Op::Div => match self.num_pair() {
-                    Some((x, y)) => self.replace_top2(Value::Num(x / y)),
-                    None => {
-                        let (a, b) = self.pop_pair();
-                        self.stack.push(Value::Num(to_num(&a) / to_num(&b)));
-                    }
-                },
-                Op::Mod => match self.num_pair() {
-                    Some((x, y)) => self.replace_top2(Value::Num(js_mod(x, y))),
-                    None => {
-                        let (a, b) = self.pop_pair();
-                        self.stack.push(Value::Num(js_mod(to_num(&a), to_num(&b))));
-                    }
-                },
-                Op::Pow => {
-                    let (a, b) = self.pop_pair();
-                    self.stack.push(Value::Num(to_num(&a).powf(to_num(&b))));
-                }
-                Op::Eq => {
-                    let (a, b) = self.pop_pair();
-                    self.stack.push(Value::Bool(loose_eq(&a, &b)));
-                }
-                Op::Ne => {
-                    let (a, b) = self.pop_pair();
-                    self.stack.push(Value::Bool(!loose_eq(&a, &b)));
-                }
-                Op::StrictEq => match self.num_pair() {
-                    Some((x, y)) => self.replace_top2(Value::Bool(x == y)),
-                    None => {
-                        let (a, b) = self.pop_pair();
-                        self.stack.push(Value::Bool(strict_eq(&a, &b)));
-                    }
-                },
-                Op::StrictNe => match self.num_pair() {
-                    Some((x, y)) => self.replace_top2(Value::Bool(x != y)),
-                    None => {
-                        let (a, b) = self.pop_pair();
-                        self.stack.push(Value::Bool(!strict_eq(&a, &b)));
-                    }
-                },
-                Op::Lt => match self.num_pair() {
-                    Some((x, y)) => self.replace_top2(Value::Bool(x < y)),
-                    None => {
-                        let (a, b) = self.pop_pair();
-                        self.stack
-                            .push(Value::Bool(compare(&a, &b) == Some(Ordering::Less)));
-                    }
-                },
-                Op::Le => match self.num_pair() {
-                    Some((x, y)) => self.replace_top2(Value::Bool(x <= y)),
-                    None => {
-                        let (a, b) = self.pop_pair();
-                        let r = matches!(compare(&a, &b), Some(Ordering::Less | Ordering::Equal));
-                        self.stack.push(Value::Bool(r));
-                    }
-                },
-                Op::Gt => match self.num_pair() {
-                    Some((x, y)) => self.replace_top2(Value::Bool(x > y)),
-                    None => {
-                        let (a, b) = self.pop_pair();
-                        self.stack
-                            .push(Value::Bool(compare(&a, &b) == Some(Ordering::Greater)));
-                    }
-                },
-                Op::Ge => match self.num_pair() {
-                    Some((x, y)) => self.replace_top2(Value::Bool(x >= y)),
-                    None => {
-                        let (a, b) = self.pop_pair();
-                        let r =
-                            matches!(compare(&a, &b), Some(Ordering::Greater | Ordering::Equal));
-                        self.stack.push(Value::Bool(r));
-                    }
-                },
-                Op::Neg => {
-                    let a = self.pop();
-                    self.stack.push(Value::Num(-to_num(&a)));
-                }
-                Op::Not => {
-                    let a = self.pop();
-                    self.stack.push(Value::Bool(!truthy(&a)));
-                }
-                Op::ToNumber => {
-                    let a = self.pop();
-                    self.stack.push(Value::Num(to_num(&a)));
-                }
-                Op::TypeOf => {
-                    let a = self.pop();
-                    self.stack.push(Value::str(type_of(&a)));
-                }
-                Op::ToStr => {
-                    let a = self.pop();
-                    let s = match a {
-                        Value::Str(_) => a,
-                        other => Value::str(&to_str(&other)),
-                    };
-                    self.stack.push(s);
-                }
-
-                Op::Jump(t) => ip = t as usize,
-                Op::JumpIfFalse(t) => {
-                    if !truthy(&self.pop()) {
-                        ip = t as usize;
-                    }
-                }
-                Op::JumpIfTrue(t) => {
-                    if truthy(&self.pop()) {
-                        ip = t as usize;
-                    }
-                }
-                Op::JumpIfNotLt(t) => {
-                    let less = match self.num_pair() {
-                        Some((x, y)) => x < y,
-                        None => {
-                            let (a, b) = self.pop_pair();
-                            compare(&a, &b) == Some(Ordering::Less)
-                        }
-                    };
-                    self.stack.truncate(self.stack.len() - 2);
-                    if !less {
-                        ip = t as usize;
-                    }
-                }
-                Op::JumpIfNotLe(t) => {
-                    let (a, b) = self.pop_pair();
-                    if !matches!(compare(&a, &b), Some(Ordering::Less | Ordering::Equal)) {
-                        ip = t as usize;
-                    }
-                }
-                Op::JumpIfNotGt(t) => {
-                    let (a, b) = self.pop_pair();
-                    if compare(&a, &b) != Some(Ordering::Greater) {
-                        ip = t as usize;
-                    }
-                }
-                Op::JumpIfNotGe(t) => {
-                    let (a, b) = self.pop_pair();
-                    if !matches!(compare(&a, &b), Some(Ordering::Greater | Ordering::Equal)) {
-                        ip = t as usize;
-                    }
-                }
-                Op::JumpIfLtLK(s, k, t) => {
-                    let less = match (self.local(base + s as usize), konst(&proto, k)) {
-                        (Value::Num(x), Value::Num(y)) => *x < *y,
-                        (a, b) => compare(a, b) == Some(Ordering::Less),
-                    };
-                    if less {
-                        ip = t as usize;
-                    }
-                }
-                Op::JumpIfLtLL(a, b, t) => {
-                    let less = match (self.local(base + a as usize), self.local(base + b as usize))
-                    {
-                        (Value::Num(x), Value::Num(y)) => *x < *y,
-                        (x, y) => compare(x, y) == Some(Ordering::Less),
-                    };
-                    if less {
-                        ip = t as usize;
-                    }
-                }
-                Op::JumpIfNotLtLK(s, k, t) => {
-                    let less = match (self.local(base + s as usize), konst(&proto, k)) {
-                        (Value::Num(x), Value::Num(y)) => *x < *y,
-                        (a, b) => compare(a, b) == Some(Ordering::Less),
-                    };
-                    if !less {
-                        ip = t as usize;
-                    }
-                }
-                Op::JumpIfNotLtLL(a, b, t) => {
-                    let less = match (self.local(base + a as usize), self.local(base + b as usize))
-                    {
-                        (Value::Num(x), Value::Num(y)) => *x < *y,
-                        (x, y) => compare(x, y) == Some(Ordering::Less),
-                    };
-                    if !less {
-                        ip = t as usize;
-                    }
-                }
-                Op::AndJump(t) => {
-                    if truthy(self.top()) {
-                        self.pop();
-                    } else {
-                        ip = t as usize;
-                    }
-                }
-                Op::OrJump(t) => {
-                    if truthy(self.top()) {
-                        ip = t as usize;
-                    } else {
-                        self.pop();
-                    }
-                }
-                Op::NullishJump(t) => {
-                    if self.top().is_nullish() {
-                        self.pop();
-                    } else {
-                        ip = t as usize;
-                    }
-                }
-
                 Op::Call(argc) => {
                     self.sync_ip(ip);
                     let argc = argc as usize;
@@ -995,69 +766,8 @@ impl Vm {
                     self.invoke(callee, argc, true)?;
                     (proto, base, ip) = self.frame_state();
                 }
-                Op::Return => {
-                    let v = self.pop();
-                    let f = self.frames.pop().unwrap();
-                    self.truncate_stack(f.base - 2);
-                    let v = match f.ctor {
-                        Some(obj) if !v.is_object() => obj,
-                        _ => v,
-                    };
-                    self.stack.push(v);
-                    if self.frames.len() == base_depth {
-                        return Ok(());
-                    }
-                    (proto, base, ip) = self.frame_state();
-                }
-
-                Op::Closure(i) => {
-                    let child = proto.protos[i as usize].clone();
-                    let frame = self.frames.last().unwrap();
-                    let mut upvals = Vec::with_capacity(child.upvals.len());
-                    for d in &child.upvals {
-                        if d.from_local {
-                            let cell = match &self.stack[base + d.index as usize] {
-                                Value::Cell(c) => c.clone(),
-                                other => Rc::new(RefCell::new(other.clone())),
-                            };
-                            upvals.push(cell);
-                        } else {
-                            upvals.push(frame.closure.upvals[d.index as usize].clone());
-                        }
-                    }
-                    let this = if child.is_arrow {
-                        if proto.is_arrow {
-                            frame.closure.this.clone()
-                        } else {
-                            self.stack[base - 1].clone()
-                        }
-                    } else {
-                        Value::Undef
-                    };
-                    self.stack.push(Value::Func(Rc::new(Closure {
-                        proto: child,
-                        upvals,
-                        this,
-                    })));
-                }
-                Op::NewArray => self.stack.push(Value::arr(Vec::new())),
-                Op::ArrayExtend => {
-                    let src = self.pop();
-                    let items: Vec<Value> = match &src {
-                        Value::Arr(a) => a.borrow().clone(),
-                        Value::Str(s) => s.chars().map(|c| Value::str(&c.to_string())).collect(),
-                        _ => {
-                            self.sync_ip(ip);
-                            return Err(self.make_error("TypeError", "value is not iterable"));
-                        }
-                    };
-                    if let Some(Value::Arr(a)) = self.stack.last() {
-                        a.borrow_mut().extend(items);
-                    }
-                }
                 Op::CallSpread | Op::NewSpread => {
                     self.sync_ip(ip);
-                    let is_new = op == Op::NewSpread;
                     let list = self.pop();
                     let items: Vec<Value> = match &list {
                         Value::Arr(a) => a.borrow().clone(),
@@ -1066,54 +776,581 @@ impl Vm {
                     let argc = items.len();
                     self.stack.extend(items);
                     let callee = self.stack[self.stack.len() - argc - 2].clone();
-                    self.invoke(callee, argc, is_new)?;
+                    self.invoke(callee, argc, op == Op::NewSpread)?;
                     (proto, base, ip) = self.frame_state();
                 }
-                Op::ArrayPush => {
-                    let v = self.pop();
-                    if let Some(Value::Arr(a)) = self.stack.last() {
-                        a.borrow_mut().push(v);
+                Op::Return => {
+                    self.do_return();
+                    if self.frames.len() == base_depth {
+                        return Ok(());
                     }
+                    (proto, base, ip) = self.frame_state();
                 }
-                Op::NewObject(n) => self.stack.push(Value::obj_with(n as usize)),
-                Op::InitProp(i) => {
-                    let v = self.pop();
-                    if let Some(Value::Obj(o)) = self.stack.last() {
-                        obj_put(o, &proto.names[i as usize], v);
-                    }
-                }
-                Op::ToKeys => {
-                    let v = self.pop();
-                    let keys: Vec<Value> = match &v {
-                        Value::Obj(o) => o.borrow().iter().map(|(k, _)| Value::str(k)).collect(),
-                        Value::Arr(a) => (0..a.borrow().len())
-                            .map(|i| Value::str(&i.to_string()))
-                            .collect(),
-                        Value::Str(s) => (0..s.chars().count())
-                            .map(|i| Value::str(&i.to_string()))
-                            .collect(),
-                        _ => Vec::new(),
-                    };
-                    self.stack.push(Value::arr(keys));
-                }
-
-                Op::Throw => {
-                    let v = self.pop();
-                    return Err(v);
-                }
-                Op::PushHandler(t) => {
-                    let height = self.stack.len();
-                    self.frames
-                        .last_mut()
-                        .unwrap()
-                        .handlers
-                        .push((t as usize, height));
-                }
-                Op::PopHandler => {
-                    self.frames.last_mut().unwrap().handlers.pop();
-                }
+                _ => ip = self.exec_op(op, &proto, base, ip)?,
             }
         }
+    }
+
+    /// Runs one instruction that neither calls nor returns. `ip` is the instruction after it.
+    /// Returns the instruction to run next, which is `ip` unless a jump was taken.
+    /// Native code runs the same code through `jit::rt`, so every instruction has one definition.
+    /// Inlined into the interpreter loop, where a call per instruction would cost most of the time.
+    #[inline(always)]
+    pub(crate) fn exec_op(
+        &mut self,
+        op: Op,
+        proto: &Proto,
+        base: usize,
+        ip: usize,
+    ) -> Result<usize, Value> {
+        match op {
+            Op::Const(i) => {
+                let v = proto.consts[i as usize].clone();
+                self.stack.push(v);
+            }
+            Op::Undef => self.stack.push(Value::Undef),
+            Op::Null => self.stack.push(Value::Null),
+            Op::True => self.stack.push(Value::Bool(true)),
+            Op::False => self.stack.push(Value::Bool(false)),
+            Op::This => {
+                let this = if proto.is_arrow {
+                    self.frames.last().unwrap().closure.this.clone()
+                } else {
+                    self.stack[base - 1].clone()
+                };
+                self.stack.push(this);
+            }
+            Op::Pop => {
+                if let Some(v) = self.stack.pop() {
+                    forget_scalar(v);
+                }
+            }
+            Op::Dup => {
+                let v = self.top().clone();
+                self.stack.push(v);
+            }
+            Op::Swap => {
+                let n = self.stack.len();
+                self.stack.swap(n - 1, n - 2);
+            }
+            Op::Dup2 => {
+                let n = self.stack.len();
+                let a = self.stack[n - 2].clone();
+                let b = self.stack[n - 1].clone();
+                self.stack.push(a);
+                self.stack.push(b);
+            }
+
+            Op::GetLocal(i) => {
+                let v = self.local(base + i as usize).clone();
+                self.stack.push(v);
+            }
+            Op::SetLocal(i) => {
+                let v = self.top().clone();
+                put(self.local_mut(base + i as usize), v);
+            }
+            Op::PopToLocal(i) => {
+                let v = self.pop();
+                put(self.local_mut(base + i as usize), v);
+            }
+            Op::IncLocal(i) => self.step_local(base + i as usize, 1.0),
+            Op::DecLocal(i) => self.step_local(base + i as usize, -1.0),
+            Op::NewCell(i) => {
+                self.stack[base + i as usize] = Value::Cell(Rc::new(RefCell::new(Value::Undef)));
+            }
+            Op::GetBoxed(i) => {
+                let v = match &self.stack[base + i as usize] {
+                    Value::Cell(c) => c.borrow().clone(),
+                    other => other.clone(),
+                };
+                self.stack.push(v);
+            }
+            Op::SetBoxed(i) => {
+                let idx = base + i as usize;
+                let v = self.top().clone();
+                match &self.stack[idx] {
+                    Value::Cell(c) => *c.borrow_mut() = v,
+                    _ => self.stack[idx] = Value::Cell(Rc::new(RefCell::new(v))),
+                }
+            }
+            Op::BoxParam(i) => {
+                let idx = base + i as usize;
+                let v = std::mem::replace(&mut self.stack[idx], Value::Undef);
+                self.stack[idx] = Value::Cell(Rc::new(RefCell::new(v)));
+            }
+            Op::Rebox(i) => {
+                let idx = base + i as usize;
+                let v = match &self.stack[idx] {
+                    Value::Cell(c) => c.borrow().clone(),
+                    other => other.clone(),
+                };
+                self.stack[idx] = Value::Cell(Rc::new(RefCell::new(v)));
+            }
+            Op::AddToLocal(i) => {
+                let rhs = self.pop();
+                let idx = base + i as usize;
+                // Moving the value out first lets a string be extended in place.
+                let old = std::mem::replace(self.local_mut(idx), Value::Undef);
+                let result = match (&old, &rhs) {
+                    (Value::Num(x), Value::Num(y)) => {
+                        let sum = Value::Num(x + y);
+                        forget_scalar(old);
+                        forget_scalar(rhs);
+                        sum
+                    }
+                    _ => concat_owned(old, rhs),
+                };
+                put(self.local_mut(idx), result);
+            }
+            Op::ConcatLocal(i) => {
+                let rhs = self.pop();
+                let old = self.pop();
+                let idx = base + i as usize;
+                let result = match (&old, &rhs) {
+                    (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
+                    _ => {
+                        // Drop the variable's own reference first, so `old` can be extended in place.
+                        let released = match &mut self.stack[idx] {
+                            Value::Cell(c) => std::mem::replace(&mut *c.borrow_mut(), Value::Undef),
+                            slot => std::mem::replace(slot, Value::Undef),
+                        };
+                        drop(released);
+                        concat_owned(old, rhs)
+                    }
+                };
+                match &mut self.stack[idx] {
+                    Value::Cell(c) => *c.borrow_mut() = result.clone(),
+                    slot => *slot = result.clone(),
+                }
+                self.stack.push(result);
+            }
+            Op::GetLocalProp(s, n) => {
+                let name: &str = &proto.names[n as usize];
+                let idx = base + s as usize;
+                let direct = match self.local(idx) {
+                    Value::Obj(o) => Some(obj_get(o, name).unwrap_or(Value::Undef)),
+                    _ => None,
+                };
+                let v = match direct {
+                    Some(v) => v,
+                    None => {
+                        self.sync_ip(ip);
+                        let obj = self.stack[idx].clone();
+                        self.get_prop(&obj, name)?
+                    }
+                };
+                self.stack.push(v);
+            }
+            Op::AddLK(s, k) => {
+                let r = match (self.local(base + s as usize), konst(proto, k)) {
+                    (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
+                    (a, b) => add(a, b),
+                };
+                self.stack.push(r);
+            }
+            Op::SubLK(s, k) => {
+                let r = match (self.local(base + s as usize), konst(proto, k)) {
+                    (Value::Num(x), Value::Num(y)) => x - y,
+                    (a, b) => to_num(a) - to_num(b),
+                };
+                self.stack.push(Value::Num(r));
+            }
+            Op::MulLK(s, k) => {
+                let r = match (self.local(base + s as usize), konst(proto, k)) {
+                    (Value::Num(x), Value::Num(y)) => x * y,
+                    (a, b) => to_num(a) * to_num(b),
+                };
+                self.stack.push(Value::Num(r));
+            }
+            Op::ModLK(s, k) => {
+                let r = match (self.local(base + s as usize), konst(proto, k)) {
+                    (Value::Num(x), Value::Num(y)) => js_mod(*x, *y),
+                    (a, b) => js_mod(to_num(a), to_num(b)),
+                };
+                self.stack.push(Value::Num(r));
+            }
+
+            Op::GetUpval(i) => {
+                let v = self.frames.last().unwrap().closure.upvals[i as usize]
+                    .borrow()
+                    .clone();
+                self.stack.push(v);
+            }
+            Op::SetUpval(i) => {
+                let v = self.top().clone();
+                *self.frames.last().unwrap().closure.upvals[i as usize].borrow_mut() = v;
+            }
+
+            Op::GetGlobal(i) => {
+                self.sync_ip(ip);
+                let name: &str = &proto.names[i as usize];
+                let found = self.globals.get(name).cloned();
+                match found {
+                    Some(v) => self.stack.push(v),
+                    None => {
+                        return Err(
+                            self.make_error("ReferenceError", &format!("{} is not defined", name))
+                        )
+                    }
+                }
+            }
+            Op::GetGlobalOrUndef(i) => {
+                let v = self
+                    .globals
+                    .get(&*proto.names[i as usize])
+                    .cloned()
+                    .unwrap_or(Value::Undef);
+                self.stack.push(v);
+            }
+            Op::SetGlobal(i) => {
+                let name = proto.names[i as usize].clone();
+                let v = self.top().clone();
+                self.globals.insert(name, v);
+            }
+            Op::ConstAssign(_) => {
+                self.sync_ip(ip);
+                return Err(self.make_error("TypeError", "Assignment to constant variable."));
+            }
+
+            Op::GetProp(i) => {
+                self.sync_ip(ip);
+                let obj = self.pop();
+                let v = self.get_prop(&obj, &proto.names[i as usize])?;
+                self.stack.push(v);
+            }
+            Op::SetProp(i) => {
+                self.sync_ip(ip);
+                let v = self.pop();
+                let obj = self.pop();
+                self.set_prop(&obj, &proto.names[i as usize], v.clone())?;
+                self.stack.push(v);
+            }
+            Op::GetIndex => {
+                self.sync_ip(ip);
+                let (obj, key) = self.pop_pair();
+                let v = self.get_index(&obj, &key)?;
+                self.stack.push(v);
+            }
+            Op::SetIndex => {
+                self.sync_ip(ip);
+                let v = self.pop();
+                let key = self.pop();
+                let obj = self.pop();
+                self.set_index(&obj, &key, v.clone())?;
+                self.stack.push(v);
+            }
+
+            Op::Add => match self.num_pair() {
+                Some((x, y)) => self.replace_top2(Value::Num(x + y)),
+                None => {
+                    let (a, b) = self.pop_pair();
+                    self.stack.push(add(&a, &b));
+                }
+            },
+            Op::Sub => match self.num_pair() {
+                Some((x, y)) => self.replace_top2(Value::Num(x - y)),
+                None => {
+                    let (a, b) = self.pop_pair();
+                    self.stack.push(Value::Num(to_num(&a) - to_num(&b)));
+                }
+            },
+            Op::Mul => match self.num_pair() {
+                Some((x, y)) => self.replace_top2(Value::Num(x * y)),
+                None => {
+                    let (a, b) = self.pop_pair();
+                    self.stack.push(Value::Num(to_num(&a) * to_num(&b)));
+                }
+            },
+            Op::Div => match self.num_pair() {
+                Some((x, y)) => self.replace_top2(Value::Num(x / y)),
+                None => {
+                    let (a, b) = self.pop_pair();
+                    self.stack.push(Value::Num(to_num(&a) / to_num(&b)));
+                }
+            },
+            Op::Mod => match self.num_pair() {
+                Some((x, y)) => self.replace_top2(Value::Num(js_mod(x, y))),
+                None => {
+                    let (a, b) = self.pop_pair();
+                    self.stack.push(Value::Num(js_mod(to_num(&a), to_num(&b))));
+                }
+            },
+            Op::Pow => {
+                let (a, b) = self.pop_pair();
+                self.stack.push(Value::Num(to_num(&a).powf(to_num(&b))));
+            }
+            Op::Eq => {
+                let (a, b) = self.pop_pair();
+                self.stack.push(Value::Bool(loose_eq(&a, &b)));
+            }
+            Op::Ne => {
+                let (a, b) = self.pop_pair();
+                self.stack.push(Value::Bool(!loose_eq(&a, &b)));
+            }
+            Op::StrictEq => match self.num_pair() {
+                Some((x, y)) => self.replace_top2(Value::Bool(x == y)),
+                None => {
+                    let (a, b) = self.pop_pair();
+                    self.stack.push(Value::Bool(strict_eq(&a, &b)));
+                }
+            },
+            Op::StrictNe => match self.num_pair() {
+                Some((x, y)) => self.replace_top2(Value::Bool(x != y)),
+                None => {
+                    let (a, b) = self.pop_pair();
+                    self.stack.push(Value::Bool(!strict_eq(&a, &b)));
+                }
+            },
+            Op::Lt => match self.num_pair() {
+                Some((x, y)) => self.replace_top2(Value::Bool(x < y)),
+                None => {
+                    let (a, b) = self.pop_pair();
+                    self.stack
+                        .push(Value::Bool(compare(&a, &b) == Some(Ordering::Less)));
+                }
+            },
+            Op::Le => match self.num_pair() {
+                Some((x, y)) => self.replace_top2(Value::Bool(x <= y)),
+                None => {
+                    let (a, b) = self.pop_pair();
+                    let r = matches!(compare(&a, &b), Some(Ordering::Less | Ordering::Equal));
+                    self.stack.push(Value::Bool(r));
+                }
+            },
+            Op::Gt => match self.num_pair() {
+                Some((x, y)) => self.replace_top2(Value::Bool(x > y)),
+                None => {
+                    let (a, b) = self.pop_pair();
+                    self.stack
+                        .push(Value::Bool(compare(&a, &b) == Some(Ordering::Greater)));
+                }
+            },
+            Op::Ge => match self.num_pair() {
+                Some((x, y)) => self.replace_top2(Value::Bool(x >= y)),
+                None => {
+                    let (a, b) = self.pop_pair();
+                    let r = matches!(compare(&a, &b), Some(Ordering::Greater | Ordering::Equal));
+                    self.stack.push(Value::Bool(r));
+                }
+            },
+            Op::Neg => {
+                let a = self.pop();
+                self.stack.push(Value::Num(-to_num(&a)));
+            }
+            Op::Not => {
+                let a = self.pop();
+                self.stack.push(Value::Bool(!truthy(&a)));
+            }
+            Op::ToNumber => {
+                let a = self.pop();
+                self.stack.push(Value::Num(to_num(&a)));
+            }
+            Op::TypeOf => {
+                let a = self.pop();
+                self.stack.push(Value::str(type_of(&a)));
+            }
+            Op::ToStr => {
+                let a = self.pop();
+                let s = match a {
+                    Value::Str(_) => a,
+                    other => Value::str(&to_str(&other)),
+                };
+                self.stack.push(s);
+            }
+
+            Op::Jump(t) => return Ok(t as usize),
+            Op::JumpIfFalse(t) => {
+                if !truthy(&self.pop()) {
+                    return Ok(t as usize);
+                }
+            }
+            Op::JumpIfTrue(t) => {
+                if truthy(&self.pop()) {
+                    return Ok(t as usize);
+                }
+            }
+            Op::JumpIfNotLt(t) => {
+                let less = match self.num_pair() {
+                    Some((x, y)) => x < y,
+                    None => {
+                        let (a, b) = self.pop_pair();
+                        compare(&a, &b) == Some(Ordering::Less)
+                    }
+                };
+                self.stack.truncate(self.stack.len() - 2);
+                if !less {
+                    return Ok(t as usize);
+                }
+            }
+            Op::JumpIfNotLe(t) => {
+                let (a, b) = self.pop_pair();
+                if !matches!(compare(&a, &b), Some(Ordering::Less | Ordering::Equal)) {
+                    return Ok(t as usize);
+                }
+            }
+            Op::JumpIfNotGt(t) => {
+                let (a, b) = self.pop_pair();
+                if compare(&a, &b) != Some(Ordering::Greater) {
+                    return Ok(t as usize);
+                }
+            }
+            Op::JumpIfNotGe(t) => {
+                let (a, b) = self.pop_pair();
+                if !matches!(compare(&a, &b), Some(Ordering::Greater | Ordering::Equal)) {
+                    return Ok(t as usize);
+                }
+            }
+            Op::JumpIfLtLK(s, k, t) => {
+                let less = match (self.local(base + s as usize), konst(proto, k)) {
+                    (Value::Num(x), Value::Num(y)) => *x < *y,
+                    (a, b) => compare(a, b) == Some(Ordering::Less),
+                };
+                if less {
+                    return Ok(t as usize);
+                }
+            }
+            Op::JumpIfLtLL(a, b, t) => {
+                let less = match (self.local(base + a as usize), self.local(base + b as usize)) {
+                    (Value::Num(x), Value::Num(y)) => *x < *y,
+                    (x, y) => compare(x, y) == Some(Ordering::Less),
+                };
+                if less {
+                    return Ok(t as usize);
+                }
+            }
+            Op::JumpIfNotLtLK(s, k, t) => {
+                let less = match (self.local(base + s as usize), konst(proto, k)) {
+                    (Value::Num(x), Value::Num(y)) => *x < *y,
+                    (a, b) => compare(a, b) == Some(Ordering::Less),
+                };
+                if !less {
+                    return Ok(t as usize);
+                }
+            }
+            Op::JumpIfNotLtLL(a, b, t) => {
+                let less = match (self.local(base + a as usize), self.local(base + b as usize)) {
+                    (Value::Num(x), Value::Num(y)) => *x < *y,
+                    (x, y) => compare(x, y) == Some(Ordering::Less),
+                };
+                if !less {
+                    return Ok(t as usize);
+                }
+            }
+            Op::AndJump(t) => {
+                if truthy(self.top()) {
+                    self.pop();
+                } else {
+                    return Ok(t as usize);
+                }
+            }
+            Op::OrJump(t) => {
+                if truthy(self.top()) {
+                    return Ok(t as usize);
+                } else {
+                    self.pop();
+                }
+            }
+            Op::NullishJump(t) => {
+                if self.top().is_nullish() {
+                    self.pop();
+                } else {
+                    return Ok(t as usize);
+                }
+            }
+
+            Op::Closure(i) => {
+                let child = proto.protos[i as usize].clone();
+                let frame = self.frames.last().unwrap();
+                let mut upvals = Vec::with_capacity(child.upvals.len());
+                for d in &child.upvals {
+                    if d.from_local {
+                        let cell = match &self.stack[base + d.index as usize] {
+                            Value::Cell(c) => c.clone(),
+                            other => Rc::new(RefCell::new(other.clone())),
+                        };
+                        upvals.push(cell);
+                    } else {
+                        upvals.push(frame.closure.upvals[d.index as usize].clone());
+                    }
+                }
+                let this = if child.is_arrow {
+                    if proto.is_arrow {
+                        frame.closure.this.clone()
+                    } else {
+                        self.stack[base - 1].clone()
+                    }
+                } else {
+                    Value::Undef
+                };
+                self.stack.push(Value::Func(Rc::new(Closure {
+                    proto: child,
+                    upvals,
+                    this,
+                })));
+            }
+            Op::NewArray => self.stack.push(Value::arr(Vec::new())),
+            Op::ArrayExtend => {
+                let src = self.pop();
+                let items: Vec<Value> = match &src {
+                    Value::Arr(a) => a.borrow().clone(),
+                    Value::Str(s) => s.chars().map(|c| Value::str(&c.to_string())).collect(),
+                    _ => {
+                        self.sync_ip(ip);
+                        return Err(self.make_error("TypeError", "value is not iterable"));
+                    }
+                };
+                if let Some(Value::Arr(a)) = self.stack.last() {
+                    a.borrow_mut().extend(items);
+                }
+            }
+            Op::ArrayPush => {
+                let v = self.pop();
+                if let Some(Value::Arr(a)) = self.stack.last() {
+                    a.borrow_mut().push(v);
+                }
+            }
+            Op::NewObject(n) => self.stack.push(Value::obj_with(n as usize)),
+            Op::InitProp(i) => {
+                let v = self.pop();
+                if let Some(Value::Obj(o)) = self.stack.last() {
+                    obj_put(o, &proto.names[i as usize], v);
+                }
+            }
+            Op::ToKeys => {
+                let v = self.pop();
+                let keys: Vec<Value> = match &v {
+                    Value::Obj(o) => o.borrow().iter().map(|(k, _)| Value::str(k)).collect(),
+                    Value::Arr(a) => (0..a.borrow().len())
+                        .map(|i| Value::str(&i.to_string()))
+                        .collect(),
+                    Value::Str(s) => (0..s.chars().count())
+                        .map(|i| Value::str(&i.to_string()))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                self.stack.push(Value::arr(keys));
+            }
+
+            Op::Throw => {
+                let v = self.pop();
+                return Err(v);
+            }
+            Op::PushHandler(t) => {
+                let height = self.stack.len();
+                self.frames
+                    .last_mut()
+                    .unwrap()
+                    .handlers
+                    .push((t as usize, height));
+            }
+            Op::PopHandler => {
+                self.frames.last_mut().unwrap().handlers.pop();
+            }
+            Op::Call(_) | Op::New(_) | Op::CallSpread | Op::NewSpread | Op::Return => {
+                unreachable!("calls and returns are run by the dispatcher, not by exec_op")
+            }
+        }
+        Ok(ip)
     }
 
     // ----- properties -------------------------------------------------------

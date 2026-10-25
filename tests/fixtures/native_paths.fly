@@ -1,0 +1,51 @@
+function makeCounter(step) {
+  let count = 0;
+  return { inc() { count += step; return count; }, read() { return count; } };
+}
+const c = makeCounter(3);
+for (let i = 0; i < 4; i++) c.inc();
+console.log(c.inc(), c.read());
+const fns = [];
+for (let i = 0; i < 3; i++) fns.push(() => i * 10);
+console.log(fns.map(f => f()).join(","));
+function classify(n) {
+  switch (n % 4) {
+    case 0: return "zero";
+    case 1: return "one";
+    case 2: { let s = "two"; return s + "!"; }
+    default: return "other";
+  }
+}
+let out = "";
+for (let i = 0; i < 9; i++) out += classify(i) + ";";
+console.log(out);
+let visits = 0;
+function search(list, target) {
+  let found = -1;
+  for (let i = 0; i < list.length; i++) {
+    try {
+      if (list[i] === target) { found = i; break; }
+      if (list[i] < 0) continue;
+    } finally {
+      visits += 1;
+    }
+  }
+  return found;
+}
+console.log(search([4, -1, 7, 9, 11], 9), search([1, 2], 5), visits);
+const obj = { n: 2, add(x) { return this.n + x; } };
+const arrow = () => obj.add(5);
+let acc = 0;
+for (let k = 0; k < 5; k++) acc += arrow() * k;
+console.log(acc, typeof obj.add, typeof missing, obj.missing === undefined);
+let text = "";
+for (let k = 0; k < 6; k++) text = text + k;
+console.log(text.length, "abc".toUpperCase().padStart(6, "*"), [3, 1, 2].sort().join(""));
+let x = 5;
+x -= 2; x *= 3; x /= 2; x %= 4;
+console.log(x, -x, !x, x === 0.5, x !== 0.5, x <= 0.5, x >= 0.5);
+const nested = [[1, 2], [3, [4, 5]]];
+console.log(JSON.stringify(nested), nested[1][1][0] + nested[0][1]);
+let total = 0;
+do { total += 2; } while (total < 9);
+console.log(total, Math.max(total, 3), Math.floor(total / 4));

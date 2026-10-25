@@ -11,6 +11,16 @@ fn fixtures_dir() -> PathBuf {
 
 #[test]
 fn fixtures_match_expected_output() {
+    check_fixtures(&[]);
+}
+
+/// The same fixtures on the interpreter, which runs when native code is turned off.
+#[test]
+fn interpreter_matches_expected_output() {
+    check_fixtures(&[("FLY_JIT", "0")]);
+}
+
+fn check_fixtures(env: &[(&str, &str)]) {
     let dir = fixtures_dir();
     let mut scripts: Vec<PathBuf> = fs::read_dir(&dir)
         .expect("fixtures directory exists")
@@ -36,6 +46,7 @@ fn fixtures_match_expected_output() {
         let output = Command::new(env!("CARGO_BIN_EXE_fly"))
             .arg(&name)
             .current_dir(&dir)
+            .envs(env.iter().copied())
             .output()
             .expect("fly runs");
         let stdout = String::from_utf8_lossy(&output.stdout);

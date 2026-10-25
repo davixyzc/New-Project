@@ -1,0 +1,27 @@
+const vals = [0, -0, 1, -1, 7, -7, 2147483647, -2147483648, 2147483648, 1.5, -1.5, 4, -4, 6, -6, NaN, Infinity, -Infinity, 1e300, 0.1, 2, -2];
+function show(v) {
+  if (v === 0 && 1 / v < 0) return "-0";
+  return String(v);
+}
+let out = [];
+for (let i = 0; i < vals.length; i++) {
+  const x = vals[i];
+  out.push(show(x % 7), show(x % 2), show(x % 1), show(x % 3), show(x % 2147483647));
+  out.push(x < 2, x <= 2, x > 2, x >= 2, x === 2, x !== 2, x === x);
+  out.push(show(-x), !!x, !x);
+  out.push(show(x + 1), show(x - 1), show(x * 3), show(x / 4));
+  if (x < 2) out.push("lt"); else out.push("ge");
+  if (x >= 1) out.push("ge1");
+}
+console.log(out.join(" "));
+let acc = 0;
+for (let i = -20; i < 20; i++) {
+  acc += i % 3;
+  acc += (i * 2) % 5;
+}
+console.log(acc, show(-4 % 2), show(-0 % 5), show(0 % -5));
+let n = 0;
+do { n++; } while (n < 5);
+let w = 10;
+while (w > 0) w -= 3;
+console.log(n, w);

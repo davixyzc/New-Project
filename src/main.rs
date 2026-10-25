@@ -4,6 +4,7 @@ mod ast;
 mod builtins;
 mod bytecode;
 mod compiler;
+mod jit;
 mod lexer;
 mod parser;
 mod value;

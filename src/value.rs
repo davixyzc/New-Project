@@ -28,6 +28,7 @@ pub struct Closure {
 }
 
 #[derive(Clone)]
+#[repr(u8)]
 pub enum Value {
     Undef,
     Null,
@@ -92,10 +93,22 @@ pub fn obj_set(obj: &ObjRef, name: &str, v: Value) {
 /// Sets an own property using a key that is already shared, so no string is copied.
 pub fn obj_put(obj: &ObjRef, key: &Rc<str>, v: Value) {
     let mut props = obj.borrow_mut();
-    match props.iter().position(|(k, _)| **k == **key) {
+    match props
+        .iter()
+        .position(|(k, _)| Rc::ptr_eq(k, key) || **k == **key)
+    {
         Some(i) => props[i].1 = v,
         None => props.push((key.clone(), v)),
     }
+}
+
+/// Reads an own property using a shared key. Keys from one prototype share their allocation,
+/// so the pointer usually matches before any text is compared.
+pub fn obj_get_key(obj: &ObjRef, key: &Rc<str>) -> Option<Value> {
+    obj.borrow()
+        .iter()
+        .find(|(k, _)| Rc::ptr_eq(k, key) || **k == **key)
+        .map(|(_, v)| v.clone())
 }
 
 /// Reads an own property of a plain object.
@@ -263,7 +276,13 @@ pub fn js_mod(a: f64, b: f64) -> f64 {
         && ai.unsigned_abs() < LIMIT
         && bi.unsigned_abs() < LIMIT
     {
-        (ai % bi) as f64
+        let r = ai % bi;
+        // A zero remainder takes the sign of the dividend, so `-4 % 2` is -0.
+        if r == 0 && a.is_sign_negative() {
+            -0.0
+        } else {
+            r as f64
+        }
     } else {
         a % b
     }

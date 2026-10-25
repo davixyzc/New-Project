@@ -691,6 +691,7 @@ impl Compiler {
 
         let fs = self.funcs.pop().unwrap();
         Ok(Proto {
+            native: Default::default(),
             name: def.name.clone().unwrap_or_default(),
             file: self.file.clone(),
             code: fs.code,

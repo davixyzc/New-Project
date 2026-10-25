@@ -152,4 +152,15 @@ pub struct Proto {
     pub has_rest: bool,
     pub nlocals: u32,
     pub is_arrow: bool,
+    /// Native code, compiled on first use.
+    pub native: crate::jit::Slot,
+}
+
+impl Proto {
+    /// The function's native code, if it has any.
+    pub fn native(&self) -> Option<&crate::jit::Native> {
+        self.native
+            .get_or_init(|| crate::jit::compile(self))
+            .as_deref()
+    }
 }
