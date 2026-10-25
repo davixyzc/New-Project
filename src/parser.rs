@@ -50,7 +50,7 @@ pub fn parse_program(src: &str) -> Result<FuncDef, String> {
         body.push(p.statement()?);
     }
     let hidden = p.hidden.pop().unwrap_or_default();
-    let body = finish_body(hidden, Vec::new(), body, 1);
+    let body = finish_body(hidden, &[], Vec::new(), body, 1);
     let params = ["exports", "require", "module", "__filename", "__dirname"]
         .iter()
         .map(|n| Param {
@@ -311,6 +311,15 @@ impl Parser {
     fn fresh(&mut self) -> String {
         self.temps += 1;
         format!("%{}", self.temps)
+    }
+
+    /// Declares `name` for the whole current function, unless it is declared already (see `finish_body`).
+    fn hoist(&mut self, name: &str) {
+        if let Some(list) = self.hidden.last_mut() {
+            if !list.iter().any(|n| n == name) {
+                list.push(name.to_string());
+            }
+        }
     }
 
     /// A new temporary that the current function declares at its start, for a destructuring assignment.
@@ -611,6 +620,7 @@ impl Parser {
 
     fn var_decl(&mut self) -> Result<Stmt, String> {
         let line = self.line();
+        let is_var = self.is_word("var");
         let kind = if self.is_word("const") {
             VarKind::Const
         } else {
@@ -644,7 +654,31 @@ impl Parser {
                 break;
             }
         }
+        if is_var {
+            return Ok(self.var_assignments(decls, line));
+        }
         Ok(Stmt::Var(kind, decls, line))
+    }
+
+    /// `var` declares its names for the whole function, so each one is declared at the start of the function (see
+    /// `finish_body`), and an initializer assigns it.
+    fn var_assignments(&mut self, decls: Vec<(String, Option<Expr>)>, line: u32) -> Stmt {
+        let mut assigns = Vec::new();
+        for (name, init) in decls {
+            self.hoist(&name);
+            if let Some(value) = init {
+                assigns.push(Expr::Assign(
+                    "=",
+                    Box::new(Expr::Ident(name)),
+                    Box::new(value),
+                ));
+            }
+        }
+        match assigns.len() {
+            0 => Stmt::Empty,
+            1 => Stmt::Expr(assigns.remove(0), line),
+            _ => Stmt::Expr(Expr::Sequence(assigns), line),
+        }
     }
 
     fn for_statement(&mut self, line: u32) -> Result<Stmt, String> {
@@ -659,8 +693,13 @@ impl Parser {
             } else {
                 VarKind::Let
             };
+            let is_var = self.is_word("var");
             self.pos += 1;
             let name = self.ident()?;
+            if is_var {
+                self.hoist(&name);
+                return self.for_in_of(None, name, line);
+            }
             return self.for_in_of(Some(kind), name, line);
         }
         if decl_ahead && matches!(self.peek_at(1), Tok::Punct(p) if *p == "[" || *p == "{") {
@@ -812,7 +851,13 @@ impl Parser {
         let prologue = self.pattern_params(patterns, line);
         self.expect("{")?;
         let body = self.block_body()?;
-        let body = finish_body(self.hidden.pop().unwrap_or_default(), prologue, body, line);
+        let body = finish_body(
+            self.hidden.pop().unwrap_or_default(),
+            &params,
+            prologue,
+            body,
+            line,
+        );
         Ok(FuncDef {
             name,
             params,
@@ -875,7 +920,13 @@ impl Parser {
             let e = self.assign()?;
             vec![Stmt::Return(Some(e), line)]
         };
-        let body = finish_body(self.hidden.pop().unwrap_or_default(), prologue, body, line);
+        let body = finish_body(
+            self.hidden.pop().unwrap_or_default(),
+            &params,
+            prologue,
+            body,
+            line,
+        );
         Ok(FuncDef {
             name: None,
             params,
@@ -1083,6 +1134,10 @@ impl Parser {
         if self.eat_word("void") {
             let e = self.unary()?;
             return Ok(Expr::Unary("void", Box::new(e)));
+        }
+        if self.eat_word("delete") {
+            let e = self.unary()?;
+            return Ok(Expr::Unary("delete", Box::new(e)));
         }
         self.postfix()
     }
@@ -1410,10 +1465,21 @@ fn decls_of(binds: Vec<(Expr, Expr)>) -> Vec<(String, Option<Expr>)> {
 
 /// The statements of a function body: its hidden temporaries are declared first, then the parts of its parameters
 /// that are patterns, then the body.
-fn finish_body(hidden: Vec<String>, prologue: Vec<Stmt>, body: Vec<Stmt>, line: u32) -> Vec<Stmt> {
+fn finish_body(
+    hidden: Vec<String>,
+    params: &[Param],
+    prologue: Vec<Stmt>,
+    body: Vec<Stmt>,
+    line: u32,
+) -> Vec<Stmt> {
     let mut out = Vec::new();
-    if !hidden.is_empty() {
-        let temps = hidden.into_iter().map(|t| (t, None)).collect();
+    // A `var` with the name of a parameter is that parameter, so the name is not declared again.
+    let temps: Vec<(String, Option<Expr>)> = hidden
+        .into_iter()
+        .filter(|t| !params.iter().any(|p| p.name == *t))
+        .map(|t| (t, None))
+        .collect();
+    if !temps.is_empty() {
         out.push(Stmt::Var(VarKind::Let, temps, line));
     }
     out.extend(prologue);

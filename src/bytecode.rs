@@ -149,6 +149,10 @@ pub enum Op {
     GetSuperCtor,
     /// `value instanceof ctor`: pops the constructor and the value, and pushes whether the value is an instance.
     InstanceOf,
+    /// `delete obj.name`: pops the object, and pushes whether the property is gone.
+    DeleteProp(u32),
+    /// `delete obj[key]`: pops the key and the object, and pushes whether the property is gone.
+    DeleteIndex,
     // exceptions
     Throw,
     PushHandler(u32),

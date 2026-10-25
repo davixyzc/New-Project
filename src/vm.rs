@@ -488,6 +488,24 @@ fn array_key_index(name: &str) -> Option<usize> {
     }
 }
 
+/// `delete obj[name]`: removes an own property of an object, or sets an element of an array to undefined. The result
+/// is true in every case here, since no property is protected from deletion.
+fn delete_property(obj: &Value, name: &str) {
+    match obj {
+        Value::Obj(o) => {
+            o.borrow_mut().remove(name);
+        }
+        Value::Arr(a) => {
+            if let Some(i) = array_key_index(name) {
+                if let Some(slot) = a.borrow_mut().get_mut(i) {
+                    *slot = Value::Undef;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn index_of(n: f64) -> Option<usize> {
     if n >= 0.0 && n < MAX_ARRAY_GROW as f64 && n as usize as f64 == n {
         Some(n as usize)
@@ -1623,6 +1641,17 @@ impl Vm {
                 let v = self.pop();
                 let found = self.instance_of(&v, &ctor)?;
                 self.stack.push(Value::Bool(found));
+            }
+            Op::DeleteProp(i) => {
+                let obj = self.pop();
+                delete_property(&obj, &proto.names[i as usize]);
+                self.stack.push(Value::Bool(true));
+            }
+            Op::DeleteIndex => {
+                let key = self.pop();
+                let obj = self.pop();
+                delete_property(&obj, &to_str(&key));
+                self.stack.push(Value::Bool(true));
             }
             Op::SetIndex2Local(s) => {
                 self.sync_ip(ip);

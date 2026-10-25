@@ -1396,6 +1396,28 @@ impl Compiler {
                         return Ok(());
                     }
                 }
+                if *op == "delete" {
+                    // A property is removed from its object, and the result says whether it is gone. Anything that is
+                    // not a property is evaluated, and the result is true.
+                    match &**x {
+                        Expr::Member(obj, name) => {
+                            self.expr(obj)?;
+                            let c = self.name_const(name);
+                            self.emit(Op::DeleteProp(c));
+                        }
+                        Expr::Index(obj, key) => {
+                            self.expr(obj)?;
+                            self.expr(key)?;
+                            self.emit(Op::DeleteIndex);
+                        }
+                        other => {
+                            self.expr(other)?;
+                            self.emit(Op::Pop);
+                            self.emit(Op::True);
+                        }
+                    }
+                    return Ok(());
+                }
                 if *op == "void" {
                     // `void x` evaluates `x`, then yields undefined.
                     self.expr(x)?;

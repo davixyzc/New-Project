@@ -1,0 +1,42 @@
+{
+  const o = { a: 1, b: 2, c: 3 };
+  console.log(delete o.a, o.a, "b" in o, Object.keys(o).join());
+  console.log(delete o["c"], JSON.stringify(o), delete o.missing, delete 5);
+}
+{
+  const arr = [1, 2, 3];
+  console.log(delete arr[1], arr.length, arr.join());
+}
+{
+  console.log(-0, [-0], String(-0), `${-0}`, 0 * -1, Math.hypot(), [Math.sign(-0)]);
+}
+{
+  function fazVar() {
+    const fs = [];
+    for (var j = 0; j < 3; j++) fs.push(() => j);
+    return fs;
+  }
+  console.log(fazVar().map((f) => f()).join(","));
+  function hoisted() {
+    const before = typeof later;
+    var later = 7;
+    if (true) {
+      var inner = "block";
+    }
+    return before + " " + later + " " + inner;
+  }
+  console.log(hoisted());
+  function param(x) {
+    var x;
+    return x;
+  }
+  console.log(param(42));
+  function loops() {
+    var total = 0;
+    for (var k in { a: 1, b: 2 }) total = total + k.length;
+    for (var item of [4, 5]) total = total + item;
+    var a = 1, b, c = a + 1;
+    return [total, a, b, c, k, item].join(" ");
+  }
+  console.log(loops());
+}

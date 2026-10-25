@@ -56,6 +56,8 @@ pub fn inspect(v: &Value, top: bool, depth: usize) -> String {
         Value::Undef => "undefined".to_string(),
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),
+        // Node.js prints a negative zero with its sign, but a string or a join of it has none.
+        Value::Num(n) if *n == 0.0 && n.is_sign_negative() => "-0".to_string(),
         Value::Num(n) => num_to_string(*n),
         Value::Str(s) => {
             if top {

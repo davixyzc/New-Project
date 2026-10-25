@@ -177,6 +177,7 @@ pub(super) fn delta(op: Op) -> i32 {
         | Op::UShr
         | Op::In
         | Op::InstanceOf
+        | Op::DeleteIndex
         | Op::Eq
         | Op::Ne
         | Op::StrictEq
@@ -208,6 +209,7 @@ pub(super) fn delta(op: Op) -> i32 {
         | Op::ToStr
         | Op::ToKeys
         | Op::ToItems
+        | Op::DeleteProp(_)
         | Op::PushHandler(_)
         | Op::PopHandler => 0,
         // Jumps, `Return` and `Throw` are described by `successors`.

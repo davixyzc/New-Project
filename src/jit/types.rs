@@ -165,6 +165,8 @@ fn keeps_locals(op: Op) -> bool {
             | Op::GetSuper(_)
             | Op::GetSuperCtor
             | Op::InstanceOf
+            | Op::DeleteProp(_)
+            | Op::DeleteIndex
             | Op::Closure(_)
             | Op::Pow
     )

@@ -122,6 +122,24 @@ impl Props {
         }
     }
 
+    /// Removes the own property `name`, and tells whether there was one.
+    pub fn remove(&mut self, name: &str) -> bool {
+        let Some(i) = self.position(name) else {
+            return false;
+        };
+        self.items.remove(i);
+        if self.index.is_some() {
+            self.index = Some(
+                self.items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (k, _))| (k.clone(), i))
+                    .collect(),
+            );
+        }
+        true
+    }
+
     /// Adds a property, which the caller has checked is not there yet.
     pub fn push(&mut self, key: Rc<str>, v: Value) {
         if let Some(index) = &mut self.index {

@@ -347,7 +347,9 @@ fn hypot(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     if values.iter().any(|x| x.is_nan()) {
         return Ok(Value::Num(f64::NAN));
     }
-    Ok(Value::Num(values.iter().map(|x| x * x).sum::<f64>().sqrt()))
+    Ok(Value::Num(
+        values.iter().fold(0.0, |acc, x| acc + x * x).sqrt(),
+    ))
 }
 
 fn cbrt(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
