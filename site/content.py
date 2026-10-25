@@ -23,7 +23,7 @@ HOME = {
         ("familiar", "let, const, arrow functions, template strings, spread, switch, try com finally e require. Quem conhece JavaScript lê o código sem aprender outra sintaxe."),
     ],
     "desempenho": "Os mesmos programas em cada runtime, com a mediana de 5 execuções intercaladas, em 4 vCPU. Barras menores são mais rápidas. Os tempos incluem o início de cada processo.",
-    "como_ler": "De 24 programas, o fly é mais rápido que o Bun e o Node em 10. Nos outros 14 ainda perde, em geral nos programas com acessos a propriedades e elementos de arrays e chamadas de função. Diferenças menores que 10% dependem da máquina.",
+    "como_ler": "De 24 programas, o fly é mais rápido que o Bun e o Node em 9. Nos outros 15 ainda perde, em geral nos programas com acessos a propriedades e elementos de arrays e chamadas de função. Diferenças menores que 10% dependem da máquina, e alguns casos perto de 1× trocam de lado de uma medição para outra.",
     "limites": [
         "Não há classes, Promises, async/await, expressões regulares nem destructuring.",
         "Strings são indexadas por caractere Unicode, não por unidade UTF-16. Por isso `\"😀\".length` é 1.",

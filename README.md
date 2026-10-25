@@ -82,40 +82,40 @@ Métodos de **number**: `toFixed`, `toString` (com radix de 2 a 36).
 
 Medido nesta máquina (Xeon 2,1 GHz, 4 vCPU), em tempo de parede do processo inteiro, inicialização incluída. `benchmarks/bench.py` roda os 24 programas de `benchmarks/` com o fly, o Node 22 e o Bun 1.4, intercalados, e confere que as três saídas são iguais. Cada número é a mediana de 5 execuções. Cada programa existe em duas versões com o mesmo código, `.fly` e `.js`. Os números são do `cargo build --release` comum, sem PGO.
 
-**A máquina varia bastante, até dentro de uma mesma sessão**: o `tak` foi de 98 a 147 ms em medições diferentes. Compare as colunas de uma mesma tabela, nunca tabelas de medições diferentes. Acima de 1× o fly ganha; abaixo, perde.
+**A máquina varia bastante, até dentro de uma mesma sessão**: o `tak` foi de 98 a 147 ms em medições diferentes, e os casos perto de 1× trocam de lado de uma rodada para outra. Compare as colunas de uma mesma tabela, nunca tabelas de medições diferentes. Acima de 1× o fly ganha; abaixo, perde.
 
 | benchmark | fly ms | Node ms | Bun ms | fly em relação ao melhor dos outros | resultado |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `array` | 65,2 | 159,9 | 84,7 | 1,30× | fly ganha |
-| `binary_trees` | 178,2 | 85,8 | 65,2 | 0,37× | perde |
-| `char_codes` | 159,6 | 75,7 | 48,1 | 0,30× | perde |
-| `closures` | 172,0 | 51,5 | 68,4 | 0,30× | perde |
-| `console_lines` | 35,5 | 710,0 | 145,8 | 4,11× | fly ganha |
-| `dict_keys` | 17,9 | 61,7 | 28,3 | 1,58× | fly ganha |
-| `exceptions` | 57,6 | 414,7 | 69,2 | 1,20× | fly ganha |
-| `fib` | 11,7 | 55,2 | 19,2 | 1,64× | fly ganha |
-| `json` | 274,3 | 217,0 | 110,0 | 0,40× | perde |
-| `life` | 2200,3 | 393,4 | 214,3 | 0,10× | perde |
-| `loop` | 36,8 | 114,3 | 56,2 | 1,53× | fly ganha |
-| `mandelbrot` | 21,8 | 61,3 | 24,1 | 1,11× | fly ganha |
-| `matrix` | 123,6 | 55,4 | 28,2 | 0,23× | perde |
-| `method_calls` | 197,7 | 60,6 | 19,7 | 0,10× | perde |
-| `nbody_objects` | 492,1 | 70,6 | 31,1 | 0,06× | perde |
-| `num_to_string` | 246,9 | 99,0 | 104,1 | 0,40× | perde |
-| `objects` | 5,7 | 52,8 | 33,9 | 5,95× | fly ganha |
-| `sieve` | 628,7 | 268,8 | 160,3 | 0,25× | perde |
-| `sort_cmp` | 208,1 | 209,8 | 106,6 | 0,51× | perde |
-| `split_join` | 107,0 | 115,7 | 78,3 | 0,73× | perde |
-| `str_index` | 13,9 | 56,7 | 15,1 | 1,09× | fly ganha |
-| `string` | 10,4 | 60,3 | 27,6 | 2,65× | fly ganha |
-| `string_builder` | 121,8 | 155,5 | 93,3 | 0,77× | perde |
-| `tak` | 111,5 | 79,3 | 27,9 | 0,25× | perde |
+| `array` | 69,8 | 150,6 | 81,9 | 1,17× | fly ganha |
+| `binary_trees` | 204,8 | 86,1 | 59,6 | 0,29× | perde |
+| `char_codes` | 182,0 | 75,6 | 50,7 | 0,28× | perde |
+| `closures` | 214,0 | 54,9 | 90,4 | 0,26× | perde |
+| `console_lines` | 40,2 | 728,0 | 164,2 | 4,08× | fly ganha |
+| `dict_keys` | 24,2 | 88,1 | 36,7 | 1,52× | fly ganha |
+| `exceptions` | 70,1 | 432,9 | 76,1 | 1,09× | fly ganha |
+| `fib` | 13,4 | 58,1 | 26,9 | 2,01× | fly ganha |
+| `json` | 290,1 | 224,7 | 116,8 | 0,40× | perde |
+| `life` | 2304,0 | 453,8 | 253,2 | 0,11× | perde |
+| `loop` | 33,1 | 113,1 | 52,3 | 1,58× | fly ganha |
+| `mandelbrot` | 22,9 | 76,8 | 23,9 | 1,04× | fly ganha |
+| `matrix` | 122,1 | 65,2 | 27,0 | 0,22× | perde |
+| `method_calls` | 193,1 | 49,2 | 17,0 | 0,09× | perde |
+| `nbody_objects` | 427,8 | 70,2 | 33,6 | 0,08× | perde |
+| `num_to_string` | 159,6 | 123,3 | 103,9 | 0,65× | perde |
+| `objects` | 5,4 | 63,2 | 31,6 | 5,85× | fly ganha |
+| `sieve` | 747,8 | 257,1 | 163,0 | 0,22× | perde |
+| `sort_cmp` | 240,0 | 181,5 | 121,8 | 0,51× | perde |
+| `split_join` | 90,5 | 143,0 | 76,7 | 0,85× | perde |
+| `str_index` | 16,4 | 60,5 | 14,0 | 0,85× | perde |
+| `string` | 14,7 | 83,5 | 30,0 | 2,04× | fly ganha |
+| `string_builder` | 106,9 | 174,3 | 95,9 | 0,90× | perde |
+| `tak` | 108,9 | 61,4 | 26,4 | 0,24× | perde |
 
-**Leitura**: o fly é mais rápido que o Node e o Bun em **10 de 24** programas. Ganha na inicialização (3,4 ms, contra 8,5 ms do Bun e 45,7 ms do Node), na saída de muitas linhas, nas exceções, em objetos que não escapam (substituição escalar), na recursão e nos laços numéricos, em `mandelbrot`, num objeto usado como dicionário (`dict_keys`, depois do índice por nome) e em strings.
+**Leitura**: o fly é mais rápido que o Node e o Bun em **9 de 24** programas. Ganha com folga na inicialização (3,4 ms, contra 8,5 ms do Bun e 45,7 ms do Node), na saída de muitas linhas (`console_lines`, cerca de 4× sobre o Bun), em objetos que não escapam (substituição escalar, `objects`), em recursão e laços numéricos (`fib`, `loop`), num objeto usado como dicionário (`dict_keys`, depois do índice por nome) e em strings. Ganha por pouco em `array`, `exceptions` e `mandelbrot`, e esses três podem perder em outra rodada.
 
-Perde nos programas em que o tempo está em acessos a propriedades e elementos de arrays e em chamadas de função: `life` e `nbody_objects` ficam em 0,10× e 0,06× do melhor dos outros, `method_calls` em 0,10×, e `matrix` e `sieve` perto de 0,25×. Pelo `callgrind`, o custo está nos auxiliares que cada acesso chama, que copiam e soltam valores com contagem de referências, e na busca de propriedade sem cache.
+Perde nos programas em que o tempo está em acessos a propriedades e elementos de arrays e em chamadas de função: `life` e `nbody_objects` ficam em 0,11× e 0,08× do melhor dos outros, `method_calls` em 0,09×, e `matrix`, `sieve` e `tak` perto de 0,25×. Pelo `callgrind`, o custo está nos auxiliares que cada acesso chama, que copiam e soltam valores com contagem de referências, e na busca de propriedade sem cache.
 
-**O objetivo de ser mais rápido em qualquer situação ainda não foi atingido**: 14 das 24 cargas ficam atrás de pelo menos um dos dois. O próximo passo para essas cargas é um JIT que compile acessos a arrays e propriedades para código nativo, com caches inline de propriedade e sem uma contagem de referências por leitura.
+**O objetivo de ser mais rápido em qualquer situação ainda não foi atingido**: 15 das 24 cargas ficam atrás de pelo menos um dos dois. O próximo passo para essas cargas é um JIT que compile acessos a arrays e propriedades para código nativo, com caches inline de propriedade e sem uma contagem de referências por leitura.
 
 | | fly | Bun 1.4 | Node 22 |
 | --- | ---: | ---: | ---: |
