@@ -7,6 +7,7 @@
 mod codegen;
 mod mem;
 mod rt;
+mod types;
 mod x64;
 
 use std::cell::OnceCell;

@@ -14,6 +14,7 @@
 use std::rc::Rc;
 
 use super::rt::{self, STATUS_JUMP};
+use super::types::{number_slots, Numbers};
 use super::x64::*;
 use crate::bytecode::{Op, Proto};
 use crate::value::Value;
@@ -30,7 +31,8 @@ const OWNING: u32 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 9);
 /// extra entry for the end) and the number of stack slots a frame needs.
 pub fn compile(proto: &Proto) -> Option<(Vec<u8>, Vec<usize>, usize)> {
     let (depth, deepest) = depths(proto)?;
-    let mut gen = Gen::new(proto, &depth);
+    let types = number_slots(proto, &depth, deepest);
+    let mut gen = Gen::new(proto, &depth, types);
     gen.prologue();
     gen.body();
     gen.epilogue();
@@ -41,7 +43,7 @@ pub fn compile(proto: &Proto) -> Option<(Vec<u8>, Vec<usize>, usize)> {
 
 /// The operand depth before each instruction (-1 when it cannot run), and the deepest one.
 /// `None` if the depths disagree at a join, which would mean the bytecode is malformed.
-fn depths(proto: &Proto) -> Option<(Vec<i32>, i32)> {
+pub(super) fn depths(proto: &Proto) -> Option<(Vec<i32>, i32)> {
     let n = proto.code.len();
     if n == 0 {
         return None;
@@ -69,7 +71,7 @@ fn depths(proto: &Proto) -> Option<(Vec<i32>, i32)> {
 
 /// The instructions that can run after `op` at `ip` when `d` operands are on the stack, each
 /// with the depth it is reached at.
-fn successors(op: Op, ip: usize, d: i32) -> Vec<(usize, i32)> {
+pub(super) fn successors(op: Op, ip: usize, d: i32) -> Vec<(usize, i32)> {
     let next = ip + 1;
     let at = |t: u32| t as usize;
     match op {
@@ -92,7 +94,7 @@ fn successors(op: Op, ip: usize, d: i32) -> Vec<(usize, i32)> {
 }
 
 /// How much an instruction that falls through changes the operand depth.
-fn delta(op: Op) -> i32 {
+pub(super) fn delta(op: Op) -> i32 {
     match op {
         Op::Const(_)
         | Op::Undef
@@ -300,10 +302,14 @@ struct Gen<'a> {
     done: Label,
     /// The xmm register that holds each local's number, for the locals used in loops.
     cache: Vec<Option<u8>>,
+    /// The slots known to hold numbers before each instruction (see `types`).
+    types: Numbers,
+    /// The instruction being translated.
+    cur: usize,
 }
 
 impl<'a> Gen<'a> {
-    fn new(proto: &'a Proto, depth: &'a [i32]) -> Gen<'a> {
+    fn new(proto: &'a Proto, depth: &'a [i32], types: Numbers) -> Gen<'a> {
         let mut a = Asm::default();
         let ops = (0..=proto.code.len()).map(|_| a.label()).collect();
         let threw = a.label();
@@ -318,6 +324,8 @@ impl<'a> Gen<'a> {
             threw,
             done,
             cache: cached_locals(proto),
+            types,
+            cur: 0,
         }
     }
 
@@ -352,10 +360,24 @@ impl<'a> Gen<'a> {
 
     // ----- shared sequences -------------------------------------------------
 
-    /// Jumps to `slow` unless the value at `m` has the tag `tag`.
+    /// Jumps to `slow` unless the value at `m` has the tag `tag`. A number the analysis already
+    /// proves is not checked again.
     fn check_tag(&mut self, m: Mem, tag: u8, slow: Label) {
+        if tag == TAG_NUM && self.known_number(m) {
+            return;
+        }
         self.a.cmp8_imm(m, tag);
         self.a.jcc(CC_NE, slow);
+    }
+
+    /// Whether the slot at `m` is known to hold a number before the current instruction.
+    fn known_number(&self, m: Mem) -> bool {
+        let slot = (m.disp / 16) as usize;
+        self.types
+            .get(self.cur)
+            .and_then(|known| known.get(slot))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Jumps to `slow` if the value at `m` owns a reference, which a plain overwrite would leak.
@@ -598,6 +620,7 @@ impl<'a> Gen<'a> {
                 continue;
             }
             let op = self.proto.code[ip];
+            self.cur = ip;
             match op {
                 Op::Jump(t) => {
                     let target = self.target(t);

@@ -52,6 +52,17 @@ function strings() {
   console.log(s, count);
 }
 
+// A number local that becomes a string inside the loop must not be taken as a number afterwards.
+function grows() {
+  let total = 0;
+  for (let i = 0; i < 3; i++) {
+    total += i;
+    total += "!";
+    total += i;
+  }
+  console.log(total);
+}
+
 function negzero() {
   let z = -0;
   for (let i = 0; i < 3; i++) {
@@ -65,3 +76,4 @@ calls(5);
 thrown(4);
 strings();
 negzero();
+grows();
