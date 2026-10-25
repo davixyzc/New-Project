@@ -228,7 +228,7 @@ fn join(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
         Value::Undef => ",".to_string(),
         v => to_str(&v),
     };
-    Ok(Value::str(&join_items(&a, &sep, None)))
+    Ok(Value::from_string(join_items(&a, &sep, None)))
 }
 
 fn last_index_of(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {

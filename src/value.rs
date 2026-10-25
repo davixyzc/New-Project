@@ -201,6 +201,11 @@ impl Value {
         Value::Str(Rc::new(JsStr::new(s.to_string())))
     }
 
+    /// A string value that takes over `s`, without copying it.
+    pub fn from_string(s: String) -> Value {
+        Value::Str(Rc::new(JsStr::new(s)))
+    }
+
     pub fn arr(items: Vec<Value>) -> Value {
         Value::Arr(Rc::new(RefCell::new(items)))
     }
@@ -355,7 +360,9 @@ pub fn num_to_string(n: f64) -> String {
         return "0".to_string();
     }
     if n.fract() == 0.0 && n.abs() < 9.0e15 {
-        return format!("{}", n as i64);
+        let mut text = String::with_capacity(20);
+        push_int(&mut text, n as i64);
+        return text;
     }
     let sign = if n < 0.0 { "-" } else { "" };
     let (digits, point) = shortest_digits(n.abs());
@@ -464,17 +471,20 @@ pub fn join_items(a: &ArrRef, sep: &str, outer: Option<&Joining>) -> String {
         link = j.outer;
     }
     let joining = Joining { id, outer };
-    a.borrow()
-        .iter()
-        .map(|item| {
-            if item.is_nullish() {
-                String::new()
-            } else {
-                to_str_in(item, Some(&joining))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(sep)
+    let items = a.borrow();
+    let mut text = String::new();
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            text.push_str(sep);
+        }
+        match item {
+            Value::Undef | Value::Null => {}
+            Value::Str(s) => text.push_str(s),
+            Value::Num(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => push_int(&mut text, *n as i64),
+            other => text.push_str(&to_str_in(other, Some(&joining))),
+        }
+    }
+    text
 }
 
 /// `Number(text)` for a string: decimal numbers, `0x`, `0o` and `0b` integers, and the names `Infinity` and
@@ -563,11 +573,46 @@ pub fn add(a: &Value, b: &Value) -> Value {
             let mut s = String::with_capacity(x.len() + y.len());
             s.push_str(x);
             s.push_str(y);
-            Value::str(&s)
+            Value::from_string(s)
         }
-        _ if is_textual(a) || is_textual(b) => Value::str(&(to_str(a) + &to_str(b))),
+        _ if is_textual(a) || is_textual(b) => {
+            let mut s = String::new();
+            append_text(&mut s, a);
+            append_text(&mut s, b);
+            Value::from_string(s)
+        }
         _ => Value::Num(to_num(a) + to_num(b)),
     }
+}
+
+/// Appends the text of `v`, which is how `+` and template strings read a value, to `s`. Numbers that are whole are
+/// written straight into `s`, without a temporary string.
+fn append_text(s: &mut String, v: &Value) {
+    match v {
+        Value::Str(x) => s.push_str(x),
+        Value::Num(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => push_int(s, *n as i64),
+        other => s.push_str(&to_str(other)),
+    }
+}
+
+/// Appends the decimal digits of `v`.
+fn push_int(s: &mut String, v: i64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    let mut rest = v.unsigned_abs();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    if v < 0 {
+        s.push('-');
+    }
+    // The digits are ASCII, so they are valid UTF-8.
+    s.push_str(std::str::from_utf8(&digits[at..]).unwrap_or("0"));
 }
 
 /// The longest text the string operations build, in bytes. It is V8's limit, which V8 counts in characters.

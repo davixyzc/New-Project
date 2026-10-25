@@ -380,7 +380,7 @@ fn pad(vm: &mut Vm, this: &Value, args: &[Value], at_start: bool) -> Result<Valu
     } else {
         format!("{s}{padding}")
     };
-    Ok(Value::str(&text))
+    Ok(Value::from_string(text))
 }
 
 fn pad_start(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -399,7 +399,7 @@ fn concat(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
             return Err(vm.make_error("RangeError", "Invalid string length"));
         }
     }
-    Ok(Value::str(&s))
+    Ok(Value::from_string(s))
 }
 
 /// `at(index)`: the character at `index`, counting a negative index from the end. Outside the string is undefined.
@@ -473,7 +473,7 @@ fn number_to_string(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, V
         ));
     }
     if radix == 10.0 {
-        return Ok(Value::str(&num_to_string(n)));
+        return Ok(Value::from_string(num_to_string(n)));
     }
     Ok(Value::str(&num_to_radix(n, radix as u32)))
 }

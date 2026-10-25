@@ -445,7 +445,7 @@ fn from_char_code(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, V
             char::from_u32(unit).unwrap_or('\u{fffd}')
         })
         .collect();
-    Ok(Value::str(&text))
+    Ok(Value::from_string(text))
 }
 
 // ----- errors and conversions ------------------------------------------------
@@ -487,7 +487,9 @@ fn number(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 fn string(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(Value::str(&args.first().map(to_str).unwrap_or_default()))
+    Ok(Value::from_string(
+        args.first().map(to_str).unwrap_or_default(),
+    ))
 }
 
 fn boolean(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {

@@ -1582,7 +1582,8 @@ impl Vm {
                     if joins_too_long(&a, &b) {
                         return Err(self.make_error("RangeError", "Invalid string length"));
                     }
-                    self.stack.push(add(&a, &b));
+                    // A string temporary that nothing else holds is extended in place (see `concat_owned`).
+                    self.stack.push(concat_owned(a, b));
                 }
             },
             Op::Sub => match self.num_pair() {
