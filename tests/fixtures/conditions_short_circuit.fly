@@ -1,0 +1,30 @@
+// Conditions with && and ! in if, while, do-while, for and the ternary operator. Each operand runs only when
+// the operands before it allow it, and the side effects show which operands ran.
+let log = "";
+function t(name, v) { log = log + name; return v; }
+let n = 0;
+if (t("a", 1) && t("b", 0) && t("c", 1)) log = log + "X"; else log = log + "Y";
+if (!(t("d", 0) && t("e", 1))) log = log + "Z";
+if (t("f", 1) && !t("g", 0)) log = log + "W";
+console.log(log);
+log = "";
+let i = 0, j = 10;
+while (i < 5 && j > 6) { i++; j--; }
+console.log(i, j);
+i = 0;
+do { i++; } while (i < 3 && i !== 2);
+console.log(i);
+let steps = 0;
+for (let k = 0; k < 10 && steps < 4; k++) steps++;
+console.log(steps);
+const x = 3, y = 7;
+console.log(x < y && y < 10 ? "in" : "out", x > y && y < 10 ? "in" : "out", !(x < y) || y > 100 ? "p" : "q");
+let count = 0;
+for (let a = 0; a < 4; a++) for (let b = 0; b < 4; b++) if ((a + b) % 2 === 0 && !(a === b) || a === 3 && b === 0) count++;
+console.log(count);
+let mixed = 0;
+while (!(mixed >= 3) && (mixed < 100 || false)) mixed += 1;
+console.log(mixed, "" && "never", 0 || "fallback", null && t("h", 1));
+let v = 5;
+if (v > 1 && (v = v * 2) > 9) log = log + "yes" + v;
+console.log(log);

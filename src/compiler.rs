@@ -830,11 +830,11 @@ impl Compiler {
                 match otherwise {
                     Some(e) => {
                         let to_end = self.emit(Op::Jump(0));
-                        self.patch(to_else);
+                        self.patch_all(to_else);
                         self.stmt(e)?;
                         self.patch(to_end);
                     }
-                    None => self.patch(to_else),
+                    None => self.patch_all(to_else),
                 }
             }
             Stmt::While(cond, body, line) => {
@@ -1382,7 +1382,7 @@ impl Compiler {
                 let to_else = self.jump_if_false(cond)?;
                 self.expr(a)?;
                 let to_end = self.emit(Op::Jump(0));
-                self.patch(to_else);
+                self.patch_all(to_else);
                 self.expr(b)?;
                 self.patch(to_end);
             }
@@ -1451,16 +1451,33 @@ impl Compiler {
 
     /// Emits a jump that is taken when `cond` is false. The caller patches its target.
     /// Comparisons fuse with the jump, and comparisons on plain locals fuse entirely.
-    fn jump_if_false(&mut self, cond: &Expr) -> Result<usize, String> {
+    /// Points each of `jumps` at the next instruction.
+    fn patch_all(&mut self, jumps: Vec<usize>) {
+        for j in jumps {
+            self.patch(j);
+        }
+    }
+
+    /// Emits the jumps that are taken when `cond` is false. The caller patches their targets. A `&&` needs
+    /// one jump per operand, so that each operand is tested on its own, without a value in between.
+    fn jump_if_false(&mut self, cond: &Expr) -> Result<Vec<usize>, String> {
+        if let Expr::Logical("&&", a, b) = cond {
+            let mut jumps = self.jump_if_false(a)?;
+            jumps.extend(self.jump_if_false(b)?);
+            return Ok(jumps);
+        }
+        if let Expr::Unary("!", x) = cond {
+            return Ok(vec![self.jump_if_true(x)?]);
+        }
         if let Expr::Binary(op, a, b) = cond {
             if *op == "<" {
                 if let Some(slot) = self.local_operand(a) {
                     if let Expr::Num(c) = &**b {
                         let k = self.num_const(*c);
-                        return Ok(self.emit(Op::JumpIfNotLtLK(slot, k, 0)));
+                        return Ok(vec![self.emit(Op::JumpIfNotLtLK(slot, k, 0))]);
                     }
                     if let Some(other) = self.local_operand(b) {
-                        return Ok(self.emit(Op::JumpIfNotLtLL(slot, other, 0)));
+                        return Ok(vec![self.emit(Op::JumpIfNotLtLL(slot, other, 0))]);
                     }
                 }
             }
@@ -1474,15 +1491,24 @@ impl Compiler {
             if let Some(jump) = fused {
                 self.expr(a)?;
                 self.expr(b)?;
-                return Ok(self.emit(jump));
+                return Ok(vec![self.emit(jump)]);
             }
         }
         self.expr(cond)?;
-        Ok(self.emit(Op::JumpIfFalse(0)))
+        Ok(vec![self.emit(Op::JumpIfFalse(0))])
     }
 
-    /// Emits a jump that is taken when `cond` is true. The caller patches its target.
+    /// Emits a jump that is taken when `cond` is true. The caller patches its target. A `&&` skips to the code
+    /// after the jump when its first operand is false, and jumps when its second operand is true.
     fn jump_if_true(&mut self, cond: &Expr) -> Result<usize, String> {
+        if let Expr::Logical("&&", a, b) = cond {
+            let skip = self.jump_if_false(a)?;
+            let back = self.jump_if_true(b)?;
+            for j in skip {
+                self.patch(j);
+            }
+            return Ok(back);
+        }
         if let Expr::Binary(op, a, b) = cond {
             if *op == "<" {
                 if let Some(slot) = self.local_operand(a) {
