@@ -20,6 +20,8 @@ pub fn install(vm: &mut Vm) {
     vm.set_global("Array", table_object(global::ARRAY));
     vm.set_global("Map", Value::Native(&collections::MAP));
     vm.set_global("Set", Value::Native(&collections::SET));
+    vm.set_global("%items", Value::Native(&collections::ITEMS));
+    vm.set_global("%rest", Value::Native(&global::REST));
     vm.set_global("Date", table_object(global::DATE));
     vm.set_global("JSON", json::json_object());
     for def in global::FUNCTIONS {

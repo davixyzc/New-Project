@@ -287,6 +287,34 @@ pub fn math_object() -> Value {
 }
 
 /// `Object.assign(target, ...sources)`: copies the own properties of each source onto the target, in order.
+/// `%rest(source, taken)`, which an object pattern with a rest element calls (see `Parser::destructure`): a new object
+/// with the own properties of `source` whose names are not in the array `taken`.
+pub static REST: NativeDef = NativeDef {
+    name: "%rest",
+    func: object_rest,
+};
+
+fn object_rest(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let source = match arg(args, 0) {
+        Value::Obj(o) => o,
+        Value::Undef | Value::Null => {
+            return Err(vm.make_error("TypeError", "Cannot destructure undefined or null"))
+        }
+        _ => return Ok(crate::value::make_obj(Vec::new())),
+    };
+    let taken: Vec<String> = match arg(args, 1) {
+        Value::Arr(names) => names.borrow().iter().map(to_str).collect(),
+        _ => Vec::new(),
+    };
+    let props = source.borrow();
+    let pairs: Vec<(&str, Value)> = props
+        .iter()
+        .filter(|(k, _)| !taken.iter().any(|t| t.as_str() == &**k))
+        .map(|(k, v)| (&**k, v.clone()))
+        .collect();
+    Ok(crate::value::make_obj(pairs))
+}
+
 fn object_assign(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let target = arg(args, 0);
     let Value::Obj(t) = &target else {

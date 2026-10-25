@@ -16,6 +16,13 @@ pub static SET: NativeDef = NativeDef {
     func: set_new,
 };
 
+/// `%items(value)`, which a destructuring pattern calls on its source (see `Parser::destructure`). An array or a
+/// string is returned as it is, and a Map or a Set as the array of its items. Any other value throws.
+pub static ITEMS: NativeDef = NativeDef {
+    name: "%items",
+    func: items,
+};
+
 const MAP_METHODS: &[NativeDef] = &[
     NativeDef {
         name: "clear",
@@ -136,6 +143,17 @@ fn construct(vm: &mut Vm, set: bool, source: &Value) -> Result<Value, Value> {
         c.set(key, value);
     }
     Ok(Value::collection(c))
+}
+
+fn items(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let v = arg(args, 0);
+    match &v {
+        Value::Arr(_) | Value::Str(_) => Ok(v.clone()),
+        _ => match items_of(&v) {
+            Some(items) => Ok(Value::arr(items)),
+            None => Err(vm.make_error("TypeError", "value is not iterable")),
+        },
+    }
 }
 
 /// Runs `f` on the entries of the Map or Set that `this` is.

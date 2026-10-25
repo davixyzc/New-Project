@@ -1,0 +1,27 @@
+1 2
+1 9 [ 4, 5 ]
+1 2 3
+1 2 x
+entry a 1
+entry b 2
+user 1 ann
+user 2 bo
+8 2
+xy
+2 1
+[ 5, 6 ]
+h i
+7 8
+null
+TypeError
+1 [ 2, 3 ]
+0,10,20
+1 2
+[ 3, 4 ] 3 4
+dflt
+1 { b: 2, c: 3 }
+1 { z: 2 } { w: 3 }
+7:{"name":"n","age":3}
+21320 8
+0 1 2 3 5 7 8 9
+TypeError

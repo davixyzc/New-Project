@@ -49,6 +49,8 @@ pub fn parse_program(src: &str) -> Result<FuncDef, String> {
     while !p.at_eof() {
         body.push(p.statement()?);
     }
+    let hidden = p.hidden.pop().unwrap_or_default();
+    let body = finish_body(hidden, Vec::new(), body, 1);
     let params = ["exports", "require", "module", "__filename", "__dirname"]
         .iter()
         .map(|n| Param {
@@ -73,6 +75,11 @@ struct Parser {
     /// Number of function literals started so far. Comparing it before and after a body
     /// tells whether that body contains other functions.
     fn_seq: u32,
+    /// The hidden temporaries of each function being parsed, innermost last. Each is declared at the start of its
+    /// function (see `finish_body`).
+    hidden: Vec<Vec<String>>,
+    /// The temporaries made so far, so that their names stay apart.
+    temps: u32,
 }
 
 impl Parser {
@@ -81,6 +88,8 @@ impl Parser {
             toks,
             pos: 0,
             fn_seq,
+            hidden: vec![Vec::new()],
+            temps: 0,
         }
     }
 
@@ -177,6 +186,200 @@ impl Parser {
             return Ok(());
         }
         Err(self.unexpected("';'"))
+    }
+
+    /// A new name for a temporary. Source code cannot write it, so it cannot clash with a name in the program.
+    fn fresh(&mut self) -> String {
+        self.temps += 1;
+        format!("%{}", self.temps)
+    }
+
+    /// A new temporary that the current function declares at its start, for a destructuring assignment.
+    fn hidden_temp(&mut self) -> String {
+        let t = self.fresh();
+        if let Some(list) = self.hidden.last_mut() {
+            list.push(t.clone());
+        }
+        t
+    }
+
+    /// Parses a binding pattern: a name, or an array or object pattern. Patterns nest, and their parts may have
+    /// defaults. An array pattern may end with a rest element.
+    fn pattern(&mut self) -> Result<Pat, String> {
+        if self.eat("[") {
+            let mut items = Vec::new();
+            let mut rest = None;
+            while !self.eat("]") {
+                if self.eat(",") {
+                    items.push(None);
+                    continue;
+                }
+                if self.eat("...") {
+                    rest = Some(Box::new(self.pattern()?));
+                    self.expect("]")?;
+                    break;
+                }
+                let part = self.pattern()?;
+                let default = if self.eat("=") {
+                    Some(self.assign()?)
+                } else {
+                    None
+                };
+                items.push(Some((part, default)));
+                if !self.eat(",") {
+                    self.expect("]")?;
+                    break;
+                }
+            }
+            Ok(Pat::Array(items, rest))
+        } else if self.eat("{") {
+            let mut props = Vec::new();
+            let mut rest = None;
+            while !self.eat("}") {
+                if self.eat("...") {
+                    rest = Some(Box::new(self.pattern()?));
+                    self.expect("}")?;
+                    break;
+                }
+                let key = self.ident()?;
+                let part = if self.eat(":") {
+                    self.pattern()?
+                } else {
+                    Pat::Target(Expr::Ident(key.clone()))
+                };
+                let default = if self.eat("=") {
+                    Some(self.assign()?)
+                } else {
+                    None
+                };
+                props.push((key, part, default));
+                if !self.eat(",") {
+                    self.expect("}")?;
+                    break;
+                }
+            }
+            Ok(Pat::Object(props, rest))
+        } else {
+            Ok(Pat::Target(Expr::Ident(self.ident()?)))
+        }
+    }
+
+    /// Adds to `binds` the (target, value) pairs that bind `pat` to `source`, in the order they are made. A part that
+    /// has parts reads its value once, into a temporary. In a declaration the temporaries are declared by the same
+    /// statement, so every target is a name. Otherwise they are hidden locals of the function.
+    fn destructure(&mut self, pat: Pat, source: Expr, decl: bool, binds: &mut Vec<(Expr, Expr)>) {
+        match pat {
+            Pat::Target(target) => binds.push((target, source)),
+            Pat::Array(items, rest) => {
+                let t = if decl {
+                    self.fresh()
+                } else {
+                    self.hidden_temp()
+                };
+                let count = items.len();
+                binds.push((Expr::Ident(t.clone()), call_items(source)));
+                for (i, item) in items.into_iter().enumerate() {
+                    if let Some((part, default)) = item {
+                        let element = Expr::Index(
+                            Box::new(Expr::Ident(t.clone())),
+                            Box::new(Expr::Num(i as f64)),
+                        );
+                        self.destructure(part, with_default(element, default), decl, binds);
+                    }
+                }
+                if let Some(part) = rest {
+                    let slice = Expr::Member(Box::new(Expr::Ident(t)), "slice".to_string());
+                    let tail = Expr::Call(Box::new(slice), vec![Expr::Num(count as f64)]);
+                    self.destructure(*part, tail, decl, binds);
+                }
+            }
+            Pat::Object(props, rest) => {
+                let t = if decl {
+                    self.fresh()
+                } else {
+                    self.hidden_temp()
+                };
+                binds.push((Expr::Ident(t.clone()), source));
+                // The rest element gets the properties that the named ones do not take.
+                let taken: Vec<Expr> = props.iter().map(|(k, _, _)| Expr::Str(k.clone())).collect();
+                for (key, part, default) in props {
+                    let property = Expr::Member(Box::new(Expr::Ident(t.clone())), key);
+                    self.destructure(part, with_default(property, default), decl, binds);
+                }
+                if let Some(part) = rest {
+                    let args = vec![Expr::Ident(t), Expr::Array(taken)];
+                    let others = Expr::Call(Box::new(Expr::Ident("%rest".to_string())), args);
+                    self.destructure(*part, others, decl, binds);
+                }
+            }
+        }
+    }
+
+    /// The declarations that bind the parameters written as patterns, each from the value of its temporary.
+    fn pattern_params(&mut self, patterns: Vec<(Pat, String)>, line: u32) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        for (pat, temp) in patterns {
+            let mut binds = Vec::new();
+            self.destructure(pat, Expr::Ident(temp), true, &mut binds);
+            out.push(Stmt::Var(VarKind::Let, decls_of(binds), line));
+        }
+        out
+    }
+
+    /// `for (const pattern of iter) body`: the loop variable is a temporary, and the body starts by binding the
+    /// pattern from it.
+    fn for_in_of_pattern(
+        &mut self,
+        kind: VarKind,
+        pat: Pat,
+        name: String,
+        line: u32,
+    ) -> Result<Stmt, String> {
+        let is_of = self.is_word("of");
+        self.pos += 1;
+        let iter = self.expression()?;
+        self.expect(")")?;
+        let mut binds = Vec::new();
+        self.destructure(pat, Expr::Ident(name.clone()), true, &mut binds);
+        let body = self.statement()?;
+        let body = Box::new(Stmt::Block(vec![
+            Stmt::Var(kind, decls_of(binds), line),
+            body,
+        ]));
+        Ok(if is_of {
+            Stmt::ForOf {
+                kind: Some(kind),
+                name,
+                iter,
+                body,
+                line,
+            }
+        } else {
+            Stmt::ForIn {
+                kind: Some(kind),
+                name,
+                iter,
+                body,
+                line,
+            }
+        })
+    }
+
+    /// A destructuring assignment, as an expression. The source is read once, into a hidden temporary, each target
+    /// is assigned in turn, and the value of the expression is that temporary.
+    fn assign_pattern(&mut self, pat: Pat, source: Expr) -> Expr {
+        let mut binds = Vec::new();
+        self.destructure(pat, source, false, &mut binds);
+        let first = match &binds[0].0 {
+            Expr::Ident(t) => t.clone(),
+            _ => unreachable!("a pattern starts with its temporary"),
+        };
+        let mut parts: Vec<Expr> = binds
+            .into_iter()
+            .map(|(target, value)| Expr::Assign("=", Box::new(target), Box::new(value)))
+            .collect();
+        parts.push(Expr::Ident(first));
+        Expr::Sequence(parts)
     }
 
     fn block_body(&mut self) -> Result<Vec<Stmt>, String> {
@@ -292,10 +495,16 @@ impl Parser {
         let mut decls = Vec::new();
         loop {
             if self.is_punct("[") || self.is_punct("{") {
-                return Err(format!(
-                    "SyntaxError: destructuring is not supported yet at line {}",
-                    line
-                ));
+                let pat = self.pattern()?;
+                self.expect("=")?;
+                let source = self.assign()?;
+                let mut binds = Vec::new();
+                self.destructure(pat, source, true, &mut binds);
+                decls.extend(decls_of(binds));
+                if !self.eat(",") {
+                    break;
+                }
+                continue;
             }
             let name = self.ident()?;
             let init = if self.eat("=") {
@@ -326,6 +535,17 @@ impl Parser {
             self.pos += 1;
             let name = self.ident()?;
             return self.for_in_of(Some(kind), name, line);
+        }
+        if decl_ahead && matches!(self.peek_at(1), Tok::Punct(p) if *p == "[" || *p == "{") {
+            let kind = if self.is_word("const") {
+                VarKind::Const
+            } else {
+                VarKind::Let
+            };
+            self.pos += 1;
+            let pat = self.pattern()?;
+            let name = self.fresh();
+            return self.for_in_of_pattern(kind, pat, name, line);
         }
         if matches!(self.peek(), Tok::Ident(_)) && (self.word_at(1, "of") || self.word_at(1, "in"))
         {
@@ -459,10 +679,13 @@ impl Parser {
     fn function_rest(&mut self, name: Option<String>, line: u32) -> Result<FuncDef, String> {
         self.fn_seq += 1;
         let mine = self.fn_seq;
+        self.hidden.push(Vec::new());
         self.expect("(")?;
-        let (params, rest) = self.params()?;
+        let (params, rest, patterns) = self.params()?;
+        let prologue = self.pattern_params(patterns, line);
         self.expect("{")?;
         let body = self.block_body()?;
+        let body = finish_body(self.hidden.pop().unwrap_or_default(), prologue, body, line);
         Ok(FuncDef {
             name,
             params,
@@ -474,17 +697,26 @@ impl Parser {
         })
     }
 
-    /// Parses a parameter list. The opening parenthesis has been consumed; this consumes the closing one.
-    fn params(&mut self) -> Result<(Vec<Param>, Option<String>), String> {
+    /// Parses a parameter list. The opening parenthesis has been consumed; this consumes the closing one. A parameter
+    /// that is a pattern is received under a temporary name, and its pattern is returned with that name.
+    fn params(&mut self) -> Result<(Vec<Param>, Option<String>, Vec<(Pat, String)>), String> {
         let mut params = Vec::new();
         let mut rest = None;
+        let mut patterns = Vec::new();
         while !self.eat(")") {
             if self.eat("...") {
                 rest = Some(self.ident()?);
                 self.expect(")")?;
                 break;
             }
-            let name = self.ident()?;
+            let name = if self.is_punct("[") || self.is_punct("{") {
+                let pat = self.pattern()?;
+                let temp = self.fresh();
+                patterns.push((pat, temp.clone()));
+                temp
+            } else {
+                self.ident()?
+            };
             let default = if self.eat("=") {
                 Some(self.assign()?)
             } else {
@@ -496,23 +728,27 @@ impl Parser {
                 break;
             }
         }
-        Ok((params, rest))
+        Ok((params, rest, patterns))
     }
 
     fn arrow_body(
         &mut self,
         params: Vec<Param>,
         rest: Option<String>,
+        patterns: Vec<(Pat, String)>,
         line: u32,
     ) -> Result<FuncDef, String> {
         self.fn_seq += 1;
         let mine = self.fn_seq;
+        self.hidden.push(Vec::new());
+        let prologue = self.pattern_params(patterns, line);
         let body = if self.eat("{") {
             self.block_body()?
         } else {
             let e = self.assign()?;
             vec![Stmt::Return(Some(e), line)]
         };
+        let body = finish_body(self.hidden.pop().unwrap_or_default(), prologue, body, line);
         Ok(FuncDef {
             name: None,
             params,
@@ -541,15 +777,16 @@ impl Parser {
                     default: None,
                 }],
                 None,
+                Vec::new(),
                 line,
             )?;
             return Ok(Some(Expr::Func(Box::new(def))));
         }
         if self.is_punct("(") && self.paren_is_arrow() {
             self.pos += 1;
-            let (params, rest) = self.params()?;
+            let (params, rest, patterns) = self.params()?;
             self.expect("=>")?;
-            let def = self.arrow_body(params, rest, line)?;
+            let def = self.arrow_body(params, rest, patterns, line)?;
             return Ok(Some(Expr::Func(Box::new(def))));
         }
         Ok(None)
@@ -624,6 +861,12 @@ impl Parser {
             }
             _ => return Ok(left),
         };
+        if op == "=" && matches!(left, Expr::Array(_) | Expr::Object(_)) {
+            let pat = expr_to_pat(left).map_err(|_| self.unexpected("assignment target"))?;
+            self.pos += 1;
+            let right = self.assign()?;
+            return Ok(self.assign_pattern(pat, right));
+        }
         check_target(&left).map_err(|_| self.unexpected("assignment target"))?;
         self.pos += 1;
         let right = self.assign()?;
@@ -897,11 +1140,16 @@ impl Parser {
             t.line += line - 1;
         }
         let mut sub = Parser::new(toks, self.fn_seq);
+        sub.temps = self.temps;
         let e = sub.expression()?;
         if !sub.at_eof() {
             return Err(sub.unexpected("'}'"));
         }
         self.fn_seq = sub.fn_seq;
+        self.temps = sub.temps;
+        if let (Some(mine), Some(theirs)) = (self.hidden.last_mut(), sub.hidden.pop()) {
+            mine.extend(theirs);
+        }
         Ok(e)
     }
 }
@@ -915,6 +1163,99 @@ fn is_plain_target(e: &Expr) -> bool {
             matches!(&**obj, Expr::Ident(_)) && matches!(&**key, Expr::Ident(_) | Expr::Num(_))
         }
         _ => false,
+    }
+}
+
+/// A binding or assignment target. In a declaration every target is a name.
+enum Pat {
+    /// A target that is not a pattern: a name, or in an assignment a property too.
+    Target(Expr),
+    /// `[a, , b = 1, ...rest]`: each position holds its pattern and default, and `None` for a hole.
+    Array(Vec<Option<(Pat, Option<Expr>)>>, Option<Box<Pat>>),
+    /// `{a, b: c = 1, ...rest}`: each property is read by its key, and bound to its pattern with its default. The rest
+    /// element, if any, gets the other own properties.
+    Object(Vec<(String, Pat, Option<Expr>)>, Option<Box<Pat>>),
+}
+
+/// `e`, or `default` when `e` is undefined.
+fn with_default(e: Expr, default: Option<Expr>) -> Expr {
+    match default {
+        None => e,
+        Some(d) => Expr::Cond(
+            Box::new(Expr::Binary(
+                "===",
+                Box::new(e.clone()),
+                Box::new(Expr::Undef),
+            )),
+            Box::new(d),
+            Box::new(e),
+        ),
+    }
+}
+
+/// The call that turns a source into the items that a pattern reads by index (see `%items`).
+fn call_items(source: Expr) -> Expr {
+    Expr::Call(Box::new(Expr::Ident("%items".to_string())), vec![source])
+}
+
+/// The declarators of a declaration that binds each name to its value.
+fn decls_of(binds: Vec<(Expr, Expr)>) -> Vec<(String, Option<Expr>)> {
+    binds
+        .into_iter()
+        .map(|(target, value)| match target {
+            Expr::Ident(name) => (name, Some(value)),
+            _ => unreachable!("a declaration binds names"),
+        })
+        .collect()
+}
+
+/// The statements of a function body: its hidden temporaries are declared first, then the parts of its parameters
+/// that are patterns, then the body.
+fn finish_body(hidden: Vec<String>, prologue: Vec<Stmt>, body: Vec<Stmt>, line: u32) -> Vec<Stmt> {
+    let mut out = Vec::new();
+    if !hidden.is_empty() {
+        let temps = hidden.into_iter().map(|t| (t, None)).collect();
+        out.push(Stmt::Var(VarKind::Let, temps, line));
+    }
+    out.extend(prologue);
+    out.extend(body);
+    out
+}
+
+/// An array or object literal, written as the target of `=`, as the pattern that it stands for.
+fn expr_to_pat(e: Expr) -> Result<Pat, ()> {
+    match e {
+        Expr::Array(items) => {
+            let mut elems = Vec::new();
+            let mut rest = None;
+            for item in items {
+                match item {
+                    Expr::Spread(inner) => rest = Some(Box::new(expr_to_pat(*inner)?)),
+                    other => elems.push(Some(elem_to_pat(other)?)),
+                }
+            }
+            Ok(Pat::Array(elems, rest))
+        }
+        Expr::Object(props) => {
+            let mut out = Vec::new();
+            for (key, value) in props {
+                let (part, default) = elem_to_pat(value)?;
+                out.push((key, part, default));
+            }
+            Ok(Pat::Object(out, None))
+        }
+        target => {
+            check_target(&target)?;
+            Ok(Pat::Target(target))
+        }
+    }
+}
+
+/// An element of a literal pattern: a target, with a default when it is written `target = default`.
+fn elem_to_pat(e: Expr) -> Result<(Pat, Option<Expr>), ()> {
+    match e {
+        Expr::Assign("=", target, default) => Ok((expr_to_pat(*target)?, Some(*default))),
+        other => Ok((expr_to_pat(other)?, None)),
     }
 }
 
