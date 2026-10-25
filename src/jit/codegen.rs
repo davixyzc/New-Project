@@ -997,6 +997,14 @@ impl<'a> Gen<'a> {
                 self.a.jcc(CC_E, slow);
                 Fast::Guarded
             }
+            Op::This if !self.proto.is_arrow => {
+                // `this` sits just below the arguments of the call, in the slot before the frame's first local.
+                let (src, dst) = (self.slot(-1), self.temp(d));
+                self.check_plain(src, slow);
+                self.copy(src, dst);
+                let clone = rt::clone_into as *const () as usize;
+                Fast::Direct(clone, vec![Arg::Addr(src), Arg::Addr(dst)])
+            }
             Op::Dup => {
                 // Copies the top value. A plain value is copied here, and any other is cloned by a helper.
                 let (src, dst) = (self.temp(d - 1), self.temp(d));

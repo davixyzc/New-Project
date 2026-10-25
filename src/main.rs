@@ -6,6 +6,7 @@
 
 #![cfg_attr(not(test), no_main)]
 
+mod alloc;
 mod ast;
 mod builtins;
 mod bytecode;
@@ -17,6 +18,9 @@ mod parser;
 mod scalar;
 mod value;
 mod vm;
+
+#[global_allocator]
+static GLOBAL: alloc::Pooled = alloc::Pooled;
 
 /// The C entry point. Returns the process exit status. The test harness has its own `main`, so the
 /// symbol is only exported in a normal build; this function stays in the test build as well, which

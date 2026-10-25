@@ -2,13 +2,95 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
 use crate::bytecode::Proto;
 use crate::vm::Vm;
 
-pub type Props = Vec<(Rc<str>, Value)>;
+/// The own properties of an object, in the order they were added. An object with many properties also keeps an
+/// index from name to position, so that a lookup does not scan them.
+#[derive(Clone, Default)]
+pub struct Props {
+    items: Vec<(Rc<str>, Value)>,
+    index: Option<HashMap<Rc<str>, usize>>,
+}
+
+/// From this many properties on, an object gets an index by name.
+const INDEX_FROM: usize = 16;
+
+impl Props {
+    pub fn with_capacity(capacity: usize) -> Props {
+        Props {
+            items: Vec::with_capacity(capacity),
+            index: None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, (Rc<str>, Value)> {
+        self.items.iter()
+    }
+
+    pub fn value(&self, i: usize) -> &Value {
+        &self.items[i].1
+    }
+
+    pub fn set_value(&mut self, i: usize, v: Value) {
+        self.items[i].1 = v;
+    }
+
+    /// The position of the property called `name`.
+    pub fn position(&self, name: &str) -> Option<usize> {
+        match &self.index {
+            Some(index) => index.get(name).copied(),
+            None => self.items.iter().position(|(k, _)| &**k == name),
+        }
+    }
+
+    /// The position of the property with the shared key `key`. The pointer is compared first, which finds almost
+    /// every key, and the text only when the pointer finds nothing.
+    pub fn position_of_key(&self, key: &Rc<str>) -> Option<usize> {
+        match &self.index {
+            Some(index) => index.get(&**key).copied(),
+            None => self
+                .items
+                .iter()
+                .position(|(k, _)| Rc::ptr_eq(k, key))
+                .or_else(|| self.items.iter().position(|(k, _)| **k == **key)),
+        }
+    }
+
+    /// Adds a property, which the caller has checked is not there yet.
+    pub fn push(&mut self, key: Rc<str>, v: Value) {
+        if let Some(index) = &mut self.index {
+            index.insert(key.clone(), self.items.len());
+        }
+        self.items.push((key, v));
+        if self.index.is_none() && self.items.len() > INDEX_FROM {
+            self.index = Some(
+                self.items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (k, _))| (k.clone(), i))
+                    .collect(),
+            );
+        }
+    }
+}
+
+impl std::ops::Index<usize> for Props {
+    type Output = (Rc<str>, Value);
+
+    fn index(&self, i: usize) -> &(Rc<str>, Value) {
+        &self.items[i]
+    }
+}
+
 pub type ObjRef = Rc<RefCell<Props>>;
 pub type ArrRef = Rc<RefCell<Vec<Value>>>;
 /// Arguments arrive as a borrowed slice, so calls do not allocate.
@@ -128,7 +210,7 @@ impl Value {
     }
 
     pub fn obj_with(capacity: usize) -> Value {
-        Value::Obj(Rc::new(RefCell::new(Vec::with_capacity(capacity))))
+        Value::Obj(Rc::new(RefCell::new(Props::with_capacity(capacity))))
     }
 
     pub fn is_object(&self) -> bool {
@@ -155,18 +237,18 @@ impl Value {
 /// Sets (or replaces) an own property on a plain object.
 pub fn obj_set(obj: &ObjRef, name: &str, v: Value) {
     let mut props = obj.borrow_mut();
-    match props.iter().position(|(k, _)| &**k == name) {
-        Some(i) => props[i].1 = v,
-        None => props.push((Rc::from(name), v)),
+    match props.position(name) {
+        Some(i) => props.set_value(i, v),
+        None => props.push(Rc::from(name), v),
     }
 }
 
 /// Sets an own property using a key that is already shared, so no string is copied.
 pub fn obj_put(obj: &ObjRef, key: &Rc<str>, v: Value) {
     let mut props = obj.borrow_mut();
-    match position_of_key(&props, key) {
-        Some(i) => props[i].1 = v,
-        None => props.push((key.clone(), v)),
+    match props.position_of_key(key) {
+        Some(i) => props.set_value(i, v),
+        None => props.push(key.clone(), v),
     }
 }
 
@@ -174,14 +256,7 @@ pub fn obj_put(obj: &ObjRef, key: &Rc<str>, v: Value) {
 /// so the pointer decides almost every lookup, and the text is compared only when the pointer finds nothing.
 pub fn obj_get_key(obj: &ObjRef, key: &Rc<str>) -> Option<Value> {
     let props = obj.borrow();
-    position_of_key(&props, key).map(|i| props[i].1.clone())
-}
-
-fn position_of_key(props: &Props, key: &Rc<str>) -> Option<usize> {
-    props
-        .iter()
-        .position(|(k, _)| Rc::ptr_eq(k, key))
-        .or_else(|| props.iter().position(|(k, _)| **k == **key))
+    props.position_of_key(key).map(|i| props.value(i).clone())
 }
 
 thread_local! {
@@ -204,18 +279,16 @@ pub fn intern_name(name: &str) -> Rc<str> {
 
 /// Reads an own property of a plain object.
 pub fn obj_get(obj: &ObjRef, name: &str) -> Option<Value> {
-    obj.borrow()
-        .iter()
-        .find(|(k, _)| &**k == name)
-        .map(|(_, v)| v.clone())
+    let props = obj.borrow();
+    props.position(name).map(|i| props.value(i).clone())
 }
 
 /// Builds a plain object from name/value pairs.
 pub fn make_obj(pairs: Vec<(&str, Value)>) -> Value {
-    let props: Props = pairs
-        .into_iter()
-        .map(|(k, v)| (intern_name(k), v))
-        .collect();
+    let mut props = Props::default();
+    for (k, v) in pairs {
+        props.push(intern_name(k), v);
+    }
     Value::Obj(Rc::new(RefCell::new(props)))
 }
 
