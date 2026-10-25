@@ -408,6 +408,8 @@ pub struct Vm {
     pub stack: Vec<Value>,
     pub frames: FrameStack,
     pub globals: NameMap<Value>,
+    /// The prototype of each kind of error, by its name. The prototype of `Error` is the one that the others inherit.
+    pub error_protos: Vec<(&'static str, ObjRef)>,
     /// Module objects (`{ exports }`) keyed by absolute path, so each file runs once.
     pub modules: HashMap<PathBuf, Value>,
     pub out: BufWriter<Stdout>,
@@ -488,6 +490,18 @@ fn array_key_index(name: &str) -> Option<usize> {
     }
 }
 
+/// Whether `proto` is the prototype of `o`, or one of the prototypes further along its chain.
+fn chain_has(o: &ObjRef, proto: &ObjRef) -> bool {
+    let mut cur = o.borrow().proto.clone();
+    while let Some(p) = cur {
+        if Rc::ptr_eq(&p, proto) {
+            return true;
+        }
+        cur = p.borrow().proto.clone();
+    }
+    false
+}
+
 /// `delete obj[name]`: removes an own property of an object, or sets an element of an array to undefined. The result
 /// is true in every case here, since no property is protected from deletion.
 fn delete_property(obj: &Value, name: &str) {
@@ -524,6 +538,7 @@ impl Vm {
             stack: Vec::with_capacity(1024),
             frames: FrameStack::new(),
             globals: NameMap::default(),
+            error_protos: error_protos(),
             modules: HashMap::new(),
             out: BufWriter::new(std::io::stdout()),
             ticks: VecDeque::new(),
@@ -2109,19 +2124,18 @@ impl Vm {
                     return Ok(false);
                 };
                 let proto = c.instance_proto();
-                let mut cur = o.borrow().proto.clone();
-                while let Some(p) = cur {
-                    if Rc::ptr_eq(&p, &proto) {
-                        return Ok(true);
-                    }
-                    cur = p.borrow().proto.clone();
-                }
-                Ok(false)
+                Ok(chain_has(o, &proto))
             }
-            Value::Native(d) => Ok(match v {
-                Value::Obj(o) => builtins::collections::is_instance(&o.borrow(), d),
-                _ => false,
-            }),
+            Value::Native(d) => {
+                let Value::Obj(o) = v else {
+                    return Ok(false);
+                };
+                if self.error_protos.iter().any(|(k, _)| *k == d.name) {
+                    let proto = self.error_proto(d.name);
+                    return Ok(chain_has(o, &proto));
+                }
+                Ok(builtins::collections::is_instance(&o.borrow(), d))
+            }
             // The built-in tables stand for `Object` and `Array`, which every object and every array is an instance of.
             Value::Obj(table) => {
                 let is_global = |name: &str, vm: &Vm| matches!(vm.globals.get(name), Some(Value::Obj(t)) if Rc::ptr_eq(t, table));
@@ -2377,6 +2391,16 @@ impl Vm {
         }
     }
 
+    /// The prototype of the errors of `kind`, which is the prototype of `Error` when there is no such kind.
+    pub fn error_proto(&self, kind: &str) -> ObjRef {
+        self.error_protos
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .or_else(|| self.error_protos.first())
+            .map(|(_, p)| p.clone())
+            .expect("the error prototypes are made at start")
+    }
+
     /// Builds an error object (`name`, `message`, `stack`) for a built-in error kind.
     pub fn make_error(&mut self, kind: &str, msg: &str) -> Value {
         let loc = self.location();
@@ -2385,11 +2409,9 @@ impl Vm {
         } else {
             format!("{}: {}\n    at {}", kind, msg, loc)
         };
-        make_obj(vec![
-            ("name", Value::str(kind)),
-            ("message", Value::str(msg)),
-            ("stack", Value::str(&stack)),
-        ])
+        let obj = new_obj(Some(self.error_proto(kind)));
+        init_error(&obj, kind, msg, &stack);
+        Value::Obj(obj)
     }
 
     // ----- timers and the event loop ---------------------------------------

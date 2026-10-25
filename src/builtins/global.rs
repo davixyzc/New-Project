@@ -5,7 +5,9 @@ use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::builtins::{arg, fs, table_object};
-use crate::value::{key_order, obj_set, to_int32, to_num, to_str, truthy, NativeDef, Value};
+use crate::value::{
+    init_error, key_order, obj_set, to_int32, to_num, to_str, truthy, NativeDef, Value,
+};
 use crate::vm::Vm;
 
 pub static FUNCTIONS: &[NativeDef] = &[
@@ -513,32 +515,46 @@ fn from_char_code(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, V
 
 // ----- errors and conversions ------------------------------------------------
 
-fn new_error(vm: &mut Vm, kind: &str, args: &[Value]) -> Value {
+/// The error that an error constructor makes. Called as the superclass of a class (`super(message)`), it sets up the
+/// object it was called on, which is the instance; otherwise it makes a new error.
+fn new_error(vm: &mut Vm, this: Value, kind: &str, args: &[Value]) -> Value {
     let msg = match args.first() {
         Some(v) if !v.is_nullish() => to_str(v),
         _ => String::new(),
     };
-    vm.make_error(kind, &msg)
+    match this {
+        Value::Obj(obj) => {
+            let loc = vm.location();
+            let stack = if loc.is_empty() {
+                format!("{}: {}", kind, msg)
+            } else {
+                format!("{}: {}\n    at {}", kind, msg, loc)
+            };
+            init_error(&obj, kind, &msg, &stack);
+            Value::Obj(obj)
+        }
+        _ => vm.make_error(kind, &msg),
+    }
 }
 
-fn error_ctor(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(new_error(vm, "Error", args))
+fn error_ctor(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(new_error(vm, this, "Error", args))
 }
 
-fn type_error_ctor(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(new_error(vm, "TypeError", args))
+fn type_error_ctor(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(new_error(vm, this, "TypeError", args))
 }
 
-fn range_error_ctor(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(new_error(vm, "RangeError", args))
+fn range_error_ctor(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(new_error(vm, this, "RangeError", args))
 }
 
-fn syntax_error_ctor(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(new_error(vm, "SyntaxError", args))
+fn syntax_error_ctor(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(new_error(vm, this, "SyntaxError", args))
 }
 
-fn reference_error_ctor(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(new_error(vm, "ReferenceError", args))
+fn reference_error_ctor(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(new_error(vm, this, "ReferenceError", args))
 }
 
 fn number(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {

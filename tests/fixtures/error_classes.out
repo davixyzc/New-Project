@@ -1,0 +1,6 @@
+true true false TypeError bad type
+true true TypeError
+true true ValidationError must have @ email
+ValidationError too young true false
+false plain false
+Error: txt RangeError: r

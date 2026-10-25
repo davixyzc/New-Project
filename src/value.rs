@@ -497,6 +497,23 @@ pub fn new_obj(proto: Option<ObjRef>) -> ObjRef {
     }))
 }
 
+/// The prototypes of the built-in errors, by kind. Each kind inherits from the prototype of `Error`, which is first.
+pub fn error_protos() -> Vec<(&'static str, ObjRef)> {
+    let base = new_obj(None);
+    let mut out = vec![("Error", base.clone())];
+    for kind in ["TypeError", "RangeError", "SyntaxError", "ReferenceError"] {
+        out.push((kind, new_obj(Some(base.clone()))));
+    }
+    out
+}
+
+/// Sets the `name`, `message` and `stack` of an error object.
+pub fn init_error(obj: &ObjRef, kind: &str, msg: &str, stack: &str) {
+    obj_put(obj, &intern_name("name"), Value::str(kind));
+    obj_put(obj, &intern_name("message"), Value::str(msg));
+    obj_put(obj, &intern_name("stack"), Value::str(stack));
+}
+
 /// The name of the class of an object, which is the name of the `constructor` of its prototype. None when the object
 /// has no prototype with a named constructor.
 pub fn class_name(props: &Props) -> Option<String> {

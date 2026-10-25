@@ -19,7 +19,11 @@ fn make_class(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value>
     };
     let (parent_proto, parent_statics) = match &parent {
         Value::Func(p) => (Some(p.instance_proto()), Some(p.statics())),
-        Value::Undef | Value::Null => (None, None),
+        // A class that extends a built-in error inherits from the prototype of that error.
+        Value::Native(d) if vm.error_protos.iter().any(|(k, _)| *k == d.name) => {
+            (Some(vm.error_proto(d.name)), None)
+        }
+        Value::Native(_) | Value::Undef | Value::Null => (None, None),
         _ => {
             return Err(vm.make_error(
                 "TypeError",
@@ -40,7 +44,7 @@ fn make_class(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value>
         info.statics = Some(statics.clone());
         info.home = Some(prototype.clone());
         info.parent = match &parent {
-            Value::Func(_) => Some(parent.clone()),
+            Value::Func(_) | Value::Native(_) => Some(parent.clone()),
             _ => None,
         };
     }

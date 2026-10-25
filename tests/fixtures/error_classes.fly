@@ -1,0 +1,24 @@
+const e = new TypeError("bad type");
+console.log(e instanceof TypeError, e instanceof Error, e instanceof RangeError, e.name, e.message);
+try {
+  null.x;
+} catch (err) {
+  console.log(err instanceof TypeError, err instanceof Error, err.name);
+}
+class ValidationError extends Error {
+  constructor(field, message) {
+    super(message);
+    this.name = "ValidationError";
+    this.field = field;
+  }
+}
+const v = new ValidationError("email", "must have @");
+console.log(v instanceof ValidationError, v instanceof Error, v.name, v.message, v.field);
+try {
+  throw new ValidationError("age", "too young");
+} catch (err) {
+  console.log(err.name, err.message, err instanceof Error, err instanceof TypeError);
+}
+class Plain {}
+console.log(new Plain() instanceof Error, Error("plain").message, [] instanceof Error);
+console.log(String(new Error("txt")), `${new RangeError("r")}`);
