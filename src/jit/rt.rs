@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use crate::builtins;
 use crate::bytecode::Proto;
-use crate::value::{obj_get_key, obj_put, ArrRef, Value};
+use crate::value::{obj_get_key, obj_put, ArrRef, JsStr, Value};
 use crate::vm::Vm;
 
 use super::{call_numbers, numbers_arity, MAX_NUMBER_ARGS};
@@ -294,6 +294,10 @@ pub unsafe extern "C" fn get_prop_into(
             ptr::write(dst, array_prop(a, &*name));
             true
         }
+        Value::Str(s) => {
+            ptr::write(dst, string_prop(s, &*name));
+            true
+        }
         _ => false,
     }
 }
@@ -307,10 +311,23 @@ pub unsafe extern "C" fn get_prop_top(slot: *mut Value, name: *const Rc<str>) ->
     let v = match &*slot {
         Value::Obj(o) => obj_get_key(o, &*name).unwrap_or(Value::Undef),
         Value::Arr(a) => array_prop(a, &*name),
+        Value::Str(s) => string_prop(s, &*name),
         _ => return false,
     };
     *slot = v;
     true
+}
+
+/// `x === y`, or `x !== y` when `negate` is set, for values of any kind. It replaces `x` by the boolean, and drops
+/// `y`, which the comparison consumes. Comparisons of two numbers never reach it.
+///
+/// # Safety
+/// `x` and `y` must point at valid values that the instruction pops.
+pub unsafe extern "C" fn strict_eq_into(x: *mut Value, y: *mut Value, negate: u64) {
+    let equal = crate::value::strict_eq(&*x, &*y) != (negate != 0);
+    ptr::drop_in_place(x);
+    ptr::drop_in_place(y);
+    ptr::write(x, Value::Bool(equal));
 }
 
 /// Reads the global `name` into `dst`. A name that is not defined writes nothing and returns false, so the
@@ -369,6 +386,13 @@ pub unsafe extern "C" fn mod_top(a: *mut Value, b: *const Value) -> bool {
 /// # Safety
 /// `obj` and `key` must point at valid values that the instruction pops.
 pub unsafe extern "C" fn get_index_top(obj: *mut Value, key: *const Value) -> bool {
+    if let (Value::Str(s), Value::Num(n)) = (&*obj, &*key) {
+        let v = crate::vm::index_of(*n)
+            .and_then(|i| builtins::string::char_at(s, i))
+            .map_or(Value::Undef, crate::value::char_value);
+        *obj = v;
+        return true;
+    }
     let (Value::Arr(a), Value::Num(n)) = (&*obj, &*key) else {
         return false;
     };
@@ -414,6 +438,17 @@ pub unsafe extern "C" fn set_index_top(
     drop(old);
     *obj = ptr::read(val);
     true
+}
+
+/// The property `name` of a string: its length, or one of its methods.
+fn string_prop(s: &JsStr, name: &str) -> Value {
+    if name == "length" {
+        Value::Num(s.char_count() as f64)
+    } else {
+        builtins::string::method(name)
+            .map(Value::Native)
+            .unwrap_or(Value::Undef)
+    }
 }
 
 /// The property `name` of an array: its length, or one of its methods.

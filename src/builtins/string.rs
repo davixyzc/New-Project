@@ -113,8 +113,10 @@ pub static NUMBER_METHODS: &[NativeDef] = &[
     },
 ];
 
+static METHOD_INDEX: std::sync::OnceLock<Vec<&'static NativeDef>> = std::sync::OnceLock::new();
+
 pub fn method(name: &str) -> Option<&'static NativeDef> {
-    METHODS.iter().find(|d| d.name == name)
+    crate::builtins::sorted_lookup(METHODS, &METHOD_INDEX, name)
 }
 
 pub fn number_method(name: &str) -> Option<&'static NativeDef> {

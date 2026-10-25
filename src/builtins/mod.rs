@@ -27,6 +27,24 @@ pub fn install(vm: &mut Vm) {
     vm.set_global("Infinity", Value::Num(f64::INFINITY));
 }
 
+/// The definition called `name` in a table of built-in methods. `index` holds the table sorted by name. It is built
+/// the first time the table is searched, so a lookup is a binary search rather than a scan of every method.
+pub fn sorted_lookup(
+    table: &'static [NativeDef],
+    index: &'static std::sync::OnceLock<Vec<&'static NativeDef>>,
+    name: &str,
+) -> Option<&'static NativeDef> {
+    let sorted = index.get_or_init(|| {
+        let mut defs: Vec<&'static NativeDef> = table.iter().collect();
+        defs.sort_by_key(|d| d.name);
+        defs
+    });
+    sorted
+        .binary_search_by_key(&name, |d| d.name)
+        .ok()
+        .map(|i| sorted[i])
+}
+
 /// An object whose properties are the functions of a static table.
 pub fn table_object(table: &'static [NativeDef]) -> Value {
     make_obj(table.iter().map(|d| (d.name, Value::Native(d))).collect())

@@ -1122,6 +1122,12 @@ impl<'a> Gen<'a> {
                     }
                 }
                 self.store_bool(x);
+                if matches!(op, Op::StrictEq | Op::StrictNe) {
+                    // Any other pair of values takes the helper, which compares strings too.
+                    let eq = rt::strict_eq_into as *const () as usize;
+                    let negate = u64::from(op == Op::StrictNe);
+                    return Fast::Direct(eq, vec![Arg::Addr(x), Arg::Addr(y), Arg::Imm(negate)]);
+                }
                 Fast::Guarded
             }
             Op::Neg => {

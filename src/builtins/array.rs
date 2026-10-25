@@ -120,8 +120,10 @@ pub fn push_def() -> &'static NativeDef {
     &METHODS[0]
 }
 
+static METHOD_INDEX: std::sync::OnceLock<Vec<&'static NativeDef>> = std::sync::OnceLock::new();
+
 pub fn method(name: &str) -> Option<&'static NativeDef> {
-    METHODS.iter().find(|d| d.name == name)
+    crate::builtins::sorted_lookup(METHODS, &METHOD_INDEX, name)
 }
 
 fn array_of(vm: &mut Vm, this: &Value) -> Result<ArrRef, Value> {
