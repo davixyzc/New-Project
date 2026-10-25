@@ -24,15 +24,185 @@ const MAX_ARRAY_GROW: usize = 50_000_000;
 const MAX_NESTED_CALLS: usize = 2_000;
 
 pub struct Frame {
-    pub closure: Rc<Closure>,
+    /// The running closure. The callee slot (`base - 2`) holds the `Value::Func` that owns it.
+    closure: *const Closure,
     /// Next instruction to run. Only kept up to date when the frame is not running.
     pub ip: usize,
     /// Index of the first argument (slot 0) on the value stack. `this` sits at `base - 1`.
     pub base: usize,
     /// Active `try` handlers: (catch instruction index, stack height to restore).
     pub handlers: Vec<(usize, usize)>,
-    /// Set for frames started with `new`: the object to return if the constructor returns nothing.
-    pub ctor: Option<Value>,
+    /// Set for frames started with `new`: the object in the `this` slot is returned if the
+    /// constructor returns nothing.
+    pub ctor: bool,
+    /// Set for the frame of a `Callback` session. Its return keeps the frame (see `do_return`).
+    pub session: bool,
+}
+
+impl Frame {
+    /// The running closure.
+    #[inline(always)]
+    pub fn closure(&self) -> &Closure {
+        // SAFETY: the callee slot below `base` holds the `Value::Func` that owns the closure.
+        unsafe { &*self.closure }
+    }
+}
+
+/// A function that a builtin calls many times in a row, such as the callback of `map`.
+///
+/// A compiled function with no rest parameter stays on the stack from call to call: each call
+/// writes its arguments, resets its locals and runs its code, without pushing or popping a frame.
+/// Any other function goes through `Vm::call_moved`. Call `finish` after the last call, which pops
+/// the frame. A call that fails has already popped it.
+pub enum Callback {
+    Session(Session),
+    Generic { f: Value, this: Value },
+}
+
+pub struct Session {
+    closure: Rc<Closure>,
+    /// The compiled code. It belongs to the prototype that `closure` owns.
+    code: *const Native,
+    this: Value,
+    nparams: usize,
+    nlocals: usize,
+    /// Index of the first argument. The callee slot is `base - 2`, and `this` is at `base - 1`.
+    base: usize,
+    /// The frame's index in `Vm::frames`.
+    depth: usize,
+    /// Whether the frame is on the stack.
+    alive: bool,
+}
+
+impl Callback {
+    /// Prepares calls to `f` with `this`. Nothing is pushed until the first call.
+    pub fn new(vm: &Vm, f: &Value, this: Value) -> Callback {
+        if let Value::Func(c) = f {
+            let proto: *const Proto = Rc::as_ptr(&c.proto);
+            // SAFETY: `c` owns the prototype, and the session keeps `c` alive.
+            let (has_rest, nparams, nlocals) = unsafe {
+                (
+                    (*proto).has_rest,
+                    (*proto).nparams as usize,
+                    (*proto).nlocals as usize,
+                )
+            };
+            if !has_rest && vm.nested_calls < MAX_NESTED_CALLS && vm.frames.len() < MAX_FRAMES {
+                if let Some(code) = unsafe { (*proto).native() } {
+                    return Callback::Session(Session {
+                        closure: c.clone(),
+                        code: code as *const Native,
+                        this,
+                        nparams,
+                        nlocals,
+                        base: 0,
+                        depth: 0,
+                        alive: false,
+                    });
+                }
+            }
+        }
+        Callback::Generic { f: f.clone(), this }
+    }
+
+    /// How many arguments the function can read. A builtin need not build the others.
+    pub fn arity(&self) -> usize {
+        match self {
+            Callback::Session(s) => s.nparams,
+            Callback::Generic { .. } => usize::MAX,
+        }
+    }
+
+    /// Calls the function with `args`, as `Vm::call_moved` does.
+    pub fn call<const N: usize>(&mut self, vm: &mut Vm, args: [Value; N]) -> Result<Value, Value> {
+        match self {
+            Callback::Session(s) => s.call(vm, args),
+            Callback::Generic { f, this } => vm.call_moved(f, this.clone(), args),
+        }
+    }
+
+    /// Ends the calls, popping the session's frame if it is still on the stack.
+    pub fn finish(mut self, vm: &mut Vm) {
+        if let Callback::Session(s) = &mut self {
+            s.finish(vm);
+        }
+    }
+}
+
+impl Session {
+    fn call<const N: usize>(&mut self, vm: &mut Vm, args: [Value; N]) -> Result<Value, Value> {
+        if !self.alive {
+            self.push_frame(vm);
+        }
+        // Between calls the stack ends at `base`, so the arguments and locals are pushed afresh.
+        for (i, v) in args.into_iter().enumerate() {
+            if i < self.nparams {
+                vm.stack.push(v);
+            } else {
+                forget_scalar(v);
+            }
+        }
+        while vm.stack.len() < self.base + self.nlocals {
+            vm.stack.push(Value::Undef);
+        }
+        // SAFETY: `code` is alive as long as `closure` is.
+        let code = unsafe { &*self.code };
+        let need = self.base + code.frame_len();
+        if need > vm.stack.capacity() {
+            vm.stack.reserve(need - vm.stack.len());
+        }
+        let status = unsafe {
+            let frame = vm.stack.as_mut_ptr().add(self.base);
+            code.call(vm as *mut Vm, frame, 0)
+        };
+        if status == 0 {
+            // The return left the result in the callee slot, and the frame is still on the stack.
+            Ok(std::mem::replace(
+                &mut vm.stack[self.base - 2],
+                Value::Undef,
+            ))
+        } else {
+            // The exception left the frame. Its handlers may still catch it, but the frame must
+            // return like any other from here on.
+            let exc = vm.pending.take().unwrap_or(Value::Undef);
+            self.end(vm);
+            if let Some(frame) = vm.frames.get_mut(self.depth) {
+                frame.session = false;
+            }
+            vm.resume_after_error(exc, self.depth)
+        }
+    }
+
+    fn push_frame(&mut self, vm: &mut Vm) {
+        self.depth = vm.frames.len();
+        vm.nested_calls += 1;
+        vm.stack.push(Value::Func(self.closure.clone()));
+        vm.stack.push(self.this.clone());
+        self.base = vm.stack.len();
+        vm.frames.push(Frame {
+            closure: Rc::as_ptr(&self.closure),
+            ip: 0,
+            base: self.base,
+            handlers: Vec::new(),
+            ctor: false,
+            session: true,
+        });
+        self.alive = true;
+    }
+
+    /// Marks the frame as gone. The caller pops it or has already done so.
+    fn end(&mut self, vm: &mut Vm) {
+        self.alive = false;
+        vm.nested_calls -= 1;
+    }
+
+    fn finish(&mut self, vm: &mut Vm) {
+        if self.alive {
+            self.end(vm);
+            vm.frames.pop();
+            vm.truncate_stack(self.base - 2);
+        }
+    }
 }
 
 pub struct Timer {
@@ -152,7 +322,7 @@ impl Vm {
     /// Directory of the module that is currently running (used to resolve `require`).
     pub fn current_dir(&self) -> PathBuf {
         match self.frames.last() {
-            Some(f) => Path::new(&*f.closure.proto.file)
+            Some(f) => Path::new(&*f.closure().proto.file)
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_default(),
@@ -303,14 +473,14 @@ impl Vm {
                 // dropped here, unless a rest parameter collects them.
                 let fixed = c.proto.nparams as usize;
                 let keep = if c.proto.has_rest { N } else { N.min(fixed) };
-                self.stack.push(Value::Undef);
+                self.stack.push(Value::Func(c.clone()));
                 self.stack.push(this);
                 for (i, v) in args.into_iter().enumerate() {
                     if i < keep {
                         self.stack.push(v);
                     }
                 }
-                let result = match self.enter(c.clone(), keep, None) {
+                let result = match self.enter(c.clone(), keep, false) {
                     Ok(()) => self.run_entered(depth),
                     Err(e) => Err(e),
                 };
@@ -336,7 +506,7 @@ impl Vm {
         let depth = self.frames.len();
         let base = self.stack.len() + 2;
         let fixed = c.proto.nparams as usize;
-        self.stack.push(Value::Undef);
+        self.stack.push(Value::Func(c.clone()));
         self.stack.push(this);
         for (i, v) in args.into_iter().enumerate() {
             if i < fixed {
@@ -347,11 +517,12 @@ impl Vm {
             self.stack.push(Value::Undef);
         }
         self.frames.push(Frame {
-            closure: c.clone(),
+            closure: Rc::as_ptr(c),
             ip: 0,
             base,
             handlers: Vec::new(),
-            ctor: None,
+            ctor: false,
+            session: false,
         });
         let result = match self.run_native(code, 0) {
             Ok(()) => Ok(self.pop()),
@@ -376,16 +547,16 @@ impl Vm {
         args: &[Value],
     ) -> Result<Value, Value> {
         let depth = self.frames.len();
-        self.stack.push(Value::Undef);
+        self.stack.push(Value::Func(c.clone()));
         self.stack.push(this);
         self.stack.extend_from_slice(args);
-        self.enter(c, args.len(), None)?;
+        self.enter(c, args.len(), false)?;
         self.run_entered(depth)
     }
 
     /// Runs the frame that `enter` pushed above `depth` to completion, and returns its result.
     fn run_entered(&mut self, depth: usize) -> Result<Value, Value> {
-        let proto: *const Proto = Rc::as_ptr(&self.frames.last().unwrap().closure.proto);
+        let proto: *const Proto = Rc::as_ptr(&self.frames.last().unwrap().closure().proto);
         // SAFETY: the frame holds the closure that owns the prototype.
         if let Some(code) = unsafe { (*proto).native() } {
             match self.run_native(code, 0) {
@@ -398,12 +569,7 @@ impl Vm {
     }
 
     /// Pushes a frame for a closure. Arguments are already on the stack above the callee and `this` slots.
-    fn enter(
-        &mut self,
-        closure: Rc<Closure>,
-        argc: usize,
-        ctor: Option<Value>,
-    ) -> Result<(), Value> {
+    fn enter(&mut self, closure: Rc<Closure>, argc: usize, ctor: bool) -> Result<(), Value> {
         if self.frames.len() >= MAX_FRAMES {
             return Err(self.make_error("RangeError", "Maximum call stack size exceeded"));
         }
@@ -432,11 +598,12 @@ impl Vm {
             self.stack.push(Value::Undef);
         }
         self.frames.push(Frame {
-            closure,
+            closure: Rc::as_ptr(&closure),
             ip: 0,
             base,
             handlers: Vec::new(),
             ctor,
+            session: false,
         });
         Ok(())
     }
@@ -445,15 +612,11 @@ impl Vm {
     fn invoke(&mut self, callee: Value, argc: usize, is_new: bool) -> Result<(), Value> {
         match callee {
             Value::Func(c) => {
-                let ctor = if is_new {
-                    let obj = Value::obj();
+                if is_new {
                     let n = self.stack.len();
-                    self.stack[n - argc - 1] = obj.clone();
-                    Some(obj)
-                } else {
-                    None
-                };
-                self.enter(c, argc, ctor)
+                    self.stack[n - argc - 1] = Value::obj();
+                }
+                self.enter(c, argc, is_new)
             }
             Value::Native(def) => {
                 // The arguments move into a buffer that is reused from call to call.
@@ -550,7 +713,7 @@ impl Vm {
     /// Code, base and instruction pointer of the innermost frame.
     fn frame_state(&self) -> (Rc<Proto>, usize, usize) {
         let f = self.frames.last().unwrap();
-        (f.closure.proto.clone(), f.base, f.ip)
+        (f.closure().proto.clone(), f.base, f.ip)
     }
 
     /// A stack slot of the running frame. `enter` sizes the stack to cover every slot the
@@ -597,16 +760,33 @@ impl Vm {
         unsafe { self.stack.set_len(len) }
     }
 
-    /// Pops the running frame, leaving its result on the caller's stack.
+    /// Pops the running frame, leaving its result on the caller's stack. A session frame stays
+    /// instead: its locals and temporaries are dropped, and the result goes to the callee slot,
+    /// where `Session::call` takes it.
     #[inline]
     pub(crate) fn do_return(&mut self) {
         let v = self.pop();
-        let f = self.frames.pop().unwrap();
-        self.truncate_stack(f.base - 2);
-        match f.ctor {
-            Some(obj) if !v.is_object() => self.stack.push(obj),
-            _ => self.stack.push(v),
+        if let Some(top) = self.frames.last() {
+            if top.session {
+                let base = top.base;
+                self.truncate_stack(base);
+                forget_scalar(std::mem::replace(&mut self.stack[base - 2], v));
+                return;
+            }
         }
+        let (base, ctor) = {
+            let top = self.frames.last().unwrap();
+            (top.base, top.ctor)
+        };
+        self.frames.pop();
+        // A constructor returns the object it was given, unless it returned an object itself.
+        let v = if ctor && !v.is_object() {
+            self.stack[base - 1].clone()
+        } else {
+            v
+        };
+        self.truncate_stack(base - 2);
+        self.stack.push(v);
     }
 
     /// Runs the frame that is on top, and the frames it calls, until the frame at `base_depth`
@@ -617,7 +797,7 @@ impl Vm {
         while self.frames.len() > base_depth {
             let (proto, ip) = {
                 let f = self.frames.last().unwrap();
-                (f.closure.proto.clone(), f.ip)
+                (f.closure().proto.clone(), f.ip)
             };
             match proto.native() {
                 Some(code) => self.run_native(code, ip)?,
@@ -667,14 +847,14 @@ impl Vm {
         if !is_new {
             let fast = match &self.stack[idx] {
                 Value::Func(c) if c.proto.nparams as usize == argc && !c.proto.has_rest => {
-                    Some(c.clone())
+                    Some(Rc::as_ptr(c))
                 }
                 _ => None,
             };
             if let Some(closure) = fast {
-                // The frame keeps `closure` alive, so the prototype needs no reference count of its own.
-                let proto: *const Proto = Rc::as_ptr(&closure.proto);
-                // SAFETY: `proto` is owned by `closure`, which the frame pushed below holds.
+                // The callee slot keeps the closure alive while the frame runs.
+                // SAFETY: `closure` is the closure in the callee slot, which is still there.
+                let proto: *const Proto = unsafe { Rc::as_ptr(&(*closure).proto) };
                 if let Some(code) = unsafe { (*proto).native() } {
                     if self.frames.len() < MAX_FRAMES {
                         let base = idx + 2;
@@ -684,7 +864,8 @@ impl Vm {
                             ip: 0,
                             base,
                             handlers: Vec::new(),
-                            ctor: None,
+                            ctor: false,
+                            session: false,
                         });
                         while self.stack.len() < target {
                             self.stack.push(Value::Undef);
@@ -814,7 +995,7 @@ impl Vm {
             Op::False => self.stack.push(Value::Bool(false)),
             Op::This => {
                 let this = if proto.is_arrow {
-                    self.frames.last().unwrap().closure.this.clone()
+                    self.frames.last().unwrap().closure().this.clone()
                 } else {
                     self.stack[base - 1].clone()
                 };
@@ -971,14 +1152,14 @@ impl Vm {
             }
 
             Op::GetUpval(i) => {
-                let v = self.frames.last().unwrap().closure.upvals[i as usize]
+                let v = self.frames.last().unwrap().closure().upvals[i as usize]
                     .borrow()
                     .clone();
                 self.stack.push(v);
             }
             Op::SetUpval(i) => {
                 let v = self.top().clone();
-                *self.frames.last().unwrap().closure.upvals[i as usize].borrow_mut() = v;
+                *self.frames.last().unwrap().closure().upvals[i as usize].borrow_mut() = v;
             }
 
             Op::GetGlobal(i) => {
@@ -1270,12 +1451,12 @@ impl Vm {
                         };
                         upvals.push(cell);
                     } else {
-                        upvals.push(frame.closure.upvals[d.index as usize].clone());
+                        upvals.push(frame.closure().upvals[d.index as usize].clone());
                     }
                 }
                 let this = if child.is_arrow {
                     if proto.is_arrow {
-                        frame.closure.this.clone()
+                        frame.closure().this.clone()
                     } else {
                         self.stack[base - 1].clone()
                     }
@@ -1470,13 +1651,13 @@ impl Vm {
         match self.frames.last() {
             Some(f) => {
                 let line = f
-                    .closure
+                    .closure()
                     .proto
                     .lines
                     .get(f.ip.saturating_sub(1))
                     .copied()
                     .unwrap_or(0);
-                format!("{}:{}", f.closure.proto.file, line)
+                format!("{}:{}", f.closure().proto.file, line)
             }
             None => String::new(),
         }

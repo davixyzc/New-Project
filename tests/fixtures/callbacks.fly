@@ -1,0 +1,91 @@
+// Callbacks passed to array methods: results, exceptions that leave a callback, nested calls,
+// `this`, rest parameters, and arrays that change while they are walked.
+
+const nums = [1, 2, 3, 4, 5];
+console.log(nums.map((x) => x * 2).join(","));
+console.log(nums.filter((x) => x % 2 === 1).join(","));
+console.log(nums.reduce((acc, x) => acc + x, 0));
+console.log(nums.reduce((acc, x) => acc + x));
+
+const seen = [];
+nums.forEach((x, i, arr) => seen.push(x * 10 + i + arr.length));
+console.log(seen.join(" "));
+
+console.log(nums.find((x) => x > 2), nums.findIndex((x) => x > 2));
+console.log(nums.some((x) => x > 4), nums.every((x) => x > 0), nums.every((x) => x > 1));
+
+// Fewer parameters than arguments, and a `this` argument.
+console.log(nums.map(function (x) { return x + 1; }).join(" "));
+const scale = { k: 7 };
+console.log(nums.map(function (x) { return x * this.k; }, scale).join(" "));
+
+// An exception leaves the callback and reaches the caller's handler.
+try {
+  nums.map((x) => {
+    if (x === 3) throw "stop at " + x;
+    return x;
+  });
+} catch (e) {
+  console.log("caught", e);
+}
+
+// A callback that catches its own exception and keeps going.
+const safe = nums.map((x) => {
+  try {
+    if (x % 2 === 0) throw x;
+    return x;
+  } catch (e) {
+    return -e;
+  }
+});
+console.log(safe.join(" "));
+
+// Nested calls: each inner map runs its own session.
+console.log(nums.map((x) => nums.map((y) => x * y).reduce((a, b) => a + b, 0)).join(" "));
+
+// An exception inside an inner map is caught by the outer callback.
+const outer = nums.map((x) => {
+  try {
+    return nums.map((y) => {
+      if (y === 4) throw y;
+      return y;
+    }).length;
+  } catch (e) {
+    return -e;
+  }
+});
+console.log(outer.join(" "));
+
+// Rest parameters take the general path.
+console.log(nums.map((...xs) => xs.length).join(" "));
+
+// The array grows while reduce walks it: only the original length is visited.
+const grow = [1, 2, 3];
+const total = grow.reduce((acc, x) => {
+  if (grow.length < 6) grow.push(x);
+  return acc + x;
+}, 0);
+console.log(total, grow.length);
+
+// Results keep their kinds.
+console.log(nums.map((x) => "n" + x).join(""));
+console.log(nums.map((x) => ({ v: x })).map((o) => o.v).join(""));
+
+// Locals start as undefined in every call.
+console.log(nums.map((x) => { let y; if (x > 2) y = x; return y === undefined ? "none" : y; }).join(" "));
+
+// An exception from a sort comparator.
+try {
+  [2, 1].sort(() => { throw "cmp"; });
+} catch (e) {
+  console.log("sort", e);
+}
+
+// Not a function.
+try {
+  nums.map(42);
+} catch (e) {
+  console.log("not a function");
+}
+
+console.log([3, 1, 2].sort((a, b) => a - b).join(" "));

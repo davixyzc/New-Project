@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 
 use crate::builtins::arg;
 use crate::value::{strict_eq, to_num, to_str, truthy, ArrRef, NativeDef, Value};
-use crate::vm::Vm;
+use crate::vm::{Callback, Vm};
 
 pub static METHODS: &[NativeDef] = &[
     NativeDef {
@@ -229,8 +229,7 @@ fn reverse(vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
 
 fn map(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let a = array_of(vm, &this)?;
-    let f = arg(args, 0);
-    let this_arg = arg(args, 1);
+    let mut cb = Callback::new(vm, &arg(args, 0), arg(args, 1));
     let len = a.borrow().len();
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
@@ -238,19 +237,20 @@ fn map(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
             Some(v) => v,
             None => break,
         };
-        out.push(vm.call_moved(
-            &f,
-            this_arg.clone(),
-            [item, Value::Num(i as f64), this.clone()],
-        )?);
+        let third = if cb.arity() > 2 {
+            this.clone()
+        } else {
+            Value::Undef
+        };
+        out.push(cb.call(vm, [item, Value::Num(i as f64), third])?);
     }
+    cb.finish(vm);
     Ok(Value::arr(out))
 }
 
 fn filter(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let a = array_of(vm, &this)?;
-    let f = arg(args, 0);
-    let this_arg = arg(args, 1);
+    let mut cb = Callback::new(vm, &arg(args, 0), arg(args, 1));
     let len = a.borrow().len();
     let mut out = Vec::new();
     for i in 0..len {
@@ -258,40 +258,44 @@ fn filter(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
             Some(v) => v,
             None => break,
         };
-        let keep = vm.call_moved(
-            &f,
-            this_arg.clone(),
-            [item.clone(), Value::Num(i as f64), this.clone()],
-        )?;
+        let third = if cb.arity() > 2 {
+            this.clone()
+        } else {
+            Value::Undef
+        };
+        let keep = cb.call(vm, [item.clone(), Value::Num(i as f64), third])?;
         if truthy(&keep) {
             out.push(item);
         }
     }
+    cb.finish(vm);
     Ok(Value::arr(out))
 }
 
 fn for_each(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let a = array_of(vm, &this)?;
-    let f = arg(args, 0);
-    let this_arg = arg(args, 1);
+    let mut cb = Callback::new(vm, &arg(args, 0), arg(args, 1));
     let len = a.borrow().len();
     for i in 0..len {
         let item = match element(&a, i) {
             Some(v) => v,
             None => break,
         };
-        vm.call_moved(
-            &f,
-            this_arg.clone(),
-            [item, Value::Num(i as f64), this.clone()],
-        )?;
+        let third = if cb.arity() > 2 {
+            this.clone()
+        } else {
+            Value::Undef
+        };
+        cb.call(vm, [item, Value::Num(i as f64), third])?;
     }
+    cb.finish(vm);
     Ok(Value::Undef)
 }
 
 fn reduce(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let a = array_of(vm, &this)?;
     let f = arg(args, 0);
+    let mut cb = Callback::new(vm, &f, Value::Undef);
     let len = a.borrow().len();
     let (mut acc, start) = if args.len() >= 2 {
         (args[1].clone(), 0)
@@ -310,12 +314,14 @@ fn reduce(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
             Some(v) => v,
             None => break,
         };
-        acc = vm.call_moved(
-            &f,
-            Value::Undef,
-            [acc, item, Value::Num(i as f64), this.clone()],
-        )?;
+        let last = if cb.arity() > 3 {
+            this.clone()
+        } else {
+            Value::Undef
+        };
+        acc = cb.call(vm, [acc, item, Value::Num(i as f64), last])?;
     }
+    cb.finish(vm);
     Ok(acc)
 }
 
@@ -331,21 +337,25 @@ fn search(
         Value::Arr(a) => a.clone(),
         _ => return Err(vm.make_error("TypeError", "Array method called on a non-array")),
     };
+    let mut cb = Callback::new(vm, f, this_arg.clone());
     let len = a.borrow().len();
     for i in 0..len {
         let item = match element(&a, i) {
             Some(v) => v,
             None => break,
         };
-        let r = vm.call_moved(
-            f,
-            this_arg.clone(),
-            [item.clone(), Value::Num(i as f64), this.clone()],
-        )?;
+        let third = if cb.arity() > 2 {
+            this.clone()
+        } else {
+            Value::Undef
+        };
+        let r = cb.call(vm, [item.clone(), Value::Num(i as f64), third])?;
         if truthy(&r) == stop_when {
+            cb.finish(vm);
             return Ok(Some((i, item)));
         }
     }
+    cb.finish(vm);
     Ok(None)
 }
 
@@ -412,10 +422,13 @@ fn sort(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
             })
         })?
     } else {
-        merge_sort(items, &mut |x: &Value, y: &Value| {
-            let r = vm.call_moved(&compare_fn, Value::Undef, [x.clone(), y.clone()])?;
+        let mut cb = Callback::new(vm, &compare_fn, Value::Undef);
+        let sorted = merge_sort(items, &mut |x: &Value, y: &Value| {
+            let r = cb.call(vm, [x.clone(), y.clone()])?;
             Ok(to_num(&r))
-        })?
+        });
+        cb.finish(vm);
+        sorted?
     };
     *a.borrow_mut() = sorted;
     Ok(this)
