@@ -92,7 +92,7 @@ Outras medidas, com o binário com PGO (a inicialização é a mediana de 15 exe
 
 | | fly | Node 22 | Python 3 |
 | --- | ---: | ---: | ---: |
-| tamanho do executável | **916 KB** (PGO); 864 KB sem PGO | 118 MB | — |
+| tamanho do executável | **916 KB** (PGO); 864 KB sem PGO | 123 MB | — |
 | inicialização (`-e 'console.log(1)'`) | **3,3 ms** | 54 ms | 26 ms |
 | memória de pico, 1M inteiros em array | **18 MB** | 77 MB | 47 MB |
 
