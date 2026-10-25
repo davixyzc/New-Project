@@ -1,0 +1,15 @@
+console.log("sync start");
+setTimeout(() => console.log("timeout 30"), 30);
+setTimeout(() => console.log("timeout 10"), 10);
+setTimeout((a, b) => console.log("args", a, b), 120, "x", "y");
+setImmediate(() => console.log("immediate"));
+process.nextTick(() => console.log("tick"));
+let ticks = 0;
+const handle = setInterval(() => {
+  ticks++;
+  console.log("interval", ticks);
+  if (ticks === 3) clearInterval(handle);
+}, 50);
+const cancelled = setTimeout(() => console.log("never"), 1);
+clearTimeout(cancelled);
+console.log("sync end");

@@ -1,0 +1,12 @@
+console.log(1 + 2 * 3, (1 + 2) * 3, 7 / 2, 7 % 3, -7 % 3, 2 ** 10);
+console.log("con" + "cat", "n=" + 5, 1 + "2", "3" * "4", true + 1);
+console.log(1 == "1", 1 === "1", null == undefined, null === undefined, NaN === NaN);
+console.log(typeof 1, typeof "s", typeof true, typeof undefined, typeof null, typeof {}, typeof [], typeof console.log);
+console.log(0 || "fallback", "" && "never", 0 ?? "kept", null ?? "nullish", !0, !!"x");
+const name = "fly", n = 3;
+console.log(`hello ${name}! ${n * 2} items`, `plain`);
+console.log(0.1 + 0.2 > 0.3, Math.floor(-1.5), Math.round(2.5), Math.abs(-4), Math.max(1, 9, 3));
+console.log(parseInt("42px"), parseFloat("3.5e2x"), Number("12"), String(7), Boolean(0));
+let x = 5;
+x += 2; x -= 1; x *= 3; x /= 2; x %= 5;
+console.log(x, x++, ++x, x--, x);

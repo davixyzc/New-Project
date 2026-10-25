@@ -1,0 +1,15 @@
+finally on return
+try
+body 0
+finally on break 0
+finally on break 1
+finally on continue 0
+kept 1
+finally on continue 1
+inner fin
+outer fin
+1
+h fin
+caught x
+undefined object 3 1.00 -0 3.142
+1e+21 1e-7 123456789012 0.000001 1152921504606847000

@@ -1,0 +1,10 @@
+function f() { try { return "try"; } finally { console.log("finally on return"); } }
+console.log(f());
+for (let i = 0; i < 3; i++) { try { if (i === 1) break; console.log("body", i); } finally { console.log("finally on break", i); } }
+for (let i = 0; i < 2; i++) { try { if (i === 0) continue; console.log("kept", i); } finally { console.log("finally on continue", i); } }
+function g() { try { try { return 1; } finally { console.log("inner fin"); } } finally { console.log("outer fin"); } }
+console.log(g());
+function h() { try { throw new Error("x"); } catch (e) { return "caught " + e.message; } finally { console.log("h fin"); } }
+console.log(h());
+console.log(typeof notDeclaredAnywhere, typeof console, (2.5).toFixed(0), (1.005).toFixed(2), (-0.4).toFixed(0), (3.14159).toFixed(3));
+console.log(1e21, 1e-7, 123456789012, 0.000001, 2 ** 60);

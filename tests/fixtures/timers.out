@@ -1,0 +1,10 @@
+sync start
+sync end
+tick
+immediate
+timeout 10
+timeout 30
+interval 1
+interval 2
+args x y
+interval 3

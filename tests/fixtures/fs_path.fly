@@ -1,0 +1,9 @@
+const fs = require("fs");
+const path = require("path");
+const text = fs.readFileSync(path.join(__dirname, "data.txt"));
+console.log(text.split("\n"), text.length);
+console.log(fs.existsSync(path.join(__dirname, "data.txt")), fs.existsSync("definitely-missing.txt"));
+console.log(path.basename("/a/b/report.final.txt"), path.basename("/a/b/c.fly", ".fly"));
+console.log(path.extname("archive.tar.gz"), path.dirname("/srv/app/index.fly"), path.join("a", "b", "..", "c.txt"));
+try { fs.readFileSync("definitely-missing.txt"); } catch (e) { console.log("fs error:", e.message.slice(0, 7)); }
+console.log(path.resolve("a/b", "../c.txt").endsWith("/a/c.txt"), path.resolve("/x", "y", "../z"));

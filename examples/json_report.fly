@@ -1,0 +1,19 @@
+// Monta um relatório em JSON a partir de dados em memória.
+const vendas = [
+  { produto: "café", quantidade: 3, preco: 12.5 },
+  { produto: "pão", quantidade: 10, preco: 0.75 },
+  { produto: "leite", quantidade: 2, preco: 4.2 },
+];
+
+const total = vendas.reduce((soma, v) => soma + v.quantidade * v.preco, 0);
+const relatorio = { geradoEm: "exemplo", itens: vendas.length, total: total.toFixed(2), vendas };
+
+console.log(JSON.stringify(relatorio, null, 2));
+
+switch (true) {
+  case total > 100:
+    console.log("venda grande");
+    break;
+  default:
+    console.log("venda pequena");
+}

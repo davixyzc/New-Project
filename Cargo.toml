@@ -1,0 +1,18 @@
+[package]
+name = "fly"
+version = "0.1.0"
+edition = "2021"
+description = "fly: a small, fast, Node.js-inspired JavaScript-like language and runtime"
+
+[dependencies]
+
+[[bin]]
+name = "fly"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

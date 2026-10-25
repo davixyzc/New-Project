@@ -1,0 +1,42 @@
+let out = [];
+for (let i = 0; i < 10; i++) {
+  if (i % 2 === 0) continue;
+  if (i > 6) break;
+  out.push(i);
+}
+console.log("odd", out);
+
+let n = 0;
+while (true) {
+  try { n++; if (n === 3) break; } catch (e) { console.log("never"); }
+}
+console.log("n", n);
+
+let d = 0;
+do { d += 2; } while (d < 7);
+console.log("d", d);
+
+for (const k in { a: 1, b: 2 }) console.log("key", k);
+for (const ch of "hi") console.log("char", ch);
+
+function grade(score) {
+  switch (true) {
+    case score >= 90: return "A";
+    case score >= 80: return "B";
+    default: return "C";
+  }
+}
+console.log(grade(95), grade(85), grade(10));
+
+const log = [];
+for (let i = 0; i < 5; i++) {
+  switch (i % 3) {
+    case 0: log.push("zero"); break;
+    case 1: log.push("one");
+    case 2: log.push("two"); continue;
+  }
+  log.push("end" + i);
+}
+console.log(log.join(","));
+const r = i => i > 2 ? "big" : i > 0 ? "small" : "none";
+console.log(r(5), r(1), r(0));

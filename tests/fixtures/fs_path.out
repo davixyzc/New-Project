@@ -1,0 +1,6 @@
+[ 'alpha', 'beta', 'gamma' ] 16
+true false
+report.final.txt c
+.gz /srv/app a/c.txt
+fs error: ENOENT:
+true /x/z

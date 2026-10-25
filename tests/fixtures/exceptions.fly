@@ -1,0 +1,27 @@
+function risky(kind) {
+  if (kind === "type") return null.field;
+  if (kind === "custom") throw new Error("custom failure");
+  if (kind === "string") throw "plain value";
+  return "ok";
+}
+for (const kind of ["none", "type", "custom", "string"]) {
+  try {
+    console.log("result", risky(kind));
+  } catch (e) {
+    console.log("caught", typeof e === "string" ? e : e.name + ": " + e.message);
+  } finally {
+    console.log("finally", kind);
+  }
+}
+
+function nested() {
+  try {
+    try { throw new Error("inner"); }
+    catch (e) { throw new TypeError("outer from " + e.message); }
+  } catch (e) {
+    return e.name + " | " + e.message;
+  }
+}
+console.log(nested());
+try { undefinedVariable; } catch (e) { console.log(e.name, e.message); }
+try { (1)(); } catch (e) { console.log(e.name); }

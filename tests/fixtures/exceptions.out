@@ -1,0 +1,11 @@
+result ok
+finally none
+caught TypeError: Cannot read properties of null (reading 'field')
+finally type
+caught Error: custom failure
+finally custom
+caught plain value
+finally string
+TypeError | outer from inner
+ReferenceError undefinedVariable is not defined
+TypeError

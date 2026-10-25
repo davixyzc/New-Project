@@ -1,0 +1,4 @@
+const helper = require("./require_local_lib/helper");
+const again = require("./require_local_lib/helper.fly");
+console.log(helper.greet("fly"), helper.calls());
+console.log(again === helper, helper.calls());

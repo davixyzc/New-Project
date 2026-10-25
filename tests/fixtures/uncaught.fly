@@ -1,0 +1,4 @@
+console.log("before");
+function fail() { throw new RangeError("boom"); }
+fail();
+console.log("after");

@@ -1,0 +1,33 @@
+function counter() {
+  let count = 0;
+  return { inc: () => ++count, get: () => count };
+}
+const c = counter();
+c.inc(); c.inc();
+console.log("count", c.get());
+
+const fns = [];
+for (let i = 0; i < 3; i++) fns.push(() => i);
+console.log(fns.map(f => f()));
+
+const words = [];
+for (const w of ["a", "b"]) {
+  const up = w.toUpperCase();
+  words.push(() => up + w);
+}
+console.log(words[0](), words[1]());
+
+function outer() {
+  let x = 1;
+  return function middle() {
+    return function inner() { x += 10; return x; };
+  };
+}
+const inner = outer()();
+inner();
+console.log("nested", inner());
+
+let total = 0;
+const add = n => { total += n; return total; };
+add(2); add(3);
+console.log("total", total);

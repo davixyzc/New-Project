@@ -1,0 +1,7 @@
+const s = "Hello, World";
+console.log(s.length, s.toUpperCase(), s.toLowerCase(), s.indexOf("World"), s.indexOf("nope"));
+console.log(s.slice(0, 5), s.slice(-5), s.substring(7), s.charAt(4), s[1], s.charCodeAt(0));
+console.log(s.includes("lo, W"), s.startsWith("Hell"), s.endsWith("ld"), s.split(", "));
+console.log("  pad  ".trim() + "|", "ab".repeat(3), "x".padStart(3, "-"), "7".padEnd(3, "0"));
+console.log("a-b-c".replace("-", "+"), "one two".split(" ").reverse().join(" "), "".split(","));
+console.log([..."héllo"].length, "abc".split(""), "Tab\tEnd".length);

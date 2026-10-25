@@ -1,0 +1,3 @@
+let calls = 0;
+exports.greet = name => { calls++; return "hi " + name; };
+exports.calls = () => calls;

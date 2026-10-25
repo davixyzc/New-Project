@@ -1,0 +1,14 @@
+// Conta linhas e palavras de um arquivo: fly examples/wordcount.fly <arquivo>
+const fs = require("fs");
+const path = require("path");
+
+const file = process.argv[2];
+if (!file) {
+  console.error("uso: fly examples/wordcount.fly <arquivo>");
+  process.exit(2);
+}
+
+const text = fs.readFileSync(path.resolve(file));
+const lines = text.split("\n");
+const words = text.split(" ").filter((w) => w.length > 0);
+console.log(`${path.basename(file)}: ${lines.length} linhas, ${words.length} palavras`);

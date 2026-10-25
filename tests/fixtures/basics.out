@@ -1,0 +1,9 @@
+7 9 3.5 1 -1 1024
+concat n=5 12 12 2
+true false true false false
+number string boolean undefined object object object function
+fallback  0 nullish true true
+hello fly! 6 items plain
+true -2 3 4 9
+42 350 12 7 false
+4 4 6 6 5

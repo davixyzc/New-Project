@@ -1,0 +1,24 @@
+function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); }
+console.log("fact", fact(10));
+
+function greet(name = "world", punct = "!") { return "hello " + name + punct; }
+console.log(greet(), greet("fly"), greet(undefined, "?"));
+
+function collect(first, ...rest) { return first + ":" + rest.length + ":" + rest.join("|"); }
+console.log(collect(1), collect(1, 2, 3));
+
+const obj = {
+  name: "box",
+  describe() { return "box:" + this.name; },
+  later() { return () => this.name; },
+};
+console.log(obj.describe(), obj.later()());
+
+function Point(x, y) { this.x = x; this.y = y; }
+const p = new Point(3, 4);
+console.log(p.x * p.y, p.x + p.y);
+
+const square = x => x * x;
+const addAll = (...xs) => xs.reduce((a, b) => a + b, 0);
+console.log(square(7), addAll(1, 2, 3, 4));
+console.log(typeof square, square.name === "", fact.name);

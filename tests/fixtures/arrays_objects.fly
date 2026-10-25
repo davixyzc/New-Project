@@ -1,0 +1,20 @@
+const nums = [5, 3, 8, 1];
+console.log(nums.length, nums.indexOf(8), nums.includes(4), nums.slice(1, 3));
+console.log(nums.map(n => n * 10), nums.filter(n => n > 3), nums.find(n => n > 4));
+console.log(nums.some(n => n > 7), nums.every(n => n > 0), nums.findIndex(n => n === 1));
+const copy = [...nums, 9];
+copy.push(10, 11);
+console.log(copy.pop(), copy.shift(), copy.length, copy.concat([0]).length);
+console.log([3, 1, 2].sort(), [10, 9, 1].sort((a, b) => a - b), [1, 2, 3].reverse());
+console.log([1, [2, 3]].join("-"), [null, undefined, 1].join(","), String([1, 2]));
+
+const person = { name: "ana", age: 30, tags: ["x"] };
+person.age += 1;
+person["city"] = "rio";
+console.log(Object.keys(person).join(","), person.age, person.city, person.missing);
+console.log(Object.values({ a: 1, b: 2 }), Object.entries({ k: "v" })[0][1]);
+delete_me = { tmp: 1 };
+console.log(JSON.stringify({ list: [1, { deep: true }], s: "q\"" }));
+console.log(JSON.parse('{"a":[1,2,{"b":null}]}').a[2].b, Array.isArray(nums), Array.isArray(person));
+const matrix = [[1, 2], [3, 4]];
+console.log(matrix[1][0], matrix.map(row => row.reduce((a, b) => a + b, 0)));

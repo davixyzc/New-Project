@@ -1,0 +1,1307 @@
+//! Compiles the AST into bytecode prototypes.
+//!
+//! Scope resolution happens here: every name becomes a frame slot, a captured cell,
+//! an upvalue or a global lookup. A function whose body contains other functions
+//! stores all its locals in cells, so closures can share them.
+
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use crate::ast::*;
+use crate::bytecode::{Op, Proto, UpvalDesc};
+use crate::parser::parse_program;
+use crate::value::Value;
+
+/// Compiles one source file into the prototype of its module wrapper function.
+pub fn compile_module(file: &str, src: &str) -> Result<Proto, String> {
+    let def = parse_program(src)?;
+    let mut c = Compiler {
+        funcs: Vec::new(),
+        file: Rc::from(file),
+    };
+    c.function(&def)
+}
+
+struct Compiler {
+    funcs: Vec<FuncState>,
+    file: Rc<str>,
+}
+
+struct FuncState {
+    boxed: bool,
+    code: Vec<Op>,
+    lines: Vec<u32>,
+    consts: Vec<Value>,
+    string_consts: HashMap<String, u32>,
+    protos: Vec<Rc<Proto>>,
+    /// Captured names: (name, where to load it from, is_const).
+    upvals: Vec<(String, UpvalDesc, bool)>,
+    scopes: Vec<Scope>,
+    next_slot: u32,
+    max_slot: u32,
+    loops: Vec<LoopCtx>,
+    /// Number of `try` handlers that are active at the current point.
+    handlers: u32,
+    /// `try` blocks with a `finally` whose body is being compiled, innermost last.
+    finally_stack: Vec<FinallyCtx>,
+    line: u32,
+}
+
+/// A `try` block with a `finally`, while its body is being compiled.
+struct FinallyCtx {
+    /// Handler depth outside the `try`. Leaving the `try` pops back to this depth.
+    handlers: u32,
+    body: Vec<Stmt>,
+}
+
+struct Scope {
+    vars: Vec<Var>,
+    first_slot: u32,
+}
+
+struct Var {
+    name: String,
+    slot: u32,
+    is_const: bool,
+}
+
+#[derive(Default)]
+struct LoopCtx {
+    breaks: Vec<usize>,
+    continues: Vec<usize>,
+    /// Handler depth when the loop started; jumps out of the loop must pop deeper handlers.
+    handlers: u32,
+    /// False for `switch`, which `break` can leave but `continue` skips over.
+    is_loop: bool,
+}
+
+enum Ref {
+    Local { slot: u32, is_const: bool },
+    Upval { index: u32, is_const: bool },
+    Global,
+}
+
+impl FuncState {
+    fn new(boxed: bool, line: u32) -> Self {
+        FuncState {
+            boxed,
+            code: Vec::new(),
+            lines: Vec::new(),
+            consts: Vec::new(),
+            string_consts: HashMap::new(),
+            protos: Vec::new(),
+            upvals: Vec::new(),
+            scopes: Vec::new(),
+            next_slot: 0,
+            max_slot: 0,
+            loops: Vec::new(),
+            handlers: 0,
+            finally_stack: Vec::new(),
+            line,
+        }
+    }
+}
+
+/// For `x += e` and `x = x + e`, returns `e`.
+fn concat_rhs<'a>(op: &str, name: &str, value: &'a Expr) -> Option<&'a Expr> {
+    match (op, value) {
+        ("+=", _) => Some(value),
+        ("=", Expr::Binary("+", lhs, rhs)) if matches!(&**lhs, Expr::Ident(n) if n.as_str() == name) => {
+            Some(&**rhs)
+        }
+        _ => None,
+    }
+}
+
+fn binop(op: &str) -> Op {
+    match op {
+        "+" => Op::Add,
+        "-" => Op::Sub,
+        "*" => Op::Mul,
+        "/" => Op::Div,
+        "%" => Op::Mod,
+        "**" => Op::Pow,
+        "==" => Op::Eq,
+        "!=" => Op::Ne,
+        "===" => Op::StrictEq,
+        "!==" => Op::StrictNe,
+        "<" => Op::Lt,
+        "<=" => Op::Le,
+        ">" => Op::Gt,
+        ">=" => Op::Ge,
+        _ => unreachable!("unknown binary operator {}", op),
+    }
+}
+
+impl Compiler {
+    fn fs(&mut self) -> &mut FuncState {
+        self.funcs.last_mut().unwrap()
+    }
+
+    fn emit(&mut self, op: Op) -> usize {
+        let fs = self.fs();
+        fs.code.push(op);
+        fs.lines.push(fs.line);
+        fs.code.len() - 1
+    }
+
+    fn here(&mut self) -> usize {
+        self.fs().code.len()
+    }
+
+    fn line(&mut self, line: u32) {
+        self.fs().line = line;
+    }
+
+    fn syntax_error(&mut self, msg: &str) -> String {
+        format!("SyntaxError: {} at line {}", msg, self.fs().line)
+    }
+
+    fn patch_to(&mut self, at: usize, target: u32) {
+        let fs = self.fs();
+        fs.code[at] = match fs.code[at] {
+            Op::Jump(_) => Op::Jump(target),
+            Op::JumpIfFalse(_) => Op::JumpIfFalse(target),
+            Op::JumpIfTrue(_) => Op::JumpIfTrue(target),
+            Op::JumpIfNotLt(_) => Op::JumpIfNotLt(target),
+            Op::JumpIfNotLe(_) => Op::JumpIfNotLe(target),
+            Op::JumpIfNotGt(_) => Op::JumpIfNotGt(target),
+            Op::JumpIfNotGe(_) => Op::JumpIfNotGe(target),
+            Op::AndJump(_) => Op::AndJump(target),
+            Op::OrJump(_) => Op::OrJump(target),
+            Op::NullishJump(_) => Op::NullishJump(target),
+            Op::PushHandler(_) => Op::PushHandler(target),
+            other => other,
+        };
+    }
+
+    /// Points the jump at `at` to the next instruction emitted.
+    fn patch(&mut self, at: usize) {
+        let target = self.here() as u32;
+        self.patch_to(at, target);
+    }
+
+    fn str_const(&mut self, s: &str) -> u32 {
+        let fs = self.fs();
+        if let Some(&i) = fs.string_consts.get(s) {
+            return i;
+        }
+        let i = fs.consts.len() as u32;
+        fs.consts.push(Value::str(s));
+        fs.string_consts.insert(s.to_string(), i);
+        i
+    }
+
+    fn push_num(&mut self, n: f64) {
+        let fs = self.fs();
+        let i = fs.consts.len() as u32;
+        fs.consts.push(Value::Num(n));
+        self.emit(Op::Const(i));
+    }
+
+    // ----- scopes and slots -------------------------------------------------
+
+    fn enter_scope(&mut self) {
+        let fs = self.fs();
+        let first_slot = fs.next_slot;
+        fs.scopes.push(Scope {
+            vars: Vec::new(),
+            first_slot,
+        });
+    }
+
+    fn exit_scope(&mut self) {
+        let fs = self.fs();
+        let scope = fs.scopes.pop().unwrap();
+        fs.next_slot = scope.first_slot;
+    }
+
+    fn alloc_slot(&mut self) -> u32 {
+        let fs = self.fs();
+        let slot = fs.next_slot;
+        fs.next_slot += 1;
+        fs.max_slot = fs.max_slot.max(fs.next_slot);
+        slot
+    }
+
+    fn declare(&mut self, name: &str, is_const: bool) -> u32 {
+        let slot = self.alloc_slot();
+        self.fs().scopes.last_mut().unwrap().vars.push(Var {
+            name: name.to_string(),
+            slot,
+            is_const,
+        });
+        slot
+    }
+
+    /// A hidden slot for compiler temporaries.
+    fn temp(&mut self) -> u32 {
+        let slot = self.alloc_slot();
+        if self.fs().boxed {
+            self.emit(Op::NewCell(slot));
+        }
+        slot
+    }
+
+    fn get_slot(&mut self, slot: u32) {
+        if self.fs().boxed {
+            self.emit(Op::GetBoxed(slot));
+        } else {
+            self.emit(Op::GetLocal(slot));
+        }
+    }
+
+    /// Stores the top of the stack into a slot, leaving the value in place.
+    fn set_slot(&mut self, slot: u32) {
+        if self.fs().boxed {
+            self.emit(Op::SetBoxed(slot));
+        } else {
+            self.emit(Op::SetLocal(slot));
+        }
+    }
+
+    fn resolve(&mut self, name: &str) -> Ref {
+        let level = self.funcs.len() - 1;
+        self.resolve_at(level, name)
+    }
+
+    fn resolve_at(&mut self, level: usize, name: &str) -> Ref {
+        let fs = &self.funcs[level];
+        for scope in fs.scopes.iter().rev() {
+            if let Some(v) = scope.vars.iter().rev().find(|v| v.name == name) {
+                return Ref::Local {
+                    slot: v.slot,
+                    is_const: v.is_const,
+                };
+            }
+        }
+        if let Some(i) = fs.upvals.iter().position(|(n, _, _)| n == name) {
+            return Ref::Upval {
+                index: i as u32,
+                is_const: fs.upvals[i].2,
+            };
+        }
+        if level == 0 {
+            return Ref::Global;
+        }
+        // Not ours: capture it from the enclosing function. Its locals are cells
+        // because that function contains us, so the capture can share the cell.
+        let (desc, is_const) = match self.resolve_at(level - 1, name) {
+            Ref::Local { slot, is_const } => (
+                UpvalDesc {
+                    from_local: true,
+                    index: slot,
+                },
+                is_const,
+            ),
+            Ref::Upval { index, is_const } => (
+                UpvalDesc {
+                    from_local: false,
+                    index,
+                },
+                is_const,
+            ),
+            Ref::Global => return Ref::Global,
+        };
+        let fs = &mut self.funcs[level];
+        fs.upvals.push((name.to_string(), desc, is_const));
+        Ref::Upval {
+            index: (fs.upvals.len() - 1) as u32,
+            is_const,
+        }
+    }
+
+    fn load_var(&mut self, name: &str) {
+        match self.resolve(name) {
+            Ref::Local { slot, .. } => self.get_slot(slot),
+            Ref::Upval { index, .. } => {
+                self.emit(Op::GetUpval(index));
+            }
+            Ref::Global => {
+                let c = self.str_const(name);
+                self.emit(Op::GetGlobal(c));
+            }
+        }
+    }
+
+    /// Assignment: stores the top of the stack and leaves it there.
+    fn store_var(&mut self, name: &str) {
+        match self.resolve(name) {
+            Ref::Local {
+                slot,
+                is_const: false,
+            } => self.set_slot(slot),
+            Ref::Upval {
+                index,
+                is_const: false,
+            } => {
+                self.emit(Op::SetUpval(index));
+            }
+            Ref::Local { is_const: true, .. } | Ref::Upval { is_const: true, .. } => {
+                let c = self.str_const(name);
+                self.emit(Op::ConstAssign(c));
+            }
+            Ref::Global => {
+                let c = self.str_const(name);
+                self.emit(Op::SetGlobal(c));
+            }
+        }
+    }
+
+    /// Initialises a declared variable of the current scope (ignores `const`).
+    fn init_var(&mut self, name: &str) {
+        match self.resolve(name) {
+            Ref::Local { slot, .. } => self.set_slot(slot),
+            _ => self.store_var(name),
+        }
+    }
+
+    // ----- functions --------------------------------------------------------
+
+    fn function(&mut self, def: &FuncDef) -> Result<Proto, String> {
+        self.funcs.push(FuncState::new(def.has_inner, def.line));
+        self.enter_scope();
+        let nfixed = def.params.len() as u32;
+        for p in &def.params {
+            self.declare(&p.name, false);
+        }
+        if let Some(rest) = &def.rest {
+            self.declare(rest, false);
+        }
+        let nargs = nfixed + u32::from(def.rest.is_some());
+        if self.fs().boxed {
+            for i in 0..nargs {
+                self.emit(Op::BoxParam(i));
+            }
+        }
+        for (i, p) in def.params.iter().enumerate() {
+            if let Some(default) = &p.default {
+                let slot = i as u32;
+                self.get_slot(slot);
+                self.emit(Op::Undef);
+                self.emit(Op::StrictEq);
+                let skip = self.emit(Op::JumpIfFalse(0));
+                self.expr(default)?;
+                self.set_slot(slot);
+                self.emit(Op::Pop);
+                self.patch(skip);
+            }
+        }
+        self.declare_block(&def.body)?;
+        for s in &def.body {
+            self.stmt(s)?;
+        }
+        self.emit(Op::Undef);
+        self.emit(Op::Return);
+
+        let fs = self.funcs.pop().unwrap();
+        Ok(Proto {
+            name: def.name.clone().unwrap_or_default(),
+            file: self.file.clone(),
+            code: fs.code,
+            lines: fs.lines,
+            consts: fs.consts,
+            protos: fs.protos,
+            upvals: fs.upvals.iter().map(|(_, d, _)| *d).collect(),
+            nparams: nfixed,
+            has_rest: def.rest.is_some(),
+            nlocals: fs.max_slot,
+            is_arrow: def.is_arrow,
+        })
+    }
+
+    /// Compiles a nested function and returns its index in the current prototype's table.
+    /// An anonymous function takes `name_hint` as its name, as in `const f = () => ...`.
+    fn child(&mut self, def: &FuncDef, name_hint: Option<&str>) -> Result<u32, String> {
+        let mut proto = self.function(def)?;
+        if proto.name.is_empty() {
+            if let Some(name) = name_hint {
+                proto.name = name.to_string();
+            }
+        }
+        let fs = self.fs();
+        fs.protos.push(Rc::new(proto));
+        Ok((fs.protos.len() - 1) as u32)
+    }
+
+    /// Declares the lexical names of a block (`let`, `const`, function declarations),
+    /// creates their cells, and instantiates hoisted functions. Returns the declared slots.
+    fn declare_block(&mut self, stmts: &[Stmt]) -> Result<Vec<u32>, String> {
+        let mut declared = Vec::new();
+        let mut funcs: Vec<(&FuncDef, u32)> = Vec::new();
+        for s in stmts {
+            match s {
+                Stmt::Var(kind, decls, _) => {
+                    for (name, _) in decls {
+                        declared.push(self.declare(name, *kind == VarKind::Const));
+                    }
+                }
+                Stmt::Func(def) => {
+                    let slot = self.declare(def.name.as_deref().unwrap_or(""), false);
+                    declared.push(slot);
+                    funcs.push((&**def, slot));
+                }
+                _ => {}
+            }
+        }
+        if self.fs().boxed {
+            for &slot in &declared {
+                self.emit(Op::NewCell(slot));
+            }
+        }
+        for (def, slot) in funcs {
+            let idx = self.child(def, None)?;
+            self.emit(Op::Closure(idx));
+            self.set_slot(slot);
+            self.emit(Op::Pop);
+        }
+        Ok(declared)
+    }
+
+    fn block(&mut self, stmts: &[Stmt]) -> Result<(), String> {
+        self.enter_scope();
+        self.declare_block(stmts)?;
+        for s in stmts {
+            self.stmt(s)?;
+        }
+        self.exit_scope();
+        Ok(())
+    }
+
+    // ----- statements -------------------------------------------------------
+
+    fn loop_push(&mut self) {
+        let fs = self.fs();
+        let handlers = fs.handlers;
+        fs.loops.push(LoopCtx {
+            handlers,
+            is_loop: true,
+            ..LoopCtx::default()
+        });
+    }
+
+    fn loop_pop(&mut self) -> LoopCtx {
+        self.fs().loops.pop().unwrap()
+    }
+
+    fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
+        match s {
+            Stmt::Expr(e, line) => {
+                self.line(*line);
+                self.expr_discard(e)?;
+            }
+            Stmt::Var(_, decls, line) => {
+                self.line(*line);
+                for (name, init) in decls {
+                    match init {
+                        Some(Expr::Func(def)) => {
+                            let idx = self.child(def, Some(name))?;
+                            self.emit(Op::Closure(idx));
+                        }
+                        Some(e) => self.expr(e)?,
+                        None => {
+                            self.emit(Op::Undef);
+                        }
+                    }
+                    self.init_var(name);
+                    self.emit(Op::Pop);
+                }
+            }
+            Stmt::Func(..) | Stmt::Empty => {}
+            Stmt::Return(value, line) => {
+                self.line(*line);
+                match value {
+                    Some(e) => self.expr(e)?,
+                    None => {
+                        self.emit(Op::Undef);
+                    }
+                }
+                self.leave_try_blocks(0)?;
+                self.emit(Op::Return);
+            }
+            Stmt::If(cond, then, otherwise, line) => {
+                self.line(*line);
+                let to_else = self.jump_if_false(cond)?;
+                self.stmt(then)?;
+                match otherwise {
+                    Some(e) => {
+                        let to_end = self.emit(Op::Jump(0));
+                        self.patch(to_else);
+                        self.stmt(e)?;
+                        self.patch(to_end);
+                    }
+                    None => self.patch(to_else),
+                }
+            }
+            Stmt::While(cond, body, line) => {
+                self.line(*line);
+                let start = self.here() as u32;
+                let exit = self.jump_if_false(cond)?;
+                self.loop_push();
+                self.stmt(body)?;
+                let ctx = self.loop_pop();
+                for c in ctx.continues {
+                    self.patch_to(c, start);
+                }
+                self.emit(Op::Jump(start));
+                self.patch(exit);
+                for b in ctx.breaks {
+                    self.patch(b);
+                }
+            }
+            Stmt::DoWhile(body, cond, line) => {
+                self.line(*line);
+                let start = self.here() as u32;
+                self.loop_push();
+                self.stmt(body)?;
+                let ctx = self.loop_pop();
+                let cont = self.here() as u32;
+                for c in ctx.continues {
+                    self.patch_to(c, cont);
+                }
+                self.expr(cond)?;
+                self.emit(Op::JumpIfTrue(start));
+                for b in ctx.breaks {
+                    self.patch(b);
+                }
+            }
+            Stmt::For {
+                init,
+                test,
+                update,
+                body,
+                line,
+            } => {
+                self.line(*line);
+                self.enter_scope();
+                let mut loop_vars = Vec::new();
+                if let Some(init) = init {
+                    loop_vars = self.declare_block(std::slice::from_ref(&**init))?;
+                    self.stmt(init)?;
+                }
+                let start = self.here() as u32;
+                let exit = match test {
+                    Some(t) => Some(self.jump_if_false(t)?),
+                    None => None,
+                };
+                self.loop_push();
+                self.stmt(body)?;
+                let ctx = self.loop_pop();
+                let cont = self.here() as u32;
+                for c in ctx.continues {
+                    self.patch_to(c, cont);
+                }
+                // Each iteration gets fresh copies of captured loop variables, so closures
+                // created in earlier iterations keep the values they saw.
+                if self.fs().boxed {
+                    for slot in loop_vars {
+                        self.emit(Op::Rebox(slot));
+                    }
+                }
+                if let Some(u) = update {
+                    self.expr_discard(u)?;
+                }
+                self.emit(Op::Jump(start));
+                if let Some(e) = exit {
+                    self.patch(e);
+                }
+                for b in ctx.breaks {
+                    self.patch(b);
+                }
+                self.exit_scope();
+            }
+            Stmt::ForOf {
+                kind,
+                name,
+                iter,
+                body,
+                line,
+            } => {
+                self.for_each(*kind, name, iter, body, *line, false)?;
+            }
+            Stmt::ForIn {
+                kind,
+                name,
+                iter,
+                body,
+                line,
+            } => {
+                self.for_each(*kind, name, iter, body, *line, true)?;
+            }
+            Stmt::Break(line) => {
+                self.line(*line);
+                let loop_handlers = match self.fs().loops.last() {
+                    Some(l) => l.handlers,
+                    None => return Err(self.syntax_error("'break' outside of a loop")),
+                };
+                self.leave_try_blocks(loop_handlers)?;
+                let j = self.emit(Op::Jump(0));
+                self.fs().loops.last_mut().unwrap().breaks.push(j);
+            }
+            Stmt::Continue(line) => {
+                self.line(*line);
+                let target = match self.fs().loops.iter().rposition(|l| l.is_loop) {
+                    Some(i) => i,
+                    None => return Err(self.syntax_error("'continue' outside of a loop")),
+                };
+                let loop_handlers = self.fs().loops[target].handlers;
+                self.leave_try_blocks(loop_handlers)?;
+                let j = self.emit(Op::Jump(0));
+                self.fs().loops[target].continues.push(j);
+            }
+            Stmt::Switch(discriminant, cases, line) => {
+                self.line(*line);
+                self.switch_stmt(discriminant, cases)?;
+            }
+            Stmt::Throw(e, line) => {
+                self.line(*line);
+                self.expr(e)?;
+                self.emit(Op::Throw);
+            }
+            Stmt::Try {
+                body,
+                param,
+                handler,
+                finalizer,
+                line,
+            } => {
+                self.line(*line);
+                self.try_stmt(
+                    body,
+                    param.as_deref(),
+                    handler.as_deref(),
+                    finalizer.as_deref(),
+                )?;
+            }
+            Stmt::Block(stmts) => self.block(stmts)?,
+        }
+        Ok(())
+    }
+
+    fn switch_stmt(
+        &mut self,
+        discriminant: &Expr,
+        cases: &[(Option<Expr>, Vec<Stmt>)],
+    ) -> Result<(), String> {
+        self.enter_scope();
+        for (_, body) in cases {
+            self.declare_block(body)?;
+        }
+        self.expr(discriminant)?;
+        let value = self.temp();
+        self.set_slot(value);
+        self.emit(Op::Pop);
+
+        // Dispatch: compare with each case in order, otherwise go to `default` or the end.
+        let mut to_body = Vec::with_capacity(cases.len());
+        for (test, _) in cases {
+            match test {
+                Some(t) => {
+                    self.get_slot(value);
+                    self.expr(t)?;
+                    self.emit(Op::StrictEq);
+                    to_body.push(Some(self.emit(Op::JumpIfTrue(0))));
+                }
+                None => to_body.push(None),
+            }
+        }
+        let to_default = self.emit(Op::Jump(0));
+
+        // Bodies run in source order, so a case without `break` falls through to the next.
+        let handlers = self.fs().handlers;
+        self.fs().loops.push(LoopCtx {
+            handlers,
+            is_loop: false,
+            ..LoopCtx::default()
+        });
+        let mut default_at = None;
+        for (i, (test, body)) in cases.iter().enumerate() {
+            let here = self.here() as u32;
+            if let Some(j) = to_body[i] {
+                self.patch_to(j, here);
+            }
+            if test.is_none() {
+                default_at = Some(here);
+            }
+            for s in body {
+                self.stmt(s)?;
+            }
+        }
+        let end = self.here() as u32;
+        self.patch_to(to_default, default_at.unwrap_or(end));
+        let ctx = self.loop_pop();
+        for b in ctx.breaks {
+            self.patch_to(b, end);
+        }
+        self.exit_scope();
+        Ok(())
+    }
+
+    /// Pushes call arguments, then emits the call. Spread arguments are gathered into one array first.
+    fn call_args(&mut self, args: &[Expr], plain: fn(u32) -> Op, spread: Op) -> Result<(), String> {
+        if args.iter().any(|a| matches!(a, Expr::Spread(_))) {
+            self.emit(Op::NewArray);
+            for a in args {
+                match a {
+                    Expr::Spread(inner) => {
+                        self.expr(inner)?;
+                        self.emit(Op::ArrayExtend);
+                    }
+                    other => {
+                        self.expr(other)?;
+                        self.emit(Op::ArrayPush);
+                    }
+                }
+            }
+            self.emit(spread);
+        } else {
+            for a in args {
+                self.expr(a)?;
+            }
+            self.emit(plain(args.len() as u32));
+        }
+        Ok(())
+    }
+
+    /// Leaves the `try` blocks entered above `depth` handlers, innermost first: pops their
+    /// handlers and runs their `finally` bodies inline. Used by return, break and continue.
+    fn leave_try_blocks(&mut self, depth: u32) -> Result<(), String> {
+        let at_exit = self.fs().handlers;
+        let mut left = Vec::new();
+        loop {
+            let ctx_handlers = match self.fs().finally_stack.last() {
+                Some(ctx) if ctx.handlers >= depth => ctx.handlers,
+                _ => break,
+            };
+            let ctx = self.fs().finally_stack.pop().unwrap();
+            self.pop_handlers_to(ctx_handlers);
+            self.fs().handlers = ctx_handlers;
+            // Compiled with this `try` already left, so a `return` inside it cannot run it again.
+            self.block(&ctx.body)?;
+            left.push(ctx);
+        }
+        self.pop_handlers_to(depth);
+        self.fs().handlers = at_exit;
+        while let Some(ctx) = left.pop() {
+            self.fs().finally_stack.push(ctx);
+        }
+        Ok(())
+    }
+
+    /// Emits `PopHandler` for every `try` entered since the given depth (used by break/continue).
+    fn pop_handlers_to(&mut self, depth: u32) {
+        let current = self.fs().handlers;
+        for _ in depth..current {
+            self.emit(Op::PopHandler);
+        }
+    }
+
+    fn for_each(
+        &mut self,
+        kind: Option<VarKind>,
+        name: &str,
+        iter: &Expr,
+        body: &Stmt,
+        line: u32,
+        keys: bool,
+    ) -> Result<(), String> {
+        self.line(line);
+        self.enter_scope();
+        let list = self.temp();
+        let index = self.temp();
+        self.expr(iter)?;
+        if keys {
+            self.emit(Op::ToKeys);
+        }
+        self.set_slot(list);
+        self.emit(Op::Pop);
+        self.push_num(0.0);
+        self.set_slot(index);
+        self.emit(Op::Pop);
+
+        let length = self.str_const("length");
+        let start = self.here() as u32;
+        self.get_slot(index);
+        self.get_slot(list);
+        self.emit(Op::GetProp(length));
+        self.emit(Op::Lt);
+        let exit = self.emit(Op::JumpIfFalse(0));
+
+        // Per-iteration scope: a `let`/`const` binding is a new cell on every pass.
+        self.enter_scope();
+        let target = match kind {
+            Some(k) => {
+                let slot = self.declare(name, k == VarKind::Const);
+                if self.fs().boxed {
+                    self.emit(Op::NewCell(slot));
+                }
+                Some(slot)
+            }
+            None => None,
+        };
+        self.get_slot(list);
+        self.get_slot(index);
+        self.emit(Op::GetIndex);
+        match target {
+            Some(slot) => self.set_slot(slot),
+            None => self.store_var(name),
+        }
+        self.emit(Op::Pop);
+
+        self.loop_push();
+        self.stmt(body)?;
+        let ctx = self.loop_pop();
+        let cont = self.here() as u32;
+        for c in ctx.continues {
+            self.patch_to(c, cont);
+        }
+        self.exit_scope();
+
+        self.get_slot(index);
+        self.push_num(1.0);
+        self.emit(Op::Add);
+        self.set_slot(index);
+        self.emit(Op::Pop);
+        self.emit(Op::Jump(start));
+        self.patch(exit);
+        for b in ctx.breaks {
+            self.patch(b);
+        }
+        self.exit_scope();
+        Ok(())
+    }
+
+    fn try_stmt(
+        &mut self,
+        body: &[Stmt],
+        param: Option<&str>,
+        handler: Option<&[Stmt]>,
+        finalizer: Option<&[Stmt]>,
+    ) -> Result<(), String> {
+        // With a `finally`, an outer handler catches anything thrown by the try or catch parts.
+        let outer = match finalizer {
+            Some(fin) => {
+                let handlers = self.fs().handlers;
+                let j = self.emit(Op::PushHandler(0));
+                self.fs().handlers += 1;
+                self.fs().finally_stack.push(FinallyCtx {
+                    handlers,
+                    body: fin.to_vec(),
+                });
+                Some(j)
+            }
+            None => None,
+        };
+        match handler {
+            Some(catch_body) => {
+                let to_catch = self.emit(Op::PushHandler(0));
+                self.fs().handlers += 1;
+                self.block(body)?;
+                self.emit(Op::PopHandler);
+                self.fs().handlers -= 1;
+                let to_end = self.emit(Op::Jump(0));
+
+                // Entered with the thrown value on the stack.
+                self.patch(to_catch);
+                self.enter_scope();
+                if let Some(name) = param {
+                    let slot = self.declare(name, false);
+                    if self.fs().boxed {
+                        self.emit(Op::NewCell(slot));
+                    }
+                    self.set_slot(slot);
+                }
+                self.emit(Op::Pop);
+                self.declare_block(catch_body)?;
+                for s in catch_body {
+                    self.stmt(s)?;
+                }
+                self.exit_scope();
+                self.patch(to_end);
+            }
+            None => self.block(body)?,
+        }
+
+        if let Some(fin) = finalizer {
+            self.fs().finally_stack.pop();
+            self.emit(Op::PopHandler);
+            self.fs().handlers -= 1;
+            self.block(fin)?;
+            let to_end = self.emit(Op::Jump(0));
+
+            // Exceptional path: run the finalizer, then rethrow the saved value.
+            self.patch(outer.unwrap());
+            self.enter_scope();
+            let saved = self.temp();
+            self.set_slot(saved);
+            self.emit(Op::Pop);
+            self.block(fin)?;
+            self.get_slot(saved);
+            self.emit(Op::Throw);
+            self.exit_scope();
+            self.patch(to_end);
+        }
+        Ok(())
+    }
+
+    // ----- expressions ------------------------------------------------------
+
+    fn expr(&mut self, e: &Expr) -> Result<(), String> {
+        match e {
+            Expr::Num(n) => self.push_num(*n),
+            Expr::Str(s) => {
+                let c = self.str_const(s);
+                self.emit(Op::Const(c));
+            }
+            Expr::Template(quasis, exprs) => {
+                let c = self.str_const(&quasis[0]);
+                self.emit(Op::Const(c));
+                for (i, part) in exprs.iter().enumerate() {
+                    self.expr(part)?;
+                    self.emit(Op::ToStr);
+                    self.emit(Op::Add);
+                    let q = &quasis[i + 1];
+                    if !q.is_empty() {
+                        let c = self.str_const(q);
+                        self.emit(Op::Const(c));
+                        self.emit(Op::Add);
+                    }
+                }
+            }
+            Expr::Bool(true) => {
+                self.emit(Op::True);
+            }
+            Expr::Bool(false) => {
+                self.emit(Op::False);
+            }
+            Expr::Null => {
+                self.emit(Op::Null);
+            }
+            Expr::Undef => {
+                self.emit(Op::Undef);
+            }
+            Expr::This => {
+                self.emit(Op::This);
+            }
+            Expr::Ident(name) => self.load_var(name),
+            Expr::Array(items) => {
+                self.emit(Op::NewArray);
+                for item in items {
+                    match item {
+                        Expr::Spread(inner) => {
+                            self.expr(inner)?;
+                            self.emit(Op::ArrayExtend);
+                        }
+                        other => {
+                            self.expr(other)?;
+                            self.emit(Op::ArrayPush);
+                        }
+                    }
+                }
+            }
+            Expr::Object(props) => {
+                self.emit(Op::NewObject);
+                for (key, value) in props {
+                    self.expr(value)?;
+                    let c = self.str_const(key);
+                    self.emit(Op::InitProp(c));
+                }
+            }
+            Expr::Func(def) => {
+                let idx = self.child(def, None)?;
+                self.emit(Op::Closure(idx));
+            }
+            Expr::Unary(op, x) => {
+                // `typeof name` must not throw for an undeclared global.
+                if let ("typeof", Expr::Ident(name)) = (*op, &**x) {
+                    if let Ref::Global = self.resolve(name) {
+                        let c = self.str_const(name);
+                        self.emit(Op::GetGlobalOrUndef(c));
+                        self.emit(Op::TypeOf);
+                        return Ok(());
+                    }
+                }
+                self.expr(x)?;
+                let code = match *op {
+                    "-" => Op::Neg,
+                    "!" => Op::Not,
+                    "+" => Op::ToNumber,
+                    _ => Op::TypeOf,
+                };
+                self.emit(code);
+            }
+            Expr::Update { op, prefix, target } => self.update(op, *prefix, target)?,
+            Expr::Binary(op, a, b) => {
+                self.expr(a)?;
+                self.expr(b)?;
+                self.emit(binop(op));
+            }
+            Expr::Logical(op, a, b) => {
+                self.expr(a)?;
+                let jump = match *op {
+                    "&&" => Op::AndJump(0),
+                    "||" => Op::OrJump(0),
+                    _ => Op::NullishJump(0),
+                };
+                let j = self.emit(jump);
+                self.expr(b)?;
+                self.patch(j);
+            }
+            Expr::Assign(op, target, value) => self.assign(op, target, value)?,
+            Expr::Cond(cond, a, b) => {
+                self.expr(cond)?;
+                let to_else = self.emit(Op::JumpIfFalse(0));
+                self.expr(a)?;
+                let to_end = self.emit(Op::Jump(0));
+                self.patch(to_else);
+                self.expr(b)?;
+                self.patch(to_end);
+            }
+            Expr::Call(callee, args) => {
+                // Stack layout for calls: [callee, this, args...]
+                match &**callee {
+                    Expr::Member(obj, name) => {
+                        self.expr(obj)?;
+                        self.emit(Op::Dup);
+                        let c = self.str_const(name);
+                        self.emit(Op::GetProp(c));
+                        self.emit(Op::Swap);
+                    }
+                    Expr::Index(obj, key) => {
+                        self.expr(obj)?;
+                        self.emit(Op::Dup);
+                        self.expr(key)?;
+                        self.emit(Op::GetIndex);
+                        self.emit(Op::Swap);
+                    }
+                    other => {
+                        self.expr(other)?;
+                        self.emit(Op::Undef);
+                    }
+                }
+                self.call_args(args, Op::Call, Op::CallSpread)?;
+            }
+            Expr::New(callee, args) => {
+                self.expr(callee)?;
+                self.emit(Op::Undef);
+                self.call_args(args, Op::New, Op::NewSpread)?;
+            }
+            Expr::Spread(_) => {
+                return Err(
+                    self.syntax_error("spread is only supported in arrays and call arguments")
+                )
+            }
+            Expr::Member(obj, name) => {
+                self.expr(obj)?;
+                let c = self.str_const(name);
+                self.emit(Op::GetProp(c));
+            }
+            Expr::Index(obj, key) => {
+                self.expr(obj)?;
+                self.expr(key)?;
+                self.emit(Op::GetIndex);
+            }
+        }
+        Ok(())
+    }
+
+    /// Emits a jump that is taken when `cond` is false, and returns its position for patching.
+    /// Comparisons are fused with the jump.
+    fn jump_if_false(&mut self, cond: &Expr) -> Result<usize, String> {
+        if let Expr::Binary(op, a, b) = cond {
+            let fused = match *op {
+                "<" => Some(Op::JumpIfNotLt(0)),
+                "<=" => Some(Op::JumpIfNotLe(0)),
+                ">" => Some(Op::JumpIfNotGt(0)),
+                ">=" => Some(Op::JumpIfNotGe(0)),
+                _ => None,
+            };
+            if let Some(jump) = fused {
+                self.expr(a)?;
+                self.expr(b)?;
+                return Ok(self.emit(jump));
+            }
+        }
+        self.expr(cond)?;
+        Ok(self.emit(Op::JumpIfFalse(0)))
+    }
+
+    /// Compiles an expression whose value is discarded. `i++` only needs its prefix form here.
+    fn expr_discard(&mut self, e: &Expr) -> Result<(), String> {
+        if let Expr::Update { op, target, .. } = e {
+            if let Expr::Ident(name) = &**target {
+                if let Ref::Local {
+                    slot,
+                    is_const: false,
+                } = self.resolve(name)
+                {
+                    if !self.fs().boxed {
+                        let step = if *op == "++" {
+                            Op::IncLocal(slot)
+                        } else {
+                            Op::DecLocal(slot)
+                        };
+                        self.emit(step);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        match e {
+            Expr::Update { op, target, .. } => self.update(op, true, target)?,
+            other => self.expr(other)?,
+        }
+        self.emit(Op::Pop);
+        Ok(())
+    }
+
+    fn assign(&mut self, op: &str, target: &Expr, value: &Expr) -> Result<(), String> {
+        // `x += e` and `x = x + e` on a local append in place (see `Op::ConcatLocal`).
+        if let Expr::Ident(name) = target {
+            if let Some(rhs) = concat_rhs(op, name, value) {
+                if let Ref::Local {
+                    slot,
+                    is_const: false,
+                } = self.resolve(name)
+                {
+                    self.get_slot(slot);
+                    self.expr(rhs)?;
+                    self.emit(Op::ConcatLocal(slot));
+                    return Ok(());
+                }
+            }
+        }
+        let compound = if op == "=" {
+            None
+        } else {
+            Some(binop(&op[..op.len() - 1]))
+        };
+        match target {
+            Expr::Ident(name) => {
+                if let Some(b) = compound {
+                    self.load_var(name);
+                    self.expr(value)?;
+                    self.emit(b);
+                } else {
+                    self.expr(value)?;
+                }
+                self.store_var(name);
+            }
+            Expr::Member(obj, name) => {
+                self.expr(obj)?;
+                let c = self.str_const(name);
+                if let Some(b) = compound {
+                    self.emit(Op::Dup);
+                    self.emit(Op::GetProp(c));
+                    self.expr(value)?;
+                    self.emit(b);
+                } else {
+                    self.expr(value)?;
+                }
+                self.emit(Op::SetProp(c));
+            }
+            Expr::Index(obj, key) => {
+                self.expr(obj)?;
+                self.expr(key)?;
+                if let Some(b) = compound {
+                    self.emit(Op::Dup2);
+                    self.emit(Op::GetIndex);
+                    self.expr(value)?;
+                    self.emit(b);
+                } else {
+                    self.expr(value)?;
+                }
+                self.emit(Op::SetIndex);
+            }
+            _ => return Err(self.syntax_error("invalid assignment target")),
+        }
+        Ok(())
+    }
+
+    fn update(&mut self, op: &str, prefix: bool, target: &Expr) -> Result<(), String> {
+        let step = if op == "++" { Op::Add } else { Op::Sub };
+        let mark = self.fs().next_slot;
+        match target {
+            Expr::Ident(name) => {
+                self.load_var(name);
+                if prefix {
+                    self.push_num(1.0);
+                    self.emit(step);
+                    self.store_var(name);
+                } else {
+                    // Keep the old value as the result, store the new one.
+                    self.emit(Op::ToNumber);
+                    self.emit(Op::Dup);
+                    self.push_num(1.0);
+                    self.emit(step);
+                    self.store_var(name);
+                    self.emit(Op::Pop);
+                }
+            }
+            Expr::Member(obj, name) => {
+                let c = self.str_const(name);
+                if prefix {
+                    self.expr(obj)?;
+                    self.emit(Op::Dup);
+                    self.emit(Op::GetProp(c));
+                    self.push_num(1.0);
+                    self.emit(step);
+                    self.emit(Op::SetProp(c));
+                } else {
+                    let obj_slot = self.temp();
+                    self.expr(obj)?;
+                    self.set_slot(obj_slot);
+                    self.emit(Op::Pop);
+                    self.get_slot(obj_slot);
+                    self.emit(Op::GetProp(c));
+                    self.emit(Op::ToNumber);
+                    self.emit(Op::Dup);
+                    self.push_num(1.0);
+                    self.emit(step);
+                    self.get_slot(obj_slot);
+                    self.emit(Op::Swap);
+                    self.emit(Op::SetProp(c));
+                    self.emit(Op::Pop);
+                }
+            }
+            Expr::Index(obj, key) => {
+                if prefix {
+                    self.expr(obj)?;
+                    self.expr(key)?;
+                    self.emit(Op::Dup2);
+                    self.emit(Op::GetIndex);
+                    self.push_num(1.0);
+                    self.emit(step);
+                    self.emit(Op::SetIndex);
+                } else {
+                    let obj_slot = self.temp();
+                    let key_slot = self.temp();
+                    let new_slot = self.temp();
+                    self.expr(obj)?;
+                    self.set_slot(obj_slot);
+                    self.emit(Op::Pop);
+                    self.expr(key)?;
+                    self.set_slot(key_slot);
+                    self.emit(Op::Pop);
+                    self.get_slot(obj_slot);
+                    self.get_slot(key_slot);
+                    self.emit(Op::GetIndex);
+                    self.emit(Op::ToNumber);
+                    self.emit(Op::Dup);
+                    self.push_num(1.0);
+                    self.emit(step);
+                    self.set_slot(new_slot);
+                    self.emit(Op::Pop);
+                    self.get_slot(obj_slot);
+                    self.get_slot(key_slot);
+                    self.get_slot(new_slot);
+                    self.emit(Op::SetIndex);
+                    self.emit(Op::Pop);
+                }
+            }
+            _ => return Err(self.syntax_error("invalid update target")),
+        }
+        self.fs().next_slot = mark;
+        Ok(())
+    }
+}

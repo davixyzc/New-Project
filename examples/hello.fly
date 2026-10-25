@@ -1,0 +1,13 @@
+// Um exemplo rápido: funções, arrays, objetos, template strings e um timer.
+const saudar = (nome) => `Olá, ${nome}!`;
+
+const pessoas = ["Ana", "Bruno", "Carla"];
+for (const p of pessoas) {
+  console.log(saudar(p));
+}
+
+const contagem = pessoas.map((p) => p.length);
+console.log("tamanhos:", contagem, "total:", contagem.reduce((a, b) => a + b, 0));
+
+setTimeout(() => console.log("isto roda depois do código síncrono"), 10);
+console.log("isto roda primeiro");
