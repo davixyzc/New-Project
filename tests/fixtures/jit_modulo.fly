@@ -1,0 +1,49 @@
+// A remainder by a constant compiles to a multiplication in native code. Each one is checked
+// against the same remainder taken by a divisor only known at run time, which does not.
+
+function byConstants(n) {
+  return [
+    n % 2, n % 3, n % 5, n % 6, n % 7, n % 9, n % 10, n % 11, n % 12, n % 13,
+    n % 25, n % 100, n % 641, n % 1000, n % 65537, n % 1048576, n % 1000003,
+    n % 2147483646, n % 2147483647, n % 1,
+  ];
+}
+
+const divisors = [
+  2, 3, 5, 6, 7, 9, 10, 11, 12, 13, 25, 100, 641, 1000, 65537, 1048576, 1000003,
+  2147483646, 2147483647, 1,
+];
+
+function byValues(n) {
+  const out = [];
+  for (let i = 0; i < divisors.length; i++) {
+    out.push(n % divisors[i]);
+  }
+  return out;
+}
+
+const values = [];
+for (let n = -5000; n <= 5000; n++) {
+  values.push(n);
+}
+for (let k = -5000; k <= 5000; k++) {
+  values.push(k * 104729);
+}
+const extra = [-2147483648, 2147483647, 3000000000, -3000000000, 10000000000, 7.5, -7.5, 0];
+for (let i = 0; i < extra.length; i++) {
+  values.push(extra[i]);
+}
+
+// A zero remainder keeps the sign of the dividend, so the sign of a zero is checked too.
+let mismatches = 0;
+let signErrors = 0;
+for (let i = 0; i < values.length; i++) {
+  const n = values[i];
+  const fast = byConstants(n);
+  const slow = byValues(n);
+  for (let j = 0; j < fast.length; j++) {
+    if (fast[j] !== slow[j]) mismatches++;
+    if (fast[j] === 0 && 1 / fast[j] !== 1 / slow[j]) signErrors++;
+  }
+}
+console.log(values.length, mismatches, signErrors);
