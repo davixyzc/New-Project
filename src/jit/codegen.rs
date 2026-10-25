@@ -563,6 +563,36 @@ impl<'a> Gen<'a> {
         self.after_helper(None);
     }
 
+    /// A plain call. `rt::call_plain` pushes the callee's frame when it can, and then native code
+    /// runs the callee's code itself. Otherwise the call has already run when the helper returns.
+    fn plain_call(&mut self, ip: usize, d: i32, argc: u32) {
+        self.a.mov_rr(RDI, RBX);
+        self.a.mov_imm32(RSI, ip as u32);
+        self.a.mov_imm32(RDX, d as u32);
+        self.a.mov_imm32(RCX, argc);
+        self.a
+            .mov_imm64(RAX, rt::call_plain as *const () as usize as u64);
+        self.a.call_reg(RAX);
+        // rax is the callee's code, or the status of a call that has run already (0 or 1). rdx is
+        // this frame, which may have moved.
+        let ran = self.a.label();
+        self.a.cmp64_imm8(RAX, 1);
+        self.a.jcc(CC_BE, ran);
+        // The callee's frame starts above this frame's locals and the operands below its arguments.
+        self.a.mov_rr(R12, RDX);
+        self.a.lea(RSI, self.slot(self.nlocals + d - argc as i32));
+        self.a.mov_rr(RDI, RBX);
+        self.a.mov_imm32(RDX, 0);
+        self.a.call_reg(RAX);
+        // Either way, rax is the status and rdx is this frame.
+        self.a.bind(ran);
+        self.a.test32(RAX, RAX);
+        let threw = self.threw;
+        self.a.jcc(CC_NE, threw);
+        self.a.mov_rr(R12, RDX);
+        self.reload_all();
+    }
+
     /// Returns from the function, through its helper, which pops the frame.
     fn return_helper(&mut self, ip: usize, d: i32) {
         self.a.mov_rr(RDI, RBX);
@@ -589,6 +619,10 @@ impl<'a> Gen<'a> {
         self.a.mov_rr(RBX, RDI);
         self.a.mov_rr(R12, RSI);
         self.reload_all();
+        // rdx is the instruction to start at. Zero starts at the first one, which a direct call enters.
+        let first = self.ops[0];
+        self.a.test64(RDX, RDX);
+        self.a.jcc(CC_E, first);
         self.a.jmp_reg(RDX);
     }
 
@@ -627,7 +661,7 @@ impl<'a> Gen<'a> {
                     self.a.jmp(target);
                 }
                 Op::Return => self.return_helper(ip, d),
-                Op::Call(argc) => self.call_helper(ip, d, argc, 0),
+                Op::Call(argc) => self.plain_call(ip, d, argc),
                 Op::New(argc) => self.call_helper(ip, d, argc, rt::CALL_NEW),
                 Op::CallSpread => self.call_helper(ip, d, 0, rt::CALL_SPREAD),
                 Op::NewSpread => self.call_helper(ip, d, 0, rt::CALL_SPREAD | rt::CALL_NEW),

@@ -43,23 +43,6 @@ unsafe fn enter(vm: &mut Vm, next_ip: usize, depth: usize) -> (*const Proto, usi
     (proto, base)
 }
 
-/// The helper's return for a call that ran its code to `status` (0 returned, 1 threw). The caller's
-/// frame is on top again, and native code continues from its base.
-///
-/// # Safety
-/// The frame of the caller must still be on the stack.
-unsafe fn finish_status(vm: &mut Vm, status: u64) -> HelperRet {
-    let base = vm.frames.last().map_or(0, |f| f.base);
-    HelperRet {
-        status: if status == 0 {
-            STATUS_DONE
-        } else {
-            STATUS_THREW
-        },
-        base: vm.stack.as_mut_ptr().add(base),
-    }
-}
-
 /// Turns an instruction's result into the helper's return value. `result` is the instruction
 /// that runs next, so anything other than `next` is a jump the native code must take. An
 /// exception is kept in `vm.pending` for the dispatcher to take.
@@ -95,6 +78,48 @@ pub unsafe extern "C" fn op(vm: *mut Vm, ip: usize, depth: usize) -> HelperRet {
     finish(vm, result, next)
 }
 
+/// What `call_plain` returns. `code` is the address of the callee's code, which native code runs
+/// next. Or it is the status of a call that has already run to its end (`STATUS_DONE` or
+/// `STATUS_THREW`), as the other helpers return it. `base` is the caller's frame, which may have
+/// moved.
+#[repr(C)]
+pub struct PlainCall {
+    pub code: u64,
+    pub base: *mut Value,
+}
+
+/// Runs a plain call (no `new`, no spread) for native code. When the callee is compiled code that
+/// takes exactly `argc` arguments, its frame is pushed and its code address is returned, and native
+/// code runs it. Any other call runs to its end here.
+///
+/// # Safety
+/// Same as `call`.
+pub unsafe extern "C" fn call_plain(
+    vm: *mut Vm,
+    ip: usize,
+    depth: usize,
+    argc: usize,
+) -> PlainCall {
+    let vm = &mut *vm;
+    let (_, base) = enter(vm, ip + 1, depth);
+    let code = match vm.push_callee(argc) {
+        Some(code) => (*code).entry() as u64,
+        None => {
+            let idx = vm.stack.len() - argc - 2;
+            if vm.push_in_place(idx, argc) {
+                STATUS_DONE
+            } else {
+                let result = vm.call_op(argc, false, false).map(|()| ip + 1);
+                finish(vm, result, ip + 1).status
+            }
+        }
+    };
+    PlainCall {
+        code,
+        base: vm.stack.as_mut_ptr().add(base),
+    }
+}
+
 /// Runs the call or construct at `ip` with `argc` arguments. The callee has finished on return.
 ///
 /// # Safety
@@ -108,11 +133,6 @@ pub unsafe extern "C" fn call(
 ) -> HelperRet {
     let vm = &mut *vm;
     enter(vm, ip + 1, depth);
-    if flags == 0 {
-        if let Some(status) = vm.call_in_place(argc) {
-            return finish_status(vm, status);
-        }
-    }
     let is_new = flags & (CALL_NEW as usize) != 0;
     let spread = flags & (CALL_SPREAD as usize) != 0;
     let result = vm.call_op(argc, is_new, spread).map(|()| ip + 1);
@@ -250,7 +270,8 @@ pub unsafe extern "C" fn new_object(capacity: usize, dst: *mut Value) {
     ptr::write(dst, Value::obj_with(capacity));
 }
 
-/// Pops the frame of the function, leaving its result for the caller.
+/// Pops the frame of the function, leaving its result for the caller. The caller's frame, which
+/// native code that called this one continues in, is returned as `base`.
 ///
 /// # Safety
 /// Same as `op`.
@@ -258,8 +279,9 @@ pub unsafe extern "C" fn ret(vm: *mut Vm, ip: usize, depth: usize) -> HelperRet 
     let vm = &mut *vm;
     enter(vm, ip + 1, depth);
     vm.do_return();
+    let base = vm.frames.last().map_or(0, |f| f.base);
     HelperRet {
         status: STATUS_DONE,
-        base: ptr::null_mut(),
+        base: vm.stack.as_mut_ptr().add(base),
     }
 }

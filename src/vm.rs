@@ -23,6 +23,7 @@ const MAX_ARRAY_GROW: usize = 50_000_000;
 /// so they are capped separately from `MAX_FRAMES`.
 const MAX_NESTED_CALLS: usize = 2_000;
 
+#[repr(C)]
 pub struct Frame {
     /// The running closure. The callee slot (`base - 2`) holds the `Value::Func` that owns it.
     closure: *const Closure,
@@ -30,13 +31,131 @@ pub struct Frame {
     pub ip: usize,
     /// Index of the first argument (slot 0) on the value stack. `this` sits at `base - 1`.
     pub base: usize,
-    /// Active `try` handlers: (catch instruction index, stack height to restore).
-    pub handlers: Vec<(usize, usize)>,
+    /// Active `try` handlers: (catch instruction index, stack height to restore). None until the
+    /// first `try` of the frame. `None` is a null pointer, which native code can write as zero.
+    #[allow(clippy::box_collection)]
+    pub handlers: Option<Box<Vec<(usize, usize)>>>,
     /// Set for frames started with `new`: the object in the `this` slot is returned if the
     /// constructor returns nothing.
     pub ctor: bool,
     /// Set for the frame of a `Callback` session. Its return keeps the frame (see `do_return`).
     pub session: bool,
+}
+
+/// The frames of the calls in progress. The buffer has a fixed layout, so native code can push a
+/// frame by writing it at `len` (see `jit::codegen`).
+#[repr(C)]
+pub struct FrameStack {
+    buf: *mut Frame,
+    len: usize,
+    cap: usize,
+}
+
+impl FrameStack {
+    fn new() -> FrameStack {
+        FrameStack {
+            buf: std::ptr::NonNull::dangling().as_ptr(),
+            len: 0,
+            cap: 0,
+        }
+    }
+
+    /// Makes room for one more frame.
+    #[cold]
+    fn grow(&mut self) {
+        let cap = (self.cap * 2).max(16);
+        let layout = std::alloc::Layout::array::<Frame>(cap).expect("frame stack fits in memory");
+        // SAFETY: `layout` has a non-zero size. A buffer that exists was allocated with the layout
+        // of `self.cap` frames, which is what `realloc` is given.
+        let buf = unsafe {
+            if self.cap == 0 {
+                std::alloc::alloc(layout)
+            } else {
+                let old = std::alloc::Layout::array::<Frame>(self.cap).expect("frame stack fits");
+                std::alloc::realloc(self.buf as *mut u8, old, layout.size())
+            }
+        };
+        if buf.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        self.buf = buf as *mut Frame;
+        self.cap = cap;
+    }
+
+    #[inline]
+    pub fn push(&mut self, frame: Frame) {
+        if self.len == self.cap {
+            self.grow();
+        }
+        // SAFETY: the slot at `len` is inside the buffer, and it holds no frame.
+        unsafe { self.buf.add(self.len).write(frame) }
+        self.len += 1;
+    }
+
+    #[inline]
+    pub fn pop(&mut self) -> Option<Frame> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        // SAFETY: the frame at `len` was initialized, and nothing reads it after this.
+        Some(unsafe { self.buf.add(self.len).read() })
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Pops the last frame, which the caller knows is there, and drops it.
+    #[inline]
+    pub fn discard_last(&mut self) {
+        debug_assert!(self.len > 0);
+        self.len -= 1;
+        // SAFETY: the frame at `len` was initialized, and nothing reads it after this.
+        unsafe { self.buf.add(self.len).drop_in_place() }
+    }
+
+    #[inline]
+    pub fn last(&self) -> Option<&Frame> {
+        if self.len == 0 {
+            return None;
+        }
+        // SAFETY: the frames below `len` are initialized.
+        Some(unsafe { &*self.buf.add(self.len - 1) })
+    }
+
+    #[inline]
+    pub fn last_mut(&mut self) -> Option<&mut Frame> {
+        if self.len == 0 {
+            return None;
+        }
+        // SAFETY: the frames below `len` are initialized, and `self` is borrowed mutably.
+        Some(unsafe { &mut *self.buf.add(self.len - 1) })
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, i: usize) -> Option<&mut Frame> {
+        if i >= self.len {
+            return None;
+        }
+        // SAFETY: as in `last_mut`.
+        Some(unsafe { &mut *self.buf.add(i) })
+    }
+}
+
+impl Drop for FrameStack {
+    fn drop(&mut self) {
+        for i in 0..self.len {
+            // SAFETY: the frames below `len` are initialized, and each is dropped once.
+            unsafe { self.buf.add(i).drop_in_place() }
+        }
+        if self.cap > 0 {
+            let layout = std::alloc::Layout::array::<Frame>(self.cap).expect("frame stack fits");
+            // SAFETY: the buffer was allocated with this layout.
+            unsafe { std::alloc::dealloc(self.buf as *mut u8, layout) }
+        }
+    }
 }
 
 impl Frame {
@@ -134,25 +253,31 @@ impl Session {
         if !self.alive {
             self.push_frame(vm);
         }
-        // Between calls the stack ends at `base`, so the arguments and locals are pushed afresh.
-        let args = std::mem::ManuallyDrop::new(args);
-        for i in 0..N {
-            // SAFETY: each argument is read once here, and `args` is never dropped.
-            let v = unsafe { std::ptr::read(&args[i]) };
-            if i < self.nparams {
-                vm.stack.push(v);
-            } else {
-                forget_scalar(v);
-            }
-        }
-        while vm.stack.len() < self.base + self.nlocals {
-            vm.stack.push(Value::Undef);
-        }
         // SAFETY: `code` is alive as long as `closure` is.
         let code = unsafe { &*self.code };
         let need = self.base + code.frame_len();
         if need > vm.stack.capacity() {
             vm.stack.reserve(need - vm.stack.len());
+        }
+        // Between calls the stack ends at `base`, so the arguments and the other locals are written
+        // from there. Arguments past the parameters are dropped, and missing ones are `undefined`.
+        let args = std::mem::ManuallyDrop::new(args);
+        // SAFETY: the capacity for the frame was reserved above, and the slots written are the
+        // frame's own. Each argument is read once, and `args` is never dropped.
+        unsafe {
+            let p = vm.stack.as_mut_ptr();
+            for i in 0..N {
+                let v = std::ptr::read(&args[i]);
+                if i < self.nparams {
+                    std::ptr::write(p.add(self.base + i), v);
+                } else {
+                    forget_scalar(v);
+                }
+            }
+            for i in N.min(self.nparams)..self.nlocals {
+                std::ptr::write(p.add(self.base + i), Value::Undef);
+            }
+            vm.stack.set_len(self.base + self.nlocals);
         }
         let status = unsafe {
             let frame = vm.stack.as_mut_ptr().add(self.base);
@@ -186,7 +311,7 @@ impl Session {
             closure: Rc::as_ptr(&self.closure),
             ip: 0,
             base: self.base,
-            handlers: Vec::new(),
+            handlers: None,
             ctor: false,
             session: true,
         });
@@ -216,7 +341,7 @@ pub struct Timer {
 
 pub struct Vm {
     pub stack: Vec<Value>,
-    pub frames: Vec<Frame>,
+    pub frames: FrameStack,
     pub globals: HashMap<Rc<str>, Value>,
     /// Module objects (`{ exports }`) keyed by absolute path, so each file runs once.
     pub modules: HashMap<PathBuf, Value>,
@@ -281,7 +406,7 @@ impl Vm {
             .unwrap_or(1);
         let mut vm = Vm {
             stack: Vec::with_capacity(1024),
-            frames: Vec::new(),
+            frames: FrameStack::new(),
             globals: HashMap::new(),
             modules: HashMap::new(),
             out: BufWriter::new(std::io::stdout()),
@@ -523,7 +648,7 @@ impl Vm {
             closure: Rc::as_ptr(c),
             ip: 0,
             base,
-            handlers: Vec::new(),
+            handlers: None,
             ctor: false,
             session: false,
         });
@@ -604,7 +729,7 @@ impl Vm {
             closure: Rc::as_ptr(&closure),
             ip: 0,
             base,
-            handlers: Vec::new(),
+            handlers: None,
             ctor,
             session: false,
         });
@@ -661,7 +786,7 @@ impl Vm {
     fn unwind(&mut self, exc: Value, base_depth: usize) -> Result<(), Value> {
         while self.frames.len() > base_depth {
             let f = self.frames.last_mut().unwrap();
-            if let Some((catch_ip, height)) = f.handlers.pop() {
+            if let Some((catch_ip, height)) = f.handlers.as_mut().and_then(|h| h.pop()) {
                 f.ip = catch_ip;
                 self.truncate_stack(height);
                 self.stack.push(exc);
@@ -764,30 +889,50 @@ impl Vm {
     }
 
     /// Pops the running frame, leaving its result on the caller's stack. A session frame stays
-    /// instead: its locals and temporaries are dropped, and the result goes to the callee slot,
-    /// where `Session::call` takes it.
-    #[inline]
+    /// instead, with its `this`: the result goes to the callee slot, where `Session::call` takes it,
+    /// and the next call reuses the frame.
+    #[inline(always)]
     pub(crate) fn do_return(&mut self) {
-        let (base, session, ctor) = {
-            let top = self.frames.last().unwrap();
-            (top.base, top.session, top.ctor)
-        };
-        if session {
-            let v = self.pop();
-            self.truncate_stack(base);
-            forget_scalar(std::mem::replace(&mut self.stack[base - 2], v));
-            return;
+        let top = self.frames.last().unwrap();
+        let (base, session, ctor) = (top.base, top.session, top.ctor);
+        if ctor {
+            return self.do_return_ctor(base);
+        }
+        if !session {
+            self.frames.discard_last();
         }
         let len = self.stack.len();
+        // SAFETY: the result is the value at `len - 1`. The callee slot (`base - 2`) and the slots
+        // above `this` up to the result are dropped where they own a reference, except that a session
+        // keeps `this`. The result then moves into the callee slot, and the length ends after it.
+        unsafe {
+            let p = self.stack.as_mut_ptr();
+            if (*p.add(base - 2)).owns_ref() {
+                std::ptr::drop_in_place(p.add(base - 2));
+            }
+            let from = if session { base } else { base - 1 };
+            for i in from..(len - 1) {
+                let slot = p.add(i);
+                if (*slot).owns_ref() {
+                    std::ptr::drop_in_place(slot);
+                }
+            }
+            std::ptr::copy_nonoverlapping(p.add(len - 1), p.add(base - 2), 1);
+            self.stack.set_len(if session { base } else { base - 1 });
+        }
+    }
+
+    /// `do_return` for a constructor, which returns the object it was given unless the constructor
+    /// returned an object itself.
+    #[inline(never)]
+    fn do_return_ctor(&mut self, base: usize) {
+        let len = self.stack.len();
         self.frames.pop();
-        // SAFETY: the result is the value at `len - 1`. The slots from the callee slot (`base - 2`)
-        // up to it belong to the frame: the owning ones are dropped, and the result is written into
-        // the callee slot, which the length then ends after.
+        // SAFETY: as in `do_return`, with the result read out first so that it can be replaced.
         unsafe {
             let p = self.stack.as_mut_ptr();
             let v = std::ptr::read(p.add(len - 1));
-            // A constructor returns the object it was given, unless it returned an object itself.
-            let v = if ctor && !v.is_object() {
+            let v = if !v.is_object() {
                 let obj = (*p.add(base - 1)).clone();
                 drop(v);
                 obj
@@ -844,12 +989,43 @@ impl Vm {
         }
     }
 
-    /// `Call`, `New` and the spread forms, for native code. The callee has finished when this returns.
-    /// A plain call (no `new`, no spread) of compiled code that takes exactly `argc` arguments, which
-    /// is the common case. Pushes the callee's frame and runs it. Returns the status the code
-    /// reported, or `None` when the call needs the general path.
+    /// `arr.push(v)` with one argument, done in place. The argument moves into the array, and the
+    /// result replaces the callee. Returns false, and changes nothing, for any other call.
     #[inline(always)]
-    pub(crate) fn call_in_place(&mut self, argc: usize) -> Option<u64> {
+    pub(crate) fn push_in_place(&mut self, idx: usize, argc: usize) -> bool {
+        let is_push = matches!(&self.stack[idx], Value::Native(def)
+            if std::ptr::eq(*def, builtins::array::push_def()));
+        if !is_push || argc != 1 {
+            return false;
+        }
+        let arr: *const RefCell<Vec<Value>> = match &self.stack[idx + 1] {
+            Value::Arr(a) => Rc::as_ptr(a),
+            _ => return false,
+        };
+        let v = std::mem::replace(&mut self.stack[idx + 2], Value::Undef);
+        // SAFETY: the `this` slot holds the array until it is dropped below.
+        let len = unsafe {
+            let mut items = (*arr).borrow_mut();
+            items.push(v);
+            items.len()
+        };
+        drop(std::mem::replace(&mut self.stack[idx + 1], Value::Undef));
+        // SAFETY: the callee slot holds a built-in, which owns nothing, so the result overwrites it
+        // without a drop. The slots above the result are dead.
+        unsafe {
+            let p = self.stack.as_mut_ptr();
+            std::ptr::write(p.add(idx), Value::Num(len as f64));
+            self.stack.set_len(idx + 1);
+        }
+        true
+    }
+
+    /// Pushes the frame of a plain call with `argc` arguments, for native code that runs the callee
+    /// itself (see `rt::prepare_call`). Returns the callee's code, which runs from its first
+    /// instruction. Returns `None`, and pushes nothing, unless the callee is compiled code that takes
+    /// exactly those arguments.
+    #[inline(always)]
+    pub(crate) fn push_callee(&mut self, argc: usize) -> Option<*const Native> {
         let idx = self.stack.len() - argc - 2;
         let closure: *const Closure = match &self.stack[idx] {
             Value::Func(c) if c.proto.nparams as usize == argc && !c.proto.has_rest => {
@@ -869,7 +1045,7 @@ impl Vm {
             closure,
             ip: 0,
             base,
-            handlers: Vec::new(),
+            handlers: None,
             ctor: false,
             session: false,
         });
@@ -881,8 +1057,7 @@ impl Vm {
         if need > self.stack.capacity() {
             self.stack.reserve(need - self.stack.len());
         }
-        // SAFETY: the stack has room for the frame, which was reserved above.
-        Some(unsafe { code.call(self as *mut Vm, self.stack.as_mut_ptr().add(base), 0) })
+        Some(code as *const Native)
     }
 
     pub(crate) fn call_op(&mut self, argc: usize, is_new: bool, spread: bool) -> Result<(), Value> {
@@ -919,7 +1094,7 @@ impl Vm {
                             closure,
                             ip: 0,
                             base,
-                            handlers: Vec::new(),
+                            handlers: None,
                             ctor: false,
                             session: false,
                         });
@@ -1578,10 +1753,13 @@ impl Vm {
                     .last_mut()
                     .unwrap()
                     .handlers
+                    .get_or_insert_with(Default::default)
                     .push((t as usize, height));
             }
             Op::PopHandler => {
-                self.frames.last_mut().unwrap().handlers.pop();
+                if let Some(h) = self.frames.last_mut().unwrap().handlers.as_mut() {
+                    h.pop();
+                }
             }
             Op::Call(_) | Op::New(_) | Op::CallSpread | Op::NewSpread | Op::Return => {
                 unreachable!("calls and returns are run by the dispatcher, not by exec_op")

@@ -255,6 +255,11 @@ impl Asm {
         self.op(None, false, &[0x85], b, Rm::Reg(a));
     }
 
+    /// `test a64, b64`.
+    pub fn test64(&mut self, a: u8, b: u8) {
+        self.op(None, true, &[0x85], b, Rm::Reg(a));
+    }
+
     /// `test a8, b8`, for a register whose low byte holds a result (al, cl, dl or bl).
     pub fn test8(&mut self, a: u8, b: u8) {
         self.op(None, false, &[0x84], b, Rm::Reg(a));
@@ -263,6 +268,12 @@ impl Asm {
     /// `cmp r32, imm8`.
     pub fn cmp32_imm8(&mut self, r: u8, imm: u8) {
         self.op(None, false, &[0x83], 7, Rm::Reg(r));
+        self.code.push(imm);
+    }
+
+    /// `cmp r64, imm8`.
+    pub fn cmp64_imm8(&mut self, r: u8, imm: u8) {
+        self.op(None, true, &[0x83], 7, Rm::Reg(r));
         self.code.push(imm);
     }
 

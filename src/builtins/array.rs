@@ -85,6 +85,13 @@ pub static METHODS: &[NativeDef] = &[
     },
 ];
 
+/// The `push` method. It is the first entry of `METHODS`, and the VM runs it in place (see
+/// `Vm::push_in_place`).
+pub fn push_def() -> &'static NativeDef {
+    debug_assert_eq!(METHODS[0].name, "push");
+    &METHODS[0]
+}
+
 pub fn method(name: &str) -> Option<&'static NativeDef> {
     METHODS.iter().find(|d| d.name == name)
 }

@@ -49,6 +49,12 @@ impl Native {
         self.frame_len
     }
 
+    /// The address of the function's code. Native code calls it with `rdx` set to 0, which starts
+    /// at the first instruction.
+    pub fn entry(&self) -> *const u8 {
+        self.mem.ptr()
+    }
+
     /// Runs the function from instruction `ip`. Returns 0 when the frame returned, and 1 when
     /// an exception is waiting in the VM's `pending` slot.
     ///

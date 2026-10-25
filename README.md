@@ -76,27 +76,29 @@ Métodos de **number**: `toFixed`, `toString`.
 
 ## Desempenho (medido)
 
-Medidos nesta máquina (Xeon 2,1 GHz, 4 vCPU), tempo de parede, com a mediana de 7 execuções (5 no interpretador) e o mesmo algoritmo em cada linguagem. `benchmarks/bench.py --fly <caminho>` roda tudo e confere se as saídas batem entre os runtimes. A máquina varia entre sessões (nesta, o Node ficou mais lento que antes), então compare as colunas dentro de uma mesma tabela.
+Medidos nesta máquina (Xeon 2,1 GHz, 4 vCPU), tempo de parede, com a mediana de 7 execuções (5 no interpretador) e o mesmo algoritmo em cada linguagem. `benchmarks/bench.py --fly <caminho>` roda tudo e confere se as saídas batem entre os runtimes. **A máquina varia muito entre sessões**: nesta, o Node fez `array` em 203 ms, contra 87 ms numa sessão anterior, então compare as colunas dentro de uma mesma tabela, nunca tabelas de sessões diferentes.
 
 A coluna **fly (JIT)** usa o binário com PGO (`scripts/pgo-build.sh`), com código nativo ligado. A coluna **interpretador** é o mesmo binário com `FLY_JIT=0`. O melhor de cada linha está em negrito.
 
 | carga | fly (JIT) | fly (interpretador) | Node 22 | Python 3 |
 | --- | ---: | ---: | ---: | ---: |
-| `fib(30)`, recursão | 73 ms | 169 ms | **38 ms** | 118 ms |
-| laço de 20M com `%` | **49 ms** | 456 ms | 63 ms | 1561 ms |
-| `map`/`filter`/`reduce` em 1M | 241 ms | 354 ms | **87 ms** | 146 ms |
-| 1M objetos literais | **11 ms** | 66 ms | 30 ms | 229 ms |
-| 200k concatenações de string | **8 ms** | 8 ms | 38 ms | 30 ms |
+| `fib(30)`, recursão | 97 ms | 260 ms | **91 ms** | 250 ms |
+| laço de 20M com `%` | 161 ms | 1181 ms | **139 ms** | 3381 ms |
+| 1M `push`, depois `map`/`filter`/`reduce` | **180 ms** | 616 ms | 222 ms | 312 ms |
+| 1M objetos literais | **14 ms** | 89 ms | 73 ms | 449 ms |
+| 200k concatenações de string | **9 ms** | 15 ms | 71 ms | 57 ms |
 
 Outras medidas, com o binário com PGO (a inicialização é a mediana de 15 execuções):
 
 | | fly | Node 22 | Python 3 |
 | --- | ---: | ---: | ---: |
-| tamanho do executável | **909 KB** (PGO); 853 KB sem PGO | 123 MB | — |
-| inicialização (`-e 'console.log(1)'`) | **1,8 ms** | 25 ms | 14 ms |
+| tamanho do executável | **916 KB** (PGO); 864 KB sem PGO | 118 MB | — |
+| inicialização (`-e 'console.log(1)'`) | **3,3 ms** | 54 ms | 26 ms |
 | memória de pico, 1M inteiros em array | **18 MB** | 77 MB | 47 MB |
 
-**Leitura honesta**: o fly é o mais rápido em laço, objetos e strings, e tem o menor executável, a inicialização mais curta e o menor consumo de memória. Em `fib` ele fica em segundo: é mais rápido que o CPython (73 contra 118 ms), mas o Node faz em 38 ms, com um JIT que especializa tipos e embute chamadas. A vitória no laço é estreita, e em outra sessão o Node ficou em 56 ms. Em `map`/`filter`/`reduce` o fly fica em último (241 ms, contra 146 do Python e 87 do Node), e essa é a maior lacuna. A chamada de função é o gargalo: cada callback monta um quadro com contagem de referências, passa por várias camadas de `Result` e de Rust e mexe na pilha de valores. Medido com `callgrind`, são cerca de 380 instruções por chamada.
+**Leitura honesta**: nesta sessão o fly ficou em 97 ms no `fib`, contra 91 do Node, e em 161 ms no laço, contra 139 do Node. Nos dois é mais rápido que o CPython. Em `push` seguido de `map`/`filter`/`reduce`, em objetos e em strings ele fica na frente. Essas diferenças com o Node são pequenas, e a sessão anterior mostrou que o Node pode variar bem mais que isso, então elas não bastam para uma conclusão. A medida mais estável do próprio fly é a **contagem de instruções** (`callgrind`), que não depende da máquina. Em relação ao commit anterior (mesmo build, sem PGO): `fib` caiu de 917 para 822 milhões de instruções (−10%), e o `array` de 1213 para 1076 milhões (−11%). Laço, objetos e strings ficaram iguais. Dentro do `array`, um `push` caiu de cerca de 383 para cerca de 258 instruções, e um elemento de `map` ainda custa cerca de 320.
+
+**A meta de 2× não foi alcançada.** O que resta no caminho de chamada: cada chamada ainda passa por uma função auxiliar em Rust para empurrar e tirar o quadro, para soltar a referência do callee e para buscar o upvalue, e os closures são contados por `Rc`. Passar disso exige que o próprio código nativo empurre os quadros e um layout fixo para os closures.
 
 **Build com PGO**: `scripts/pgo-build.sh` treina o binário com os próprios benchmarks e fixtures e recompila com esse perfil, em cerca de 25 s. Precisa do componente `llvm-tools` do rustup (`rustup component add llvm-tools`). Dá cerca de 15 a 25% nos benchmarks. O `cargo build --release` comum continua funcionando sem ele.
 
@@ -110,6 +112,8 @@ Outras medidas, com o binário com PGO (a inicialização é a mediana de 15 exe
 - **Células só onde preciso**: uma variável vira célula (`Rc<RefCell>`) só quando uma função interna usa o nome dela. Antes, uma função com qualquer closure guardava todas as variáveis em células.
 - **Chaves compartilhadas**: nomes de propriedade ficam numa tabela do bytecode e são `Rc<str>` reaproveitados. Objetos literais não copiam as chaves a cada criação, e a busca compara primeiro o ponteiro.
 - **Chamadas sem alocação**: os argumentos vão para um buffer reaproveitado, e os callbacks de array recebem os valores por movimento. Chamadas diretas de funções compiladas montam o quadro sem passar pelo caminho geral.
+- **Chamadas diretas entre funções compiladas**: o código nativo chama o código do callee sem passar pelo despacho geral. Os quadros ficam num buffer de layout fixo (`FrameStack`), e a volta informa onde o quadro do chamador ficou, porque a pilha pode ter sido realocada.
+- **`push` no lugar**: `arr.push(v)` com um argumento move o valor para o array e troca o `this` pelo resultado, sem montar a lista de argumentos. Só vale quando o método é o `push` embutido.
 - **Escalares sem `drop`**: sobrescrever ou descartar um número não chama o destrutor do valor.
 - **Testado e descartado**: divisão por constante com multiplicação mágica (Hacker's Delight, figura 10-1). Estava correta e foi testada contra `%`, mas nesta CPU o `idiv` de 32 bits continuou mais rápido, e o código saiu.
 
@@ -145,11 +149,11 @@ cargo test --release   # os fixtures rodam no binário otimizado
 cargo test             # e no de debug, com as asserções de limites ligadas
 ```
 
-Os scripts em `tests/fixtures/*.fly` são executados duas vezes, com código nativo (o padrão) e no interpretador (`FLY_JIT=0`), e a saída é comparada com os arquivos `.out`. Os `.out` foram conferidos contra o **Node.js 22**: todos batem, exceto `fs_path` e `require_local`, que dependem de decisões próprias do fly (`Buffer` e resolução de `.fly`). Os fixtures `fast_paths`, `jit_numbers`, `jit_exceptions` e `native_paths` cobrem os caminhos otimizados: superinstruções com tipos mistos, zero negativo e `%` com sinal, NaN nas comparações, exceções que atravessam quadros nativos, recursão até o limite, closures, `switch`, e `try`/`finally` com `break` e `continue`. `jit_modulo` compara `%` por constante com `%` por divisor variável, inclusive o sinal do zero. `jit_loop_locals` muda o tipo de locais dentro de laços, chama funções e lança exceções. `scalar_objects` cobre a substituição de objetos.
+Os scripts em `tests/fixtures/*.fly` são executados duas vezes, com código nativo (o padrão) e no interpretador (`FLY_JIT=0`), e a saída é comparada com os arquivos `.out`. Os `.out` foram conferidos contra o **Node.js 22**: todos batem, exceto `fs_path` e `require_local`, que dependem de decisões próprias do fly (`Buffer` e resolução de `.fly`). Os fixtures `fast_paths`, `jit_numbers`, `jit_exceptions` e `native_paths` cobrem os caminhos otimizados: superinstruções com tipos mistos, zero negativo e `%` com sinal, NaN nas comparações, exceções que atravessam quadros nativos, recursão até o limite, closures, `switch`, e `try`/`finally` com `break` e `continue`. `jit_modulo` compara `%` por constante com `%` por divisor variável, inclusive o sinal do zero. `jit_loop_locals` muda o tipo de locais dentro de laços, chama funções e lança exceções. `scalar_objects` cobre a substituição de objetos. `native_calls` cobre chamadas diretas com a pilha crescendo, exceções que atravessam vários quadros, `push` com outros argumentos e callbacks com `this`.
 
 ## Roadmap
 
-1. **Chamadas mais baratas**: reaproveitar um quadro nos callbacks de array e guardar os quadros em memória bruta, em vez de `Vec<Frame>` com contagem de referências por chamada. É o que mais falta para `map`/`filter`/`reduce` chegarem perto de 100 ms, e para `fib` alcançar o Node.
+1. **Chamadas ainda mais baratas**: o código nativo empurra e tira os quadros, busca upvalues sem uma função auxiliar e acessa os closures com layout fixo, em vez de contar referências a cada chamada. É o que falta para `fib` e os callbacks chegarem a 2×.
 2. **Registradores no código nativo**: os locais de laços já ficam em XMM. Falta estender a funções inteiras, aos temporários e às constantes.
 3. **Valores com NaN-boxing**, para que valores não tenham tamanho de 16 bytes nem contagem de referências nos números.
 4. **Caches inline** para propriedades (hoje busca linear) e para métodos de array (hoje a busca é pelo nome a cada chamada).

@@ -1,0 +1,58 @@
+// Calls between compiled functions. The stack grows while they run, so every frame must return to
+// the right place. Exceptions cross those calls, and a call to the built-in push runs in place.
+
+function depth(n) {
+  if (n === 0) return 0;
+  const a = n * 2;
+  const b = a + 1;
+  const pair = [n, b];
+  return depth(n - 1) + pair[0] + (b - a);
+}
+console.log(depth(3000));
+
+function thrower(n) {
+  if (n === 0) throw new Error("bottom");
+  return thrower(n - 1) + 1;
+}
+
+function middle(n) {
+  try {
+    return thrower(n);
+  } catch (e) {
+    return "caught " + e.message + " at " + n;
+  }
+}
+console.log(middle(5));
+console.log(middle(0));
+
+function outer() {
+  let total = 0;
+  for (let i = 0; i < 3; i++) {
+    try {
+      total += thrower(i);
+    } catch (e) {
+      total += 100;
+    }
+  }
+  return total;
+}
+console.log(outer());
+
+const arr = [];
+for (let i = 0; i < 5; i++) arr.push(i * i);
+console.log(arr.join(","), arr.push(1, 2), arr.length);
+console.log([1].push(), [].push(9));
+
+const log = {
+  items: [],
+  push: function (x) {
+    this.items.push(x);
+    return this.items.length * 10;
+  },
+};
+console.log(log.push(7), log.push(8), log.items);
+
+const scale = { k: 3 };
+console.log([1, 2, 3].map(function (x) { return x * this.k; }, scale));
+console.log([1, 2, 3, 4].filter((x) => x % 2 === 0));
+console.log([1, 2, 3].reduce((acc, x) => acc + x, 10));
