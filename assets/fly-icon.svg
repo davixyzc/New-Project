@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="fly">
+  <title>fly</title>
+  <rect width="512" height="512" rx="112" fill="#181825"/>
+  <g transform="translate(0 -18)">
+    <g fill="#89dceb" fill-opacity="0.4">
+      <ellipse cx="172" cy="236" rx="84" ry="44" transform="rotate(-26 172 236)"/>
+      <ellipse cx="340" cy="236" rx="84" ry="44" transform="rotate(26 340 236)"/>
+      <ellipse cx="190" cy="314" rx="70" ry="34" transform="rotate(14 190 314)"/>
+      <ellipse cx="322" cy="314" rx="70" ry="34" transform="rotate(-14 322 314)"/>
+    </g>
+    <ellipse cx="256" cy="330" rx="40" ry="105" fill="#cba6f7"/>
+    <path d="M220 290H292M220 330H292M220 370H292" stroke="#181825" stroke-width="7"/>
+    <ellipse cx="256" cy="232" rx="58" ry="60" fill="#cba6f7"/>
+    <circle cx="256" cy="158" r="46" fill="#cba6f7"/>
+    <circle cx="226" cy="150" r="32" fill="#89dceb"/>
+    <circle cx="286" cy="150" r="32" fill="#89dceb"/>
+    <circle cx="216" cy="138" r="9" fill="#cdd6f4" fill-opacity="0.85"/>
+    <circle cx="276" cy="138" r="9" fill="#cdd6f4" fill-opacity="0.85"/>
+  </g>
+</svg>

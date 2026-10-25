@@ -1,5 +1,9 @@
 # fly
 
+<p align="center">
+  <img src="assets/fly-icon.svg" width="120" alt="Ícone do fly: um inseto roxo, com olhos azuis, sobre fundo escuro">
+</p>
+
 **fly** é uma linguagem de programação e um runtime no estilo Node.js: sintaxe parecida com JavaScript, módulos com `require`, `console`, timers e um event loop. A proposta é ser **mais leve**, com binário pequeno, sem dependências externas e inicialização quase instantânea.
 
 Tudo está implementado em Rust, sem crates externas.
