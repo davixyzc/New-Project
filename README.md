@@ -114,6 +114,7 @@ Outras medidas, com o binário com PGO (a inicialização é a mediana de 15 exe
 - **Chamadas sem alocação**: os argumentos vão para um buffer reaproveitado, e os callbacks de array recebem os valores por movimento. Chamadas diretas de funções compiladas montam o quadro sem passar pelo caminho geral.
 - **Chamadas diretas entre funções compiladas**: o código nativo chama o código do callee sem passar pelo despacho geral. Os quadros ficam num buffer de layout fixo (`FrameStack`), e a volta informa onde o quadro do chamador ficou, porque a pilha pode ter sido realocada.
 - **`push` no lugar**: `arr.push(v)` com um argumento move o valor para o array e troca o `this` pelo resultado, sem montar a lista de argumentos. Só vale quando o método é o `push` embutido.
+- **Inicialização**: `--version` e `--help` não criam a thread do interpretador (cerca de meio milissegundo a menos), e o `Vm` não é liberado ao sair. A linkagem estática (`RUSTFLAGS="-C target-feature=+crt-static"`) reduziria a inicialização em cerca de um quarto, mas o binário passaria de 864 KB para 1,9 MB, então não é o padrão.
 - **Escalares sem `drop`**: sobrescrever ou descartar um número não chama o destrutor do valor.
 - **Testado e descartado**: divisão por constante com multiplicação mágica (Hacker's Delight, figura 10-1). Estava correta e foi testada contra `%`, mas nesta CPU o `idiv` de 32 bits continuou mais rápido, e o código saiu.
 

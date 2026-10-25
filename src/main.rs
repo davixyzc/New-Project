@@ -27,17 +27,31 @@ const USAGE: &str = "usage: fly [options] [script.fly] [args...]
 const STACK_BYTES: usize = 256 * 1024 * 1024;
 
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    // Help and version need no interpreter, so they skip the thread that hosts it.
+    if matches!(
+        args.get(1).map(String::as_str),
+        None | Some("-h" | "--help" | "-v" | "--version")
+    ) {
+        return run_cli(args);
+    }
     let worker = std::thread::Builder::new()
         .stack_size(STACK_BYTES)
-        .spawn(run_cli);
+        .spawn(move || run_cli(args));
     match worker {
         Ok(handle) => handle.join().unwrap_or(ExitCode::FAILURE),
         Err(_) => ExitCode::FAILURE,
     }
 }
 
-fn run_cli() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+/// Ends a run without freeing the VM. Its output is already flushed, and the process is about to
+/// exit, which returns the memory anyway. Freeing every global one by one costs more than a small
+/// script does.
+fn exit_without_freeing(machine: Vm) {
+    std::mem::forget(machine);
+}
+
+fn run_cli(args: Vec<String>) -> ExitCode {
     match args.get(1).map(String::as_str) {
         None | Some("-h") | Some("--help") => {
             println!("{}", USAGE);
@@ -56,7 +70,9 @@ fn run_cli() -> ExitCode {
             argv.extend(args.iter().skip(3).cloned());
             let cwd = std::env::current_dir().unwrap_or_default();
             let mut machine = Vm::new(argv);
-            ExitCode::from(machine.run_source(&cwd.join("[eval]"), code) as u8)
+            let status = machine.run_source(&cwd.join("[eval]"), code);
+            exit_without_freeing(machine);
+            ExitCode::from(status as u8)
         }
         Some(file) => {
             let path = PathBuf::from(file);
@@ -70,7 +86,9 @@ fn run_cli() -> ExitCode {
             let mut argv = vec!["fly".to_string(), abs.display().to_string()];
             argv.extend(args.iter().skip(2).cloned());
             let mut machine = Vm::new(argv);
-            ExitCode::from(machine.run_main(&abs) as u8)
+            let status = machine.run_main(&abs);
+            exit_without_freeing(machine);
+            ExitCode::from(status as u8)
         }
     }
 }
