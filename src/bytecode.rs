@@ -6,6 +6,7 @@
 //! All other locals are read and written in place. Common instruction pairs are fused
 //! into superinstructions, such as `AddLK` (`local + constant`).
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::value::Value;
@@ -166,6 +167,9 @@ pub struct Proto {
     /// Property and variable names. Shared as `Rc<str>`, so objects built from literals
     /// reuse these keys instead of copying them.
     pub names: Vec<Rc<str>>,
+    /// Where each name was last found in an object, one per name. Native code tries that position first. It
+    /// is only a guess: a position that does not hold the same key is skipped.
+    pub hints: Vec<Cell<u32>>,
     pub protos: Vec<Rc<Proto>>,
     pub upvals: Vec<UpvalDesc>,
     pub nparams: u32,

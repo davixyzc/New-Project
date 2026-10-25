@@ -180,6 +180,7 @@ mod tests {
             code,
             consts: vec![Value::Num(0.0)],
             names: Vec::new(),
+            hints: Vec::new(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,

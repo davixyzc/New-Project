@@ -1,0 +1,6 @@
+336
+11 20
+18 3 3 3 {"x":1,"w":3}
+9 5 5
+190 19 0
+TypeError Cannot set properties of undefined (setting 'x')

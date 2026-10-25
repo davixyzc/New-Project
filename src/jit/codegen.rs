@@ -11,6 +11,7 @@
 //! that depth are dead, and native code only leaves plain values in them, so forgetting them
 //! never skips a drop.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use super::region;
@@ -913,9 +914,11 @@ impl<'a> Gen<'a> {
             Op::GetProp(i) => {
                 // Replaces an object or array by one of its properties. Other values take the slow path.
                 let name = &self.proto.names[i as usize] as *const Rc<str> as usize;
+                let hint = &self.proto.hints[i as usize] as *const Cell<u32> as usize;
                 let top = self.temp(d - 1);
                 let get = rt::get_prop_top as *const () as usize;
-                self.direct_call(get, &[Arg::Addr(top), Arg::Imm(name as u64)]);
+                let args = [Arg::Addr(top), Arg::Imm(name as u64), Arg::Imm(hint as u64)];
+                self.direct_call(get, &args);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
                 Fast::Guarded
@@ -941,7 +944,13 @@ impl<'a> Gen<'a> {
                 let name = &self.proto.names[n as usize] as *const Rc<str> as usize;
                 let (src, dst) = (self.local(s), self.temp(d));
                 let get = rt::get_prop_into as *const () as usize;
-                let args = [Arg::Addr(src), Arg::Imm(name as u64), Arg::Addr(dst)];
+                let hint = &self.proto.hints[n as usize] as *const Cell<u32> as usize;
+                let args = [
+                    Arg::Addr(src),
+                    Arg::Imm(name as u64),
+                    Arg::Addr(dst),
+                    Arg::Imm(hint as u64),
+                ];
                 let (lookup, done) = (self.a.label(), self.a.label());
                 if &*self.proto.names[n as usize] == "push" {
                     // The `push` of an array is the built-in, so it is written here, without a lookup.
@@ -1035,12 +1044,16 @@ impl<'a> Gen<'a> {
                 // Replaces an object and a value by the value, which the property keeps a copy of. Other operands
                 // take the slow path.
                 let name = &self.proto.names[i as usize] as *const Rc<str> as usize;
+                let hint = &self.proto.hints[i as usize] as *const Cell<u32> as usize;
                 let (obj, val) = (self.temp(d - 2), self.temp(d - 1));
                 let set = rt::set_prop_top as *const () as usize;
-                self.direct_call(
-                    set,
-                    &[Arg::Addr(obj), Arg::Imm(name as u64), Arg::Addr(val)],
-                );
+                let args = [
+                    Arg::Addr(obj),
+                    Arg::Imm(name as u64),
+                    Arg::Addr(val),
+                    Arg::Imm(hint as u64),
+                ];
+                self.direct_call(set, &args);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
                 Fast::Guarded
@@ -1321,6 +1334,7 @@ mod tests {
             lines: vec![0; 8],
             consts: vec![Value::Num(1.0), Value::Num(2.0)],
             names: Vec::new(),
+            hints: Vec::new(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,
@@ -1352,6 +1366,7 @@ mod tests {
             lines: vec![0; 7],
             consts: vec![Value::Num(0.0)],
             names: Vec::new(),
+            hints: Vec::new(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,

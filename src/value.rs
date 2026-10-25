@@ -1,6 +1,6 @@
 //! Runtime values and the conversion and comparison rules that operate on them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
@@ -14,7 +14,7 @@ use crate::vm::Vm;
 #[derive(Clone, Default)]
 pub struct Props {
     items: Vec<(Rc<str>, Value)>,
-    index: Option<HashMap<Rc<str>, usize>>,
+    index: Option<NameMap<usize>>,
 }
 
 /// From this many properties on, an object gets an index by name.
@@ -63,6 +63,18 @@ impl Props {
                 .position(|(k, _)| Rc::ptr_eq(k, key))
                 .or_else(|| self.items.iter().position(|(k, _)| **k == **key)),
         }
+    }
+
+    /// The position of `key`, looked up at `hint` first. The hint is set to the position that the lookup finds, so
+    /// a site that keeps seeing objects of one shape finds the key without a scan.
+    pub fn position_hinted(&self, key: &Rc<str>, hint: &Cell<u32>) -> Option<usize> {
+        let at = hint.get() as usize;
+        if self.items.get(at).is_some_and(|(k, _)| Rc::ptr_eq(k, key)) {
+            return Some(at);
+        }
+        let i = self.position_of_key(key)?;
+        hint.set(i as u32);
+        Some(i)
     }
 
     /// Adds a property, which the caller has checked is not there yet.
@@ -257,11 +269,22 @@ pub fn obj_put(obj: &ObjRef, key: &Rc<str>, v: Value) {
     }
 }
 
-/// Reads an own property using a shared key. Names from the same source share one allocation (see `intern_name`),
-/// so the pointer decides almost every lookup, and the text is compared only when the pointer finds nothing.
-pub fn obj_get_key(obj: &ObjRef, key: &Rc<str>) -> Option<Value> {
+/// Reads an own property using a shared key, trying the position in `hint` first (see `Props::position_hinted`).
+/// Names from the same source share one allocation (see `intern_name`), so the pointer decides almost every lookup.
+pub fn obj_get_hinted(obj: &ObjRef, key: &Rc<str>, hint: &Cell<u32>) -> Option<Value> {
     let props = obj.borrow();
-    props.position_of_key(key).map(|i| props.value(i).clone())
+    props
+        .position_hinted(key, hint)
+        .map(|i| props.value(i).clone())
+}
+
+/// `obj_put`, which tries the position in `hint` first (see `Props::position_hinted`).
+pub fn obj_put_hinted(obj: &ObjRef, key: &Rc<str>, v: Value, hint: &Cell<u32>) {
+    let mut props = obj.borrow_mut();
+    match props.position_hinted(key, hint) {
+        Some(i) => props.set_value(i, v),
+        None => props.push(key.clone(), v),
+    }
 }
 
 /// A hasher for names, which are short: a rotate and a multiply per byte. The default hasher is built for long keys

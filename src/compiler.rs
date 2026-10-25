@@ -4,6 +4,7 @@
 //! an upvalue or a global lookup. A local lives in a heap cell only when some nested
 //! function refers to its name, so the other locals of a function stay in plain slots.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -751,6 +752,7 @@ impl Compiler {
             code: fs.code,
             lines: fs.lines,
             consts: fs.consts,
+            hints: vec![Cell::new(0); fs.names.len()],
             names: fs.names,
             protos: fs.protos,
             upvals: fs.upvals.iter().map(|(_, d, _)| *d).collect(),

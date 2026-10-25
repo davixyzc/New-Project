@@ -2030,7 +2030,11 @@ impl Vm {
                 Ok(())
             }
             _ => {
-                let msg = format!("Cannot set property '{}' of {}", name, to_str(obj));
+                let msg = format!(
+                    "Cannot set properties of {} (setting '{}')",
+                    to_str(obj),
+                    name
+                );
                 Err(self.make_error("TypeError", &msg))
             }
         }

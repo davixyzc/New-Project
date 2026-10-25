@@ -1,12 +1,13 @@
 //! The functions native code calls. Each runs one instruction (or one call or return) through
 //! the interpreter's own code in `Vm`, so an instruction behaves the same whichever path runs it.
 
+use std::cell::Cell;
 use std::ptr;
 use std::rc::Rc;
 
 use crate::builtins;
 use crate::bytecode::Proto;
-use crate::value::{obj_get_key, obj_put, ArrRef, JsStr, Value};
+use crate::value::{obj_get_hinted, obj_put, obj_put_hinted, ArrRef, JsStr, Value};
 use crate::vm::Vm;
 
 use super::{call_numbers, numbers_arity, MAX_NUMBER_ARGS};
@@ -277,16 +278,17 @@ pub unsafe extern "C" fn boxed_into(src: *const Value, dst: *mut Value) {
 /// the error.
 ///
 /// # Safety
-/// `src` must point at a valid value, `name` at a key that outlives the code, and `dst` at a
-/// dead slot.
+/// `src` must point at a valid value, `name` at a key that outlives the code, `hint` at the cell for that name, and
+/// `dst` at a dead slot.
 pub unsafe extern "C" fn get_prop_into(
     src: *const Value,
     name: *const Rc<str>,
     dst: *mut Value,
+    hint: *const Cell<u32>,
 ) -> bool {
     match &*src {
         Value::Obj(o) => {
-            let v = obj_get_key(o, &*name).unwrap_or(Value::Undef);
+            let v = obj_get_hinted(o, &*name, &*hint).unwrap_or(Value::Undef);
             ptr::write(dst, v);
             true
         }
@@ -306,10 +308,14 @@ pub unsafe extern "C" fn get_prop_into(
 /// writes nothing and returns false, as `get_prop_into` does.
 ///
 /// # Safety
-/// `slot` must point at a valid value that is popped by the instruction, and `name` is as above.
-pub unsafe extern "C" fn get_prop_top(slot: *mut Value, name: *const Rc<str>) -> bool {
+/// `slot` must point at a valid value that is popped by the instruction, and `name` and `hint` are as above.
+pub unsafe extern "C" fn get_prop_top(
+    slot: *mut Value,
+    name: *const Rc<str>,
+    hint: *const Cell<u32>,
+) -> bool {
     let v = match &*slot {
-        Value::Obj(o) => obj_get_key(o, &*name).unwrap_or(Value::Undef),
+        Value::Obj(o) => obj_get_hinted(o, &*name, &*hint).unwrap_or(Value::Undef),
         Value::Arr(a) => array_prop(a, &*name),
         Value::Str(s) => string_prop(s, &*name),
         _ => return false,
@@ -353,16 +359,18 @@ pub unsafe extern "C" fn get_global_into(
 /// property keeps a copy. Anything else writes nothing and returns false, so the instruction's own path runs it.
 ///
 /// # Safety
-/// `obj` and `val` must point at valid values that the instruction pops, and `name` is as for `get_prop_top`.
+/// `obj` and `val` must point at valid values that the instruction pops, and `name` and `hint` are as for
+/// `get_prop_top`.
 pub unsafe extern "C" fn set_prop_top(
     obj: *mut Value,
     name: *const Rc<str>,
     val: *mut Value,
+    hint: *const Cell<u32>,
 ) -> bool {
     let Value::Obj(o) = &*obj else {
         return false;
     };
-    obj_put(o, &*name, (*val).clone());
+    obj_put_hinted(o, &*name, (*val).clone(), &*hint);
     *obj = ptr::read(val);
     true
 }

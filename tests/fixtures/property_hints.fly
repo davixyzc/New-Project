@@ -1,0 +1,51 @@
+// Property reads and writes at one site, on objects whose keys sit at different positions, in functions called in
+// loops (so the JIT compiles them). A remembered position is only a guess, so each lookup must still find the key.
+function readX(o) {
+  return o.x;
+}
+function bumpX(o, d) {
+  o.x = o.x + d;
+  return o.x;
+}
+function setW(o, i) {
+  o.w = i;
+  return o.w;
+}
+function getDyn(o, k) {
+  return o[k];
+}
+const shapes = [{ x: 1, y: 2 }, { y: 3, x: 4 }, { a: 0, b: 0, c: 0, x: 7 }, { z: 9 }];
+let total = 0;
+for (let rep = 0; rep < 3; rep++) {
+  for (let i = 0; i < shapes.length; i++) {
+    const v = readX(shapes[i]);
+    total = total + (v === undefined ? 100 : v);
+  }
+}
+console.log(total);
+const objs = [{ x: 1 }, { y: 0, x: 10 }];
+for (let r = 0; r < 5; r++) for (const o of objs) bumpX(o, 2);
+console.log(objs[0].x, objs[1].x);
+const ps = [{ x: 1 }, { w: 0, x: 2 }, { x: 3, w: 1 }];
+let ws = 0;
+for (let i = 0; i < 4; i++) for (const p of ps) ws = ws + setW(p, i);
+console.log(ws, ps[0].w, ps[1].w, ps[2].w, JSON.stringify(ps[0]));
+const dynObj = { alpha: 1, beta: 2 };
+let dsum = 0;
+for (let i = 0; i < 3; i++) dsum = dsum + getDyn(dynObj, "be" + "ta") + getDyn(dynObj, "alpha");
+dynObj["gam" + "ma"] = 5;
+console.log(dsum, dynObj.gamma, getDyn(dynObj, "gamma"));
+const grow = {};
+for (let i = 0; i < 20; i++) grow["k" + i] = i;
+let gsum = 0;
+for (let i = 0; i < 20; i++) gsum = gsum + readG(grow, i);
+function readG(o, i) {
+  return o["k" + i] + (o.k0 === 0 ? 0 : 1);
+}
+console.log(gsum, grow.k19, grow.k0);
+try {
+  const nothing = undefined;
+  nothing.x = 1;
+} catch (e) {
+  console.log(e.name, e.message);
+}
