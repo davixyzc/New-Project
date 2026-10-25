@@ -1,0 +1,97 @@
+{
+const m = new Map();
+m.set("a", 1).set("b", 2);
+m.set(1, "one");
+m.set("1", "string one");
+console.log(m.get("a"), m.get(1), m.get("1"), m.get("zzz"), m.size);
+console.log(m.has("a"), m.has("c"), m.delete("a"), m.delete("a"), m.size);
+const nan = new Map();
+nan.set(NaN, "nan");
+nan.set(-0, "zero");
+console.log(nan.get(NaN), nan.get(0), nan.get(-0), nan.size);
+const obj = {};
+const om = new Map([[obj, "object"], ["k", "v"]]);
+console.log(om.get(obj), om.get({}), om.size);
+const s = new Set([1, 2, 2, 3, 3, 3]);
+console.log(s.size, s.has(2), s.has(4));
+s.add(4).add(1);
+console.log(s.size, s.delete(2), s.size);
+console.log(JSON.stringify([...s]), Array.from(m.keys()).join("|"));
+console.log(m);
+console.log(s);
+console.log(new Map(), new Set());
+m.forEach((v, k) => console.log("each", k, v));
+s.forEach((v, k) => console.log("set each", v, k));
+for (const e of m) console.log("for", e[0], e[1]);
+for (const v of s) console.log("for set", v);
+m.clear();
+console.log(m.size, m.get(1));
+}
+{
+const big = new Map();
+for (let i = 0; i < 200; i++) big.set("k" + i, i);
+for (let i = 0; i < 200; i += 2) big.delete("k" + i);
+console.log(big.size);
+let s = 0;
+for (const e of big) s += e[1];
+console.log(s, big.get("k1"), big.get("k2"), big.has("k199"), big.has("k198"));
+big.set("k0", "again");
+const keys = [...big.keys()];
+console.log(keys.length, keys[0], keys[keys.length - 1]);
+const mixed = new Set(["1", 1, true, "true", null, undefined, NaN, NaN, 0, -0]);
+console.log(mixed.size, [...mixed].map((v) => typeof v).join(","));
+const m = new Map();
+const key = { a: 1 };
+m.set(key, [1, 2]);
+console.log(m.get(key), m.get({ a: 1 }), typeof m, JSON.stringify(m));
+console.log(String(m), "" + new Set([1]), `${new Map()}`);
+console.log(new Map([[key, [1, 2]]]));
+console.log(new Map([["a", new Set([1, 2])]]));
+console.log(Array.from(new Set("hello")), new Set("hello").size);
+console.log(Math.max(...new Set([3, 9, 4])), [...new Map([[1, "a"], [1, "b"]])]);
+const dup = new Map([[1, "a"], [1, "b"]]);
+console.log(dup.size, dup.get(1));
+const seen = new Map([["x", 1], ["y", 2], ["z", 3]]);
+seen.forEach((v, k, map) => {
+  if (k === "x") seen.delete("y");
+  if (k === "x") seen.set("z", 30);
+  console.log("visit", k, v, map === seen);
+});
+const set2 = new Set([1, 2, 3]);
+set2.forEach((v) => {
+  if (v === 1) set2.delete(2);
+  console.log("set visit", v);
+});
+console.log(set2.delete(9), set2.delete(1), set2.size, set2.has(1));
+set2.clear();
+console.log(set2.size, [...set2].length);
+try {
+  for (const x of { a: 1 }) console.log("never", x);
+} catch (e) {
+  console.log(e.name);
+}
+try {
+  new Map(5);
+} catch (e) {
+  console.log(e.name);
+}
+}
+{
+function countWords(words) {
+  const counts = new Map();
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    counts.set(w, (counts.get(w) || 0) + 1);
+  }
+  return counts;
+}
+const words = [];
+for (let r = 0; r < 50; r++) words.push("a", "b", "a", "c", "b", "a");
+const counted = countWords(words);
+console.log(counted.size, counted.get("a"), counted.get("b"), counted.get("c"), counted.get("d"));
+function addAll(set, n) {
+  for (let i = 0; i < n; i++) set.add(i % 7);
+  return set.size;
+}
+console.log(addAll(new Set(), 100), addAll(new Set([50]), 20));
+}

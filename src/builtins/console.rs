@@ -1,5 +1,6 @@
 //! `console.*` and the value formatting used by `console.log`.
 
+use crate::collection::Collection;
 use crate::value::{num_to_string, obj_get, NativeDef, Value};
 use crate::vm::Vm;
 
@@ -83,6 +84,9 @@ pub fn inspect(v: &Value, top: bool, depth: usize) -> String {
                 return "[Object]".to_string();
             }
             let props = o.borrow();
+            if let Some(c) = &props.collection {
+                return collection_text(c, depth);
+            }
             if props.is_empty() {
                 return "{}".to_string();
             }
@@ -101,6 +105,31 @@ pub fn inspect(v: &Value, top: bool, depth: usize) -> String {
         }
         Value::Native(d) => format!("[Function: {}]", d.name),
         Value::Cell(c) => inspect(&c.borrow(), top, depth),
+    }
+}
+
+/// A Map or a Set, printed as Node.js prints it: `Map(2) { 'a' => 1, 'b' => 2 }`.
+fn collection_text(c: &Collection, depth: usize) -> String {
+    let name = if c.is_set { "Set" } else { "Map" };
+    let parts: Vec<String> = c
+        .pairs()
+        .iter()
+        .map(|(k, v)| {
+            if c.is_set {
+                inspect(k, false, depth + 1)
+            } else {
+                format!(
+                    "{} => {}",
+                    inspect(k, false, depth + 1),
+                    inspect(v, false, depth + 1)
+                )
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        format!("{}({}) {{}}", name, c.len())
+    } else {
+        format!("{}({}) {{ {} }}", name, c.len(), parts.join(", "))
     }
 }
 

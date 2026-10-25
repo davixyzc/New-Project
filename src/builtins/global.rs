@@ -677,18 +677,22 @@ fn is_array(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> 
 /// `Array.from(source, mapFn)`: the items of an array or string, or the first `length` properties of an
 /// array-like object. A mapping function then replaces each item by its result.
 fn array_from(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let items = match arg(args, 0) {
+    let source = arg(args, 0);
+    let items = match &source {
         Value::Arr(a) => a.borrow().clone(),
         Value::Str(s) => s.chars().map(crate::value::char_value).collect(),
+        Value::Obj(o) if o.borrow().collection.is_some() => {
+            crate::collection::items_of(&source).unwrap_or_default()
+        }
         Value::Obj(o) => {
-            let len = to_num(&crate::value::obj_get(&o, "length").unwrap_or(Value::Undef));
+            let len = to_num(&crate::value::obj_get(o, "length").unwrap_or(Value::Undef));
             let len = if len.is_nan() {
                 0.0
             } else {
                 len.trunc().clamp(0.0, crate::vm::MAX_ARRAY_GROW as f64)
             };
             (0..len as usize)
-                .map(|i| crate::value::obj_get(&o, &i.to_string()).unwrap_or(Value::Undef))
+                .map(|i| crate::value::obj_get(o, &i.to_string()).unwrap_or(Value::Undef))
                 .collect()
         }
         _ => Vec::new(),

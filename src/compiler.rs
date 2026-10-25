@@ -1171,6 +1171,8 @@ impl Compiler {
         self.expr(iter)?;
         if keys {
             self.emit(Op::ToKeys);
+        } else {
+            self.emit(Op::ToItems);
         }
         self.set_slot(list);
         self.emit(Op::Pop);

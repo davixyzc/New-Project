@@ -11,6 +11,7 @@ mod ast;
 mod builtins;
 mod bytecode;
 mod cli;
+mod collection;
 mod compiler;
 mod jit;
 mod lexer;

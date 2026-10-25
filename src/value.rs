@@ -7,6 +7,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::bytecode::Proto;
+use crate::collection::Collection;
 use crate::vm::Vm;
 
 /// The own properties of an object, in the order they were added. An object with many properties also keeps an
@@ -15,6 +16,8 @@ use crate::vm::Vm;
 pub struct Props {
     items: Vec<(Rc<str>, Value)>,
     index: Option<NameMap<usize>>,
+    /// The entries of a Map or a Set, for an object that is one (see `builtins::collections`).
+    pub collection: Option<Box<Collection>>,
 }
 
 /// From this many properties on, an object gets an index by name.
@@ -25,6 +28,7 @@ impl Props {
         Props {
             items: Vec::with_capacity(capacity),
             index: None,
+            collection: None,
         }
     }
 
@@ -124,7 +128,7 @@ pub struct Closure {
 
 /// The text of a string value. It keeps its character count and whether every character is ASCII, so `length` and
 /// indexing take constant time for ASCII text, which is the usual case.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct JsStr {
     text: String,
     chars: usize,
@@ -222,6 +226,15 @@ impl Value {
         Value::Arr(Rc::new(RefCell::new(items)))
     }
 
+    /// A new Map or Set, which holds the entries `c`.
+    pub fn collection(c: Collection) -> Value {
+        let props = Props {
+            collection: Some(Box::new(c)),
+            ..Props::default()
+        };
+        Value::Obj(Rc::new(RefCell::new(props)))
+    }
+
     pub fn obj() -> Value {
         Value::obj_with(0)
     }
@@ -273,9 +286,10 @@ pub fn obj_put(obj: &ObjRef, key: &Rc<str>, v: Value) {
 /// Names from the same source share one allocation (see `intern_name`), so the pointer decides almost every lookup.
 pub fn obj_get_hinted(obj: &ObjRef, key: &Rc<str>, hint: &Cell<u32>) -> Option<Value> {
     let props = obj.borrow();
-    props
-        .position_hinted(key, hint)
-        .map(|i| props.value(i).clone())
+    match props.position_hinted(key, hint) {
+        Some(i) => Some(props.value(i).clone()),
+        None => crate::builtins::collections::property(&props, key),
+    }
 }
 
 /// `obj_put`, which tries the position in `hint` first (see `Props::position_hinted`).
@@ -328,7 +342,10 @@ pub fn intern_name(name: &str) -> Rc<str> {
 /// Reads an own property of a plain object.
 pub fn obj_get(obj: &ObjRef, name: &str) -> Option<Value> {
     let props = obj.borrow();
-    props.position(name).map(|i| props.value(i).clone())
+    match props.position(name) {
+        Some(i) => Some(props.value(i).clone()),
+        None => crate::builtins::collections::property(&props, name),
+    }
 }
 
 /// Builds a plain object from name/value pairs.
@@ -490,7 +507,19 @@ fn to_str_in(v: &Value, joining: Option<&Joining>) -> String {
         Value::Num(n) => num_to_string(*n),
         Value::Str(s) => s.to_string(),
         Value::Arr(a) => join_items(a, ",", joining),
-        Value::Obj(o) => error_text(o).unwrap_or_else(|| "[object Object]".to_string()),
+        Value::Obj(o) => {
+            let tag = o.borrow().collection.as_ref().map(|c| {
+                if c.is_set {
+                    "[object Set]"
+                } else {
+                    "[object Map]"
+                }
+            });
+            match tag {
+                Some(tag) => tag.to_string(),
+                None => error_text(o).unwrap_or_else(|| "[object Object]".to_string()),
+            }
+        }
         Value::Func(_) | Value::Native(_) => "function".to_string(),
         Value::Cell(c) => to_str_in(&c.borrow(), joining),
     }

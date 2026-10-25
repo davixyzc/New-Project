@@ -1896,10 +1896,9 @@ impl Vm {
             Op::NewArray => self.stack.push(Value::arr(Vec::new())),
             Op::ArrayExtend => {
                 let src = self.pop();
-                let items: Vec<Value> = match &src {
-                    Value::Arr(a) => a.borrow().clone(),
-                    Value::Str(s) => s.chars().map(|c| Value::str(&c.to_string())).collect(),
-                    _ => {
+                let items = match crate::collection::items_of(&src) {
+                    Some(items) => items,
+                    None => {
                         self.sync_ip(ip);
                         return Err(self.make_error("TypeError", "value is not iterable"));
                     }
@@ -1938,6 +1937,20 @@ impl Vm {
                     _ => Vec::new(),
                 };
                 self.stack.push(Value::arr(keys));
+            }
+            Op::ToItems => {
+                let v = self.pop();
+                if matches!(v, Value::Arr(_) | Value::Str(_)) {
+                    self.stack.push(v);
+                } else {
+                    match crate::collection::items_of(&v) {
+                        Some(items) => self.stack.push(Value::arr(items)),
+                        None => {
+                            self.sync_ip(ip);
+                            return Err(self.make_error("TypeError", "value is not iterable"));
+                        }
+                    }
+                }
             }
 
             Op::Throw => {

@@ -204,6 +204,7 @@ pub(super) fn delta(op: Op) -> i32 {
         | Op::TypeOf
         | Op::ToStr
         | Op::ToKeys
+        | Op::ToItems
         | Op::PushHandler(_)
         | Op::PopHandler => 0,
         // Jumps, `Return` and `Throw` are described by `successors`.

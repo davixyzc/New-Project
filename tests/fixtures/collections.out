@@ -1,0 +1,44 @@
+1 one string one undefined 4
+true false true false 3
+nan zero zero 2
+object undefined 2
+3 true false
+4 true 3
+[1,3,4] b|1|1
+Map(3) { 'b' => 2, 1 => 'one', '1' => 'string one' }
+Set(3) { 1, 3, 4 }
+Map(0) {} Set(0) {}
+each b 2
+each 1 one
+each 1 string one
+set each 1 1
+set each 3 3
+set each 4 4
+for b 2
+for 1 one
+for 1 string one
+for set 1
+for set 3
+for set 4
+0 undefined
+100
+10000 1 undefined true false
+101 k1 k0
+8 string,number,boolean,string,object,undefined,number,number
+[ 1, 2 ] undefined object {}
+[object Map] [object Set] [object Map]
+Map(1) { { a: 1 } => [ 1, 2 ] }
+Map(1) { 'a' => Set(2) { 1, 2 } }
+[ 'h', 'e', 'l', 'o' ] 4
+9 [ [ 1, 'b' ] ]
+1 b
+visit x 1 true
+visit z 30 true
+set visit 1
+set visit 3
+false true 1 false
+0 0
+TypeError
+TypeError
+3 150 100 50 undefined
+7 8

@@ -161,6 +161,7 @@ fn keeps_locals(op: Op) -> bool {
             | Op::ArrayExtend
             | Op::InitProp(_)
             | Op::ToKeys
+            | Op::ToItems
             | Op::Closure(_)
             | Op::Pow
     )

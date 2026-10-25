@@ -2,6 +2,7 @@
 //! so a built-in method can be referenced from a `Value` without allocating.
 
 pub mod array;
+pub mod collections;
 pub mod console;
 pub mod fs;
 pub mod global;
@@ -17,6 +18,8 @@ pub fn install(vm: &mut Vm) {
     vm.set_global("Math", global::math_object());
     vm.set_global("Object", table_object(global::OBJECT));
     vm.set_global("Array", table_object(global::ARRAY));
+    vm.set_global("Map", Value::Native(&collections::MAP));
+    vm.set_global("Set", Value::Native(&collections::SET));
     vm.set_global("Date", table_object(global::DATE));
     vm.set_global("JSON", json::json_object());
     for def in global::FUNCTIONS {

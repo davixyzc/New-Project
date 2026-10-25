@@ -140,6 +140,9 @@ pub enum Op {
     NewObject(u32),
     InitProp(u32),
     ToKeys,
+    /// Replaces a Map or a Set by the items that `for...of` walks (see `collection::items_of`). An array or a string
+    /// stays as it is, and any other value that is not iterable throws.
+    ToItems,
     // exceptions
     Throw,
     PushHandler(u32),
