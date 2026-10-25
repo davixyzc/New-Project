@@ -36,16 +36,16 @@ fn render(args: &[Value]) -> String {
         .join(" ")
 }
 
-fn log(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let line = render(&args);
+fn log(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let line = render(args);
     vm.write_out(&line);
     vm.write_out("\n");
     Ok(Value::Undef)
 }
 
-fn error(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn error(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     vm.flush();
-    eprintln!("{}", render(&args));
+    eprintln!("{}", render(args));
     Ok(Value::Undef)
 }
 

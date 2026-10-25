@@ -22,14 +22,14 @@ pub fn json_object() -> Value {
     table_object(METHODS)
 }
 
-fn stringify(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let indent = match arg(&args, 2) {
+fn stringify(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let indent = match arg(args, 2) {
         Value::Num(n) => " ".repeat(n.clamp(0.0, 10.0) as usize),
         Value::Str(s) => s.chars().take(10).collect(),
         _ => String::new(),
     };
     let mut out = String::new();
-    match write_value(&arg(&args, 0), &indent, 0, &mut out) {
+    match write_value(&arg(args, 0), &indent, 0, &mut out) {
         Ok(true) => Ok(Value::str(&out)),
         Ok(false) => Ok(Value::Undef),
         Err(msg) => Err(vm.make_error("TypeError", msg)),
@@ -131,8 +131,8 @@ fn quote(s: &str, out: &mut String) {
     out.push('"');
 }
 
-fn parse(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let text = to_str(&arg(&args, 0));
+fn parse(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let text = to_str(&arg(args, 0));
     let mut p = Parser {
         chars: text.chars().collect(),
         pos: 0,

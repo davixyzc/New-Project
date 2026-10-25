@@ -249,27 +249,27 @@ fn new_error(vm: &mut Vm, kind: &str, args: &[Value]) -> Value {
     vm.make_error(kind, &msg)
 }
 
-fn error_ctor(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(new_error(vm, "Error", &args))
+fn error_ctor(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(new_error(vm, "Error", args))
 }
 
-fn type_error_ctor(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(new_error(vm, "TypeError", &args))
+fn type_error_ctor(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(new_error(vm, "TypeError", args))
 }
 
-fn range_error_ctor(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(new_error(vm, "RangeError", &args))
+fn range_error_ctor(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(new_error(vm, "RangeError", args))
 }
 
-fn syntax_error_ctor(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(new_error(vm, "SyntaxError", &args))
+fn syntax_error_ctor(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(new_error(vm, "SyntaxError", args))
 }
 
-fn reference_error_ctor(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(new_error(vm, "ReferenceError", &args))
+fn reference_error_ctor(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(new_error(vm, "ReferenceError", args))
 }
 
-fn number(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn number(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Num(if args.is_empty() {
         0.0
     } else {
@@ -277,22 +277,22 @@ fn number(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> 
     }))
 }
 
-fn string(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn string(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::str(&args.first().map(to_str).unwrap_or_default()))
 }
 
-fn boolean(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn boolean(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Bool(args.first().is_some_and(truthy)))
 }
 
-fn parse_int(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let text = to_str(&arg(&args, 0));
+fn parse_int(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let text = to_str(&arg(args, 0));
     let t = text.trim_start();
     let (negative, t) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
-    let requested = to_num(&arg(&args, 1));
+    let requested = to_num(&arg(args, 1));
     let mut radix = if requested.is_nan() || requested == 0.0 {
         10
     } else {
@@ -323,8 +323,8 @@ fn parse_int(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Valu
     Ok(Value::Num(if negative { -value } else { value }))
 }
 
-fn parse_float(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let text = to_str(&arg(&args, 0));
+fn parse_float(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let text = to_str(&arg(args, 0));
     let t = text.trim_start();
     // Longest prefix that reads as a decimal number.
     let mut best = f64::NAN;
@@ -342,12 +342,12 @@ fn parse_float(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Va
     Ok(Value::Num(best))
 }
 
-fn is_nan(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(Value::Bool(to_num(&arg(&args, 0)).is_nan()))
+fn is_nan(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Bool(to_num(&arg(args, 0)).is_nan()))
 }
 
-fn is_finite(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(Value::Bool(to_num(&arg(&args, 0)).is_finite()))
+fn is_finite(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Bool(to_num(&arg(args, 0)).is_finite()))
 }
 
 // ----- timers -----------------------------------------------------------------
@@ -373,20 +373,20 @@ fn schedule(vm: &mut Vm, args: &[Value], repeat: bool, immediate: bool) -> Resul
     Ok(Value::Num(id as f64))
 }
 
-fn set_timeout(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    schedule(vm, &args, false, false)
+fn set_timeout(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    schedule(vm, args, false, false)
 }
 
-fn set_interval(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    schedule(vm, &args, true, false)
+fn set_interval(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    schedule(vm, args, true, false)
 }
 
-fn set_immediate(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    schedule(vm, &args, false, true)
+fn set_immediate(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    schedule(vm, args, false, true)
 }
 
-fn next_tick(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let callback = arg(&args, 0);
+fn next_tick(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let callback = arg(args, 0);
     if !matches!(callback, Value::Func(_) | Value::Native(_)) {
         return Err(vm.make_error("TypeError", "The \"callback\" argument must be a function"));
     }
@@ -395,8 +395,8 @@ fn next_tick(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value
     Ok(Value::Undef)
 }
 
-fn clear_timer(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let id = to_num(&arg(&args, 0));
+fn clear_timer(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let id = to_num(&arg(args, 0));
     if id.is_finite() && id >= 0.0 {
         vm.clear_timer(id as u64);
     }
@@ -426,13 +426,13 @@ fn value_of_key(v: &Value, key: &str) -> Value {
     }
 }
 
-fn object_keys(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let keys = keys_of(&arg(&args, 0));
+fn object_keys(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let keys = keys_of(&arg(args, 0));
     Ok(Value::arr(keys.iter().map(|k| Value::str(k)).collect()))
 }
 
-fn object_values(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let target = arg(&args, 0);
+fn object_values(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let target = arg(args, 0);
     let values = keys_of(&target)
         .iter()
         .map(|k| value_of_key(&target, k))
@@ -440,8 +440,8 @@ fn object_values(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, 
     Ok(Value::arr(values))
 }
 
-fn object_entries(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let target = arg(&args, 0);
+fn object_entries(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let target = arg(args, 0);
     let pairs = keys_of(&target)
         .iter()
         .map(|k| Value::arr(vec![Value::str(k), value_of_key(&target, k)]))
@@ -449,12 +449,12 @@ fn object_entries(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value,
     Ok(Value::arr(pairs))
 }
 
-fn is_array(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(Value::Bool(matches!(arg(&args, 0), Value::Arr(_))))
+fn is_array(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Bool(matches!(arg(args, 0), Value::Arr(_))))
 }
 
-fn array_from(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let items = match arg(&args, 0) {
+fn array_from(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let items = match arg(args, 0) {
         Value::Arr(a) => a.borrow().clone(),
         Value::Str(s) => s.chars().map(|c| Value::str(&c.to_string())).collect(),
         _ => Vec::new(),
@@ -462,7 +462,7 @@ fn array_from(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Val
     Ok(Value::arr(items))
 }
 
-fn date_now(_vm: &mut Vm, _this: Value, _args: Vec<Value>) -> Result<Value, Value> {
+fn date_now(_vm: &mut Vm, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as f64)
@@ -470,13 +470,13 @@ fn date_now(_vm: &mut Vm, _this: Value, _args: Vec<Value>) -> Result<Value, Valu
     Ok(Value::Num(ms))
 }
 
-fn process_exit(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let code = to_num(&arg(&args, 0));
+fn process_exit(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let code = to_num(&arg(args, 0));
     vm.flush();
     std::process::exit(if code.is_nan() { 0 } else { code as i32 });
 }
 
-fn process_cwd(_vm: &mut Vm, _this: Value, _args: Vec<Value>) -> Result<Value, Value> {
+fn process_cwd(_vm: &mut Vm, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     let dir = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
@@ -488,9 +488,9 @@ fn process_cwd(_vm: &mut Vm, _this: Value, _args: Vec<Value>) -> Result<Value, V
 macro_rules! unary_math {
     ($($name:ident => $f:expr),* $(,)?) => {
         $(
-            fn $name(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
+            fn $name(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
                 let f: fn(f64) -> f64 = $f;
-                Ok(Value::Num(f(to_num(&arg(&args, 0)))))
+                Ok(Value::Num(f(to_num(&arg(args, 0)))))
             }
         )*
     };
@@ -511,15 +511,15 @@ unary_math! {
     tan => f64::tan,
 }
 
-fn pow(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn pow(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Num(
-        to_num(&arg(&args, 0)).powf(to_num(&arg(&args, 1))),
+        to_num(&arg(args, 0)).powf(to_num(&arg(args, 1))),
     ))
 }
 
-fn min(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn min(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let mut best = f64::INFINITY;
-    for v in &args {
+    for v in args {
         let n = to_num(v);
         if n.is_nan() {
             return Ok(Value::Num(f64::NAN));
@@ -529,9 +529,9 @@ fn min(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
     Ok(Value::Num(best))
 }
 
-fn max(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn max(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let mut best = f64::NEG_INFINITY;
-    for v in &args {
+    for v in args {
         let n = to_num(v);
         if n.is_nan() {
             return Ok(Value::Num(f64::NAN));
@@ -541,7 +541,7 @@ fn max(_vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
     Ok(Value::Num(best))
 }
 
-fn random(vm: &mut Vm, _this: Value, _args: Vec<Value>) -> Result<Value, Value> {
+fn random(vm: &mut Vm, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Num(vm.random()))
 }
 
@@ -565,8 +565,8 @@ fn resolve_file(p: &Path) -> Option<PathBuf> {
     None
 }
 
-fn require(vm: &mut Vm, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let name = to_str(&arg(&args, 0));
+fn require(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let name = to_str(&arg(args, 0));
     match name.as_str() {
         "fs" => return Ok(fs::fs_module()),
         "path" => return Ok(fs::path_module()),

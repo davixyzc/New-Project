@@ -26,9 +26,8 @@ pub struct Frame {
     pub closure: Rc<Closure>,
     /// Next instruction to run. Only kept up to date when the frame is not running.
     pub ip: usize,
-    /// Index of the first argument (slot 0) on the value stack.
+    /// Index of the first argument (slot 0) on the value stack. `this` sits at `base - 1`.
     pub base: usize,
-    pub this: Value,
     /// Active `try` handlers: (catch instruction index, stack height to restore).
     pub handlers: Vec<(usize, usize)>,
     /// Set for frames started with `new`: the object to return if the constructor returns nothing.
@@ -56,13 +55,37 @@ pub struct Vm {
     pub next_timer: u64,
     rng: u64,
     nested_calls: usize,
+    /// Buffer that carries the arguments of a native call, reused from call to call.
+    arg_buf: Vec<Value>,
     pub argv: Vec<String>,
 }
 
-fn const_name(proto: &Proto, i: u32) -> &str {
-    match &proto.consts[i as usize] {
-        Value::Str(s) => s.as_str(),
-        _ => "",
+/// Discards a value. Scalars own nothing, so their drop glue is skipped; others are dropped.
+#[inline(always)]
+fn forget_scalar(v: Value) {
+    if v.owns_ref() {
+        drop(v);
+    } else {
+        std::mem::forget(v);
+    }
+}
+
+/// A constant of the running function. Operands are emitted in range by the compiler.
+#[inline(always)]
+fn konst(proto: &Proto, k: u32) -> &Value {
+    debug_assert!((k as usize) < proto.consts.len());
+    // SAFETY: the compiler only emits indices of constants it added to this prototype.
+    unsafe { proto.consts.get_unchecked(k as usize) }
+}
+
+/// Overwrites a value. A slot that holds a scalar needs no drop, so it is written directly.
+#[inline(always)]
+fn put(slot: &mut Value, v: Value) {
+    if slot.owns_ref() {
+        *slot = v;
+    } else {
+        // SAFETY: the old value owns nothing, so skipping its drop leaks nothing.
+        unsafe { std::ptr::write(slot, v) }
     }
 }
 
@@ -92,6 +115,7 @@ impl Vm {
             next_timer: 1,
             rng: seed | 1,
             nested_calls: 0,
+            arg_buf: Vec::new(),
             argv,
         };
         builtins::install(&mut vm);
@@ -203,14 +227,14 @@ impl Vm {
             upvals: Vec::new(),
             this: Value::Undef,
         }));
-        let args = vec![
+        let args = [
             exports,
             builtins::global::require_fn(),
             module.clone(),
             Value::str(&filename),
             Value::str(&dir),
         ];
-        self.call(&func, Value::Undef, args)?;
+        self.call(&func, Value::Undef, &args)?;
         Ok(Self::exports_of(&module))
     }
 
@@ -224,7 +248,7 @@ impl Vm {
     // ----- calls ------------------------------------------------------------
 
     /// Calls any callable value from Rust (used by natives such as `Array.prototype.map`).
-    pub fn call(&mut self, f: &Value, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+    pub fn call(&mut self, f: &Value, this: Value, args: &[Value]) -> Result<Value, Value> {
         match f {
             Value::Native(def) => (def.func)(self, this, args),
             Value::Func(c) => {
@@ -242,18 +266,45 @@ impl Vm {
         }
     }
 
+    /// Like `call`, but the arguments move onto the stack instead of being copied.
+    pub fn call_moved<const N: usize>(
+        &mut self,
+        f: &Value,
+        this: Value,
+        args: [Value; N],
+    ) -> Result<Value, Value> {
+        match f {
+            Value::Func(c) => {
+                if self.nested_calls >= MAX_NESTED_CALLS {
+                    return Err(self.make_error("RangeError", "Maximum call stack size exceeded"));
+                }
+                self.nested_calls += 1;
+                let depth = self.frames.len();
+                self.stack.push(Value::Undef);
+                self.stack.push(this);
+                self.stack.extend(args);
+                let result = match self.enter(c.clone(), N, None) {
+                    Ok(()) => self.execute(depth).map(|_| self.pop()),
+                    Err(e) => Err(e),
+                };
+                self.nested_calls -= 1;
+                result
+            }
+            _ => self.call(f, this, &args),
+        }
+    }
+
     fn call_closure(
         &mut self,
         c: Rc<Closure>,
         this: Value,
-        args: Vec<Value>,
+        args: &[Value],
     ) -> Result<Value, Value> {
         let depth = self.frames.len();
-        let argc = args.len();
         self.stack.push(Value::Undef);
         self.stack.push(this);
-        self.stack.extend(args);
-        self.enter(c, argc, None)?;
+        self.stack.extend_from_slice(args);
+        self.enter(c, args.len(), None)?;
         self.execute(depth)?;
         Ok(self.pop())
     }
@@ -277,25 +328,25 @@ impl Vm {
             } else {
                 Vec::new()
             };
-            self.stack.resize(base + fixed, Value::Undef);
+            self.truncate_stack(base + fixed);
+            while self.stack.len() < base + fixed {
+                self.stack.push(Value::Undef);
+            }
             self.stack.push(Value::arr(extra));
         } else {
-            self.stack.resize(base + fixed, Value::Undef);
+            self.truncate_stack(base + fixed);
+            while self.stack.len() < base + fixed {
+                self.stack.push(Value::Undef);
+            }
         }
         let target = base + proto.nlocals as usize;
         while self.stack.len() < target {
             self.stack.push(Value::Undef);
         }
-        let this = if proto.is_arrow {
-            closure.this.clone()
-        } else {
-            self.stack[base - 1].clone()
-        };
         self.frames.push(Frame {
             closure,
             ip: 0,
             base,
-            this,
             handlers: Vec::new(),
             ctor,
         });
@@ -317,12 +368,18 @@ impl Vm {
                 self.enter(c, argc, ctor)
             }
             Value::Native(def) => {
-                let args = self.stack.split_off(self.stack.len() - argc);
+                // The arguments move into a buffer that is reused from call to call.
+                let mut args = std::mem::take(&mut self.arg_buf);
+                args.clear();
+                let start = self.stack.len() - argc;
+                args.extend(self.stack.drain(start..));
                 let this = self.pop();
                 self.stack.pop();
                 let this = if is_new { Value::Undef } else { this };
-                let result = (def.func)(self, this, args)?;
-                self.stack.push(result);
+                let result = (def.func)(self, this, &args);
+                args.clear();
+                self.arg_buf = args;
+                self.stack.push(result?);
                 Ok(())
             }
             other => {
@@ -352,12 +409,12 @@ impl Vm {
             let f = self.frames.last_mut().unwrap();
             if let Some((catch_ip, height)) = f.handlers.pop() {
                 f.ip = catch_ip;
-                self.stack.truncate(height);
+                self.truncate_stack(height);
                 self.stack.push(exc);
                 return Ok(());
             }
             let f = self.frames.pop().unwrap();
-            self.stack.truncate(f.base - 2);
+            self.truncate_stack(f.base - 2);
         }
         Err(exc)
     }
@@ -408,16 +465,48 @@ impl Vm {
         (f.closure.proto.clone(), f.base, f.ip)
     }
 
+    /// A stack slot of the running frame. `enter` sizes the stack to cover every slot the
+    /// compiler can name, so the index is in range.
+    #[inline(always)]
+    fn local(&self, idx: usize) -> &Value {
+        debug_assert!(idx < self.stack.len());
+        // SAFETY: see above; checked in debug builds.
+        unsafe { self.stack.get_unchecked(idx) }
+    }
+
+    #[inline(always)]
+    fn local_mut(&mut self, idx: usize) -> &mut Value {
+        debug_assert!(idx < self.stack.len());
+        // SAFETY: see `local`.
+        unsafe { self.stack.get_unchecked_mut(idx) }
+    }
+
     /// `++` / `--` on a plain numeric local, in place.
     #[inline(always)]
     fn step_local(&mut self, idx: usize, delta: f64) {
-        match &mut self.stack[idx] {
+        match self.local_mut(idx) {
             Value::Num(n) => *n += delta,
             other => {
                 let n = to_num(other) + delta;
-                *other = Value::Num(n);
+                put(other, Value::Num(n));
             }
         }
+    }
+
+    /// Drops every stack value above `len`. Scalars are skipped without calling drop glue.
+    #[inline(always)]
+    fn truncate_stack(&mut self, len: usize) {
+        if self.stack.len() <= len {
+            return;
+        }
+        for v in &mut self.stack[len..] {
+            if v.owns_ref() {
+                // SAFETY: each value is dropped once here, and `set_len` below forgets the slots.
+                unsafe { std::ptr::drop_in_place(v) }
+            }
+        }
+        // SAFETY: everything above `len` has been dropped or was a scalar.
+        unsafe { self.stack.set_len(len) }
     }
 
     /// The dispatch loop. Returns Ok when the frame at `base_depth` returns, Err on a thrown value.
@@ -427,7 +516,10 @@ impl Vm {
     fn run(&mut self, base_depth: usize) -> Result<(), Value> {
         let (mut proto, mut base, mut ip) = self.frame_state();
         loop {
-            let op = proto.code[ip];
+            debug_assert!(ip < proto.code.len());
+            // SAFETY: every function ends in `Return`, and each jump target is an instruction
+            // of the same function, so `ip` stays in range.
+            let op = unsafe { *proto.code.get_unchecked(ip) };
             ip += 1;
             match op {
                 Op::Const(i) => {
@@ -439,11 +531,17 @@ impl Vm {
                 Op::True => self.stack.push(Value::Bool(true)),
                 Op::False => self.stack.push(Value::Bool(false)),
                 Op::This => {
-                    let this = self.frames.last().unwrap().this.clone();
+                    let this = if proto.is_arrow {
+                        self.frames.last().unwrap().closure.this.clone()
+                    } else {
+                        self.stack[base - 1].clone()
+                    };
                     self.stack.push(this);
                 }
                 Op::Pop => {
-                    self.stack.pop();
+                    if let Some(v) = self.stack.pop() {
+                        forget_scalar(v);
+                    }
                 }
                 Op::Dup => {
                     let v = self.top().clone();
@@ -462,12 +560,16 @@ impl Vm {
                 }
 
                 Op::GetLocal(i) => {
-                    let v = self.stack[base + i as usize].clone();
+                    let v = self.local(base + i as usize).clone();
                     self.stack.push(v);
                 }
                 Op::SetLocal(i) => {
                     let v = self.top().clone();
-                    self.stack[base + i as usize] = v;
+                    put(self.local_mut(base + i as usize), v);
+                }
+                Op::PopToLocal(i) => {
+                    let v = self.pop();
+                    put(self.local_mut(base + i as usize), v);
                 }
                 Op::IncLocal(i) => self.step_local(base + i as usize, 1.0),
                 Op::DecLocal(i) => self.step_local(base + i as usize, -1.0),
@@ -503,6 +605,22 @@ impl Vm {
                     };
                     self.stack[idx] = Value::Cell(Rc::new(RefCell::new(v)));
                 }
+                Op::AddToLocal(i) => {
+                    let rhs = self.pop();
+                    let idx = base + i as usize;
+                    // Moving the value out first lets a string be extended in place.
+                    let old = std::mem::replace(self.local_mut(idx), Value::Undef);
+                    let result = match (&old, &rhs) {
+                        (Value::Num(x), Value::Num(y)) => {
+                            let sum = Value::Num(x + y);
+                            forget_scalar(old);
+                            forget_scalar(rhs);
+                            sum
+                        }
+                        _ => concat_owned(old, rhs),
+                    };
+                    put(self.local_mut(idx), result);
+                }
                 Op::ConcatLocal(i) => {
                     let rhs = self.pop();
                     let old = self.pop();
@@ -527,6 +645,51 @@ impl Vm {
                     }
                     self.stack.push(result);
                 }
+                Op::GetLocalProp(s, n) => {
+                    let name: &str = &proto.names[n as usize];
+                    let idx = base + s as usize;
+                    let direct = match self.local(idx) {
+                        Value::Obj(o) => Some(obj_get(o, name).unwrap_or(Value::Undef)),
+                        _ => None,
+                    };
+                    let v = match direct {
+                        Some(v) => v,
+                        None => {
+                            self.sync_ip(ip);
+                            let obj = self.stack[idx].clone();
+                            self.get_prop(&obj, name)?
+                        }
+                    };
+                    self.stack.push(v);
+                }
+                Op::AddLK(s, k) => {
+                    let r = match (self.local(base + s as usize), konst(&proto, k)) {
+                        (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
+                        (a, b) => add(a, b),
+                    };
+                    self.stack.push(r);
+                }
+                Op::SubLK(s, k) => {
+                    let r = match (self.local(base + s as usize), konst(&proto, k)) {
+                        (Value::Num(x), Value::Num(y)) => x - y,
+                        (a, b) => to_num(a) - to_num(b),
+                    };
+                    self.stack.push(Value::Num(r));
+                }
+                Op::MulLK(s, k) => {
+                    let r = match (self.local(base + s as usize), konst(&proto, k)) {
+                        (Value::Num(x), Value::Num(y)) => x * y,
+                        (a, b) => to_num(a) * to_num(b),
+                    };
+                    self.stack.push(Value::Num(r));
+                }
+                Op::ModLK(s, k) => {
+                    let r = match (self.local(base + s as usize), konst(&proto, k)) {
+                        (Value::Num(x), Value::Num(y)) => js_mod(*x, *y),
+                        (a, b) => js_mod(to_num(a), to_num(b)),
+                    };
+                    self.stack.push(Value::Num(r));
+                }
 
                 Op::GetUpval(i) => {
                     let v = self.frames.last().unwrap().closure.upvals[i as usize]
@@ -541,7 +704,7 @@ impl Vm {
 
                 Op::GetGlobal(i) => {
                     self.sync_ip(ip);
-                    let name = const_name(&proto, i);
+                    let name: &str = &proto.names[i as usize];
                     let found = self.globals.get(name).cloned();
                     match found {
                         Some(v) => self.stack.push(v),
@@ -554,15 +717,15 @@ impl Vm {
                 Op::GetGlobalOrUndef(i) => {
                     let v = self
                         .globals
-                        .get(const_name(&proto, i))
+                        .get(&*proto.names[i as usize])
                         .cloned()
                         .unwrap_or(Value::Undef);
                     self.stack.push(v);
                 }
                 Op::SetGlobal(i) => {
-                    let name = const_name(&proto, i);
+                    let name = proto.names[i as usize].clone();
                     let v = self.top().clone();
-                    self.globals.insert(Rc::from(name), v);
+                    self.globals.insert(name, v);
                 }
                 Op::ConstAssign(_) => {
                     self.sync_ip(ip);
@@ -572,14 +735,14 @@ impl Vm {
                 Op::GetProp(i) => {
                     self.sync_ip(ip);
                     let obj = self.pop();
-                    let v = self.get_prop(&obj, const_name(&proto, i))?;
+                    let v = self.get_prop(&obj, &proto.names[i as usize])?;
                     self.stack.push(v);
                 }
                 Op::SetProp(i) => {
                     self.sync_ip(ip);
                     let v = self.pop();
                     let obj = self.pop();
-                    self.set_prop(&obj, const_name(&proto, i), v.clone())?;
+                    self.set_prop(&obj, &proto.names[i as usize], v.clone())?;
                     self.stack.push(v);
                 }
                 Op::GetIndex => {
@@ -758,6 +921,44 @@ impl Vm {
                         ip = t as usize;
                     }
                 }
+                Op::JumpIfLtLK(s, k, t) => {
+                    let less = match (self.local(base + s as usize), konst(&proto, k)) {
+                        (Value::Num(x), Value::Num(y)) => *x < *y,
+                        (a, b) => compare(a, b) == Some(Ordering::Less),
+                    };
+                    if less {
+                        ip = t as usize;
+                    }
+                }
+                Op::JumpIfLtLL(a, b, t) => {
+                    let less = match (self.local(base + a as usize), self.local(base + b as usize))
+                    {
+                        (Value::Num(x), Value::Num(y)) => *x < *y,
+                        (x, y) => compare(x, y) == Some(Ordering::Less),
+                    };
+                    if less {
+                        ip = t as usize;
+                    }
+                }
+                Op::JumpIfNotLtLK(s, k, t) => {
+                    let less = match (self.local(base + s as usize), konst(&proto, k)) {
+                        (Value::Num(x), Value::Num(y)) => *x < *y,
+                        (a, b) => compare(a, b) == Some(Ordering::Less),
+                    };
+                    if !less {
+                        ip = t as usize;
+                    }
+                }
+                Op::JumpIfNotLtLL(a, b, t) => {
+                    let less = match (self.local(base + a as usize), self.local(base + b as usize))
+                    {
+                        (Value::Num(x), Value::Num(y)) => *x < *y,
+                        (x, y) => compare(x, y) == Some(Ordering::Less),
+                    };
+                    if !less {
+                        ip = t as usize;
+                    }
+                }
                 Op::AndJump(t) => {
                     if truthy(self.top()) {
                         self.pop();
@@ -797,7 +998,7 @@ impl Vm {
                 Op::Return => {
                     let v = self.pop();
                     let f = self.frames.pop().unwrap();
-                    self.stack.truncate(f.base - 2);
+                    self.truncate_stack(f.base - 2);
                     let v = match f.ctor {
                         Some(obj) if !v.is_object() => obj,
                         _ => v,
@@ -815,7 +1016,7 @@ impl Vm {
                     let mut upvals = Vec::with_capacity(child.upvals.len());
                     for d in &child.upvals {
                         if d.from_local {
-                            let cell = match &self.stack[frame.base + d.index as usize] {
+                            let cell = match &self.stack[base + d.index as usize] {
                                 Value::Cell(c) => c.clone(),
                                 other => Rc::new(RefCell::new(other.clone())),
                             };
@@ -825,7 +1026,11 @@ impl Vm {
                         }
                     }
                     let this = if child.is_arrow {
-                        frame.this.clone()
+                        if proto.is_arrow {
+                            frame.closure.this.clone()
+                        } else {
+                            self.stack[base - 1].clone()
+                        }
                     } else {
                         Value::Undef
                     };
@@ -870,11 +1075,11 @@ impl Vm {
                         a.borrow_mut().push(v);
                     }
                 }
-                Op::NewObject => self.stack.push(Value::obj()),
+                Op::NewObject(n) => self.stack.push(Value::obj_with(n as usize)),
                 Op::InitProp(i) => {
                     let v = self.pop();
                     if let Some(Value::Obj(o)) = self.stack.last() {
-                        obj_set(o, const_name(&proto, i), v);
+                        obj_put(o, &proto.names[i as usize], v);
                     }
                 }
                 Op::ToKeys => {
@@ -1090,7 +1295,7 @@ impl Vm {
     /// Runs queued `process.nextTick` callbacks, including ones queued by the callbacks themselves.
     fn run_ticks(&mut self) -> Result<(), Value> {
         while let Some((callback, args)) = self.ticks.pop_front() {
-            self.call(&callback, Value::Undef, args)?;
+            self.call(&callback, Value::Undef, &args)?;
         }
         Ok(())
     }
@@ -1112,7 +1317,7 @@ impl Vm {
                     self.timer_table.remove(&id);
                 }
             }
-            self.call(&callback, Value::Undef, args)?;
+            self.call(&callback, Value::Undef, &args)?;
             self.run_ticks()?;
         }
         Ok(())

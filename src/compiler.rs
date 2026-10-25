@@ -1,10 +1,10 @@
 //! Compiles the AST into bytecode prototypes.
 //!
 //! Scope resolution happens here: every name becomes a frame slot, a captured cell,
-//! an upvalue or a global lookup. A function whose body contains other functions
-//! stores all its locals in cells, so closures can share them.
+//! an upvalue or a global lookup. A local lives in a heap cell only when some nested
+//! function refers to its name, so the other locals of a function stay in plain slots.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ast::*;
@@ -28,11 +28,16 @@ struct Compiler {
 }
 
 struct FuncState {
-    boxed: bool,
+    /// Names that nested functions refer to. Locals with these names live in cells.
+    captured: HashSet<String>,
+    /// For each slot, whether its current occupant is a cell.
+    slot_boxed: Vec<bool>,
     code: Vec<Op>,
     lines: Vec<u32>,
     consts: Vec<Value>,
     string_consts: HashMap<String, u32>,
+    names: Vec<Rc<str>>,
+    name_index: HashMap<String, u32>,
     protos: Vec<Rc<Proto>>,
     /// Captured names: (name, where to load it from, is_const).
     upvals: Vec<(String, UpvalDesc, bool)>,
@@ -82,13 +87,16 @@ enum Ref {
 }
 
 impl FuncState {
-    fn new(boxed: bool, line: u32) -> Self {
+    fn new(captured: HashSet<String>, line: u32) -> Self {
         FuncState {
-            boxed,
+            captured,
+            slot_boxed: Vec::new(),
             code: Vec::new(),
             lines: Vec::new(),
             consts: Vec::new(),
             string_consts: HashMap::new(),
+            names: Vec::new(),
+            name_index: HashMap::new(),
             protos: Vec::new(),
             upvals: Vec::new(),
             scopes: Vec::new(),
@@ -99,6 +107,205 @@ impl FuncState {
             finally_stack: Vec::new(),
             line,
         }
+    }
+}
+
+// ----- capture analysis -------------------------------------------------------
+
+/// Names that nested functions in `def` refer to. Over-approximating is safe: a local that
+/// is boxed needlessly only runs a little slower.
+fn captured_names(def: &FuncDef) -> HashSet<String> {
+    let mut out = HashSet::new();
+    if def.has_inner {
+        for p in &def.params {
+            if let Some(d) = &p.default {
+                scan_expr(d, false, &mut out);
+            }
+        }
+        for s in &def.body {
+            scan_stmt(s, false, &mut out);
+        }
+    }
+    out
+}
+
+/// Records a name when inside a nested function. Outside one, names are not captures.
+fn note(name: &str, nested: bool, out: &mut HashSet<String>) {
+    if nested && !out.contains(name) {
+        out.insert(name.to_string());
+    }
+}
+
+/// Everything a nested function mentions is a potential capture.
+fn scan_func(def: &FuncDef, out: &mut HashSet<String>) {
+    for p in &def.params {
+        if let Some(d) = &p.default {
+            scan_expr(d, true, out);
+        }
+    }
+    for s in &def.body {
+        scan_stmt(s, true, out);
+    }
+}
+
+fn scan_stmt(s: &Stmt, nested: bool, out: &mut HashSet<String>) {
+    match s {
+        Stmt::Expr(e, _) | Stmt::Throw(e, _) => scan_expr(e, nested, out),
+        Stmt::Var(_, decls, _) => {
+            for (name, init) in decls {
+                note(name, nested, out);
+                if let Some(e) = init {
+                    scan_expr(e, nested, out);
+                }
+            }
+        }
+        Stmt::Func(def) => scan_func(def, out),
+        Stmt::Return(value, _) => {
+            if let Some(e) = value {
+                scan_expr(e, nested, out);
+            }
+        }
+        Stmt::If(cond, then, otherwise, _) => {
+            scan_expr(cond, nested, out);
+            scan_stmt(then, nested, out);
+            if let Some(e) = otherwise {
+                scan_stmt(e, nested, out);
+            }
+        }
+        Stmt::While(cond, body, _) => {
+            scan_expr(cond, nested, out);
+            scan_stmt(body, nested, out);
+        }
+        Stmt::DoWhile(body, cond, _) => {
+            scan_stmt(body, nested, out);
+            scan_expr(cond, nested, out);
+        }
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+            ..
+        } => {
+            if let Some(i) = init {
+                scan_stmt(i, nested, out);
+            }
+            if let Some(t) = test {
+                scan_expr(t, nested, out);
+            }
+            if let Some(u) = update {
+                scan_expr(u, nested, out);
+            }
+            scan_stmt(body, nested, out);
+        }
+        Stmt::ForOf {
+            name, iter, body, ..
+        }
+        | Stmt::ForIn {
+            name, iter, body, ..
+        } => {
+            note(name, nested, out);
+            scan_expr(iter, nested, out);
+            scan_stmt(body, nested, out);
+        }
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty => {}
+        Stmt::Try {
+            body,
+            param,
+            handler,
+            finalizer,
+            ..
+        } => {
+            for s in body {
+                scan_stmt(s, nested, out);
+            }
+            if let Some(p) = param {
+                note(p, nested, out);
+            }
+            for s in handler.iter().flatten() {
+                scan_stmt(s, nested, out);
+            }
+            for s in finalizer.iter().flatten() {
+                scan_stmt(s, nested, out);
+            }
+        }
+        Stmt::Switch(discriminant, cases, _) => {
+            scan_expr(discriminant, nested, out);
+            for (test, body) in cases {
+                if let Some(t) = test {
+                    scan_expr(t, nested, out);
+                }
+                for s in body {
+                    scan_stmt(s, nested, out);
+                }
+            }
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                scan_stmt(s, nested, out);
+            }
+        }
+    }
+}
+
+fn scan_expr(e: &Expr, nested: bool, out: &mut HashSet<String>) {
+    match e {
+        Expr::Ident(name) => note(name, nested, out),
+        Expr::Func(def) => scan_func(def, out),
+        Expr::Template(_, parts) | Expr::Array(parts) => {
+            for p in parts {
+                scan_expr(p, nested, out);
+            }
+        }
+        Expr::Object(props) => {
+            for (_, v) in props {
+                scan_expr(v, nested, out);
+            }
+        }
+        Expr::Unary(_, x) | Expr::Spread(x) | Expr::Member(x, _) => scan_expr(x, nested, out),
+        Expr::Update { target, .. } => scan_expr(target, nested, out),
+        Expr::Binary(_, a, b)
+        | Expr::Logical(_, a, b)
+        | Expr::Assign(_, a, b)
+        | Expr::Index(a, b) => {
+            scan_expr(a, nested, out);
+            scan_expr(b, nested, out);
+        }
+        Expr::Cond(a, b, c) => {
+            scan_expr(a, nested, out);
+            scan_expr(b, nested, out);
+            scan_expr(c, nested, out);
+        }
+        Expr::Call(callee, args) | Expr::New(callee, args) => {
+            scan_expr(callee, nested, out);
+            for a in args {
+                scan_expr(a, nested, out);
+            }
+        }
+        Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::Undef | Expr::This => {}
+    }
+}
+
+/// True when evaluating `e` cannot assign to a variable, so a local read before `e` and a
+/// local read after `e` hold the same value.
+fn is_pure(e: &Expr) -> bool {
+    match e {
+        Expr::Num(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undef
+        | Expr::This
+        | Expr::Ident(_)
+        | Expr::Func(_) => true,
+        Expr::Template(_, parts) | Expr::Array(parts) => parts.iter().all(is_pure),
+        Expr::Object(props) => props.iter().all(|(_, v)| is_pure(v)),
+        Expr::Unary(_, x) | Expr::Spread(x) | Expr::Member(x, _) => is_pure(x),
+        Expr::Binary(_, a, b) | Expr::Logical(_, a, b) | Expr::Index(a, b) => {
+            is_pure(a) && is_pure(b)
+        }
+        Expr::Cond(a, b, c) => is_pure(a) && is_pure(b) && is_pure(c),
+        Expr::Update { .. } | Expr::Assign(..) | Expr::Call(..) | Expr::New(..) => false,
     }
 }
 
@@ -133,6 +340,17 @@ fn binop(op: &str) -> Op {
     }
 }
 
+/// The superinstruction for `local <op> constant`, if there is one.
+fn fused_local_const(op: &str) -> Option<fn(u32, u32) -> Op> {
+    match op {
+        "+" => Some(Op::AddLK),
+        "-" => Some(Op::SubLK),
+        "*" => Some(Op::MulLK),
+        "%" => Some(Op::ModLK),
+        _ => None,
+    }
+}
+
 impl Compiler {
     fn fs(&mut self) -> &mut FuncState {
         self.funcs.last_mut().unwrap()
@@ -157,6 +375,7 @@ impl Compiler {
         format!("SyntaxError: {} at line {}", msg, self.fs().line)
     }
 
+    /// Sets the target of a jump emitted earlier. Other instructions are left alone.
     fn patch_to(&mut self, at: usize, target: u32) {
         let fs = self.fs();
         fs.code[at] = match fs.code[at] {
@@ -167,6 +386,10 @@ impl Compiler {
             Op::JumpIfNotLe(_) => Op::JumpIfNotLe(target),
             Op::JumpIfNotGt(_) => Op::JumpIfNotGt(target),
             Op::JumpIfNotGe(_) => Op::JumpIfNotGe(target),
+            Op::JumpIfLtLK(s, k, _) => Op::JumpIfLtLK(s, k, target),
+            Op::JumpIfLtLL(a, b, _) => Op::JumpIfLtLL(a, b, target),
+            Op::JumpIfNotLtLK(s, k, _) => Op::JumpIfNotLtLK(s, k, target),
+            Op::JumpIfNotLtLL(a, b, _) => Op::JumpIfNotLtLL(a, b, target),
             Op::AndJump(_) => Op::AndJump(target),
             Op::OrJump(_) => Op::OrJump(target),
             Op::NullishJump(_) => Op::NullishJump(target),
@@ -181,6 +404,7 @@ impl Compiler {
         self.patch_to(at, target);
     }
 
+    /// A string value in the constant pool (literals).
     fn str_const(&mut self, s: &str) -> u32 {
         let fs = self.fs();
         if let Some(&i) = fs.string_consts.get(s) {
@@ -192,10 +416,27 @@ impl Compiler {
         i
     }
 
-    fn push_num(&mut self, n: f64) {
+    /// A property or variable name in the name table. Objects share these keys.
+    fn name_const(&mut self, s: &str) -> u32 {
+        let fs = self.fs();
+        if let Some(&i) = fs.name_index.get(s) {
+            return i;
+        }
+        let i = fs.names.len() as u32;
+        fs.names.push(Rc::from(s));
+        fs.name_index.insert(s.to_string(), i);
+        i
+    }
+
+    fn num_const(&mut self, n: f64) -> u32 {
         let fs = self.fs();
         let i = fs.consts.len() as u32;
         fs.consts.push(Value::Num(n));
+        i
+    }
+
+    fn push_num(&mut self, n: f64) {
+        let i = self.num_const(n);
         self.emit(Op::Const(i));
     }
 
@@ -221,11 +462,33 @@ impl Compiler {
         let slot = fs.next_slot;
         fs.next_slot += 1;
         fs.max_slot = fs.max_slot.max(fs.next_slot);
+        if fs.slot_boxed.len() < fs.next_slot as usize {
+            fs.slot_boxed.resize(fs.next_slot as usize, false);
+        }
         slot
     }
 
+    fn slot_is_boxed(&self, slot: u32) -> bool {
+        self.funcs
+            .last()
+            .unwrap()
+            .slot_boxed
+            .get(slot as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Declares a variable of the current scope. It is a cell only if a nested function uses its name.
     fn declare(&mut self, name: &str, is_const: bool) -> u32 {
         let slot = self.alloc_slot();
+        let boxed = self.fs().captured.contains(name);
+        let was_boxed = std::mem::replace(&mut self.fs().slot_boxed[slot as usize], boxed);
+        if was_boxed && !boxed {
+            // The slot may still hold the cell of an earlier variable. Clear it before use.
+            self.emit(Op::Undef);
+            self.emit(Op::SetLocal(slot));
+            self.emit(Op::Pop);
+        }
         self.fs().scopes.last_mut().unwrap().vars.push(Var {
             name: name.to_string(),
             slot,
@@ -234,17 +497,15 @@ impl Compiler {
         slot
     }
 
-    /// A hidden slot for compiler temporaries.
+    /// A hidden slot for compiler temporaries. Temporaries are always written before they are read.
     fn temp(&mut self) -> u32 {
         let slot = self.alloc_slot();
-        if self.fs().boxed {
-            self.emit(Op::NewCell(slot));
-        }
+        self.fs().slot_boxed[slot as usize] = false;
         slot
     }
 
     fn get_slot(&mut self, slot: u32) {
-        if self.fs().boxed {
+        if self.slot_is_boxed(slot) {
             self.emit(Op::GetBoxed(slot));
         } else {
             self.emit(Op::GetLocal(slot));
@@ -253,7 +514,7 @@ impl Compiler {
 
     /// Stores the top of the stack into a slot, leaving the value in place.
     fn set_slot(&mut self, slot: u32) {
-        if self.fs().boxed {
+        if self.slot_is_boxed(slot) {
             self.emit(Op::SetBoxed(slot));
         } else {
             self.emit(Op::SetLocal(slot));
@@ -285,7 +546,7 @@ impl Compiler {
             return Ref::Global;
         }
         // Not ours: capture it from the enclosing function. Its locals are cells
-        // because that function contains us, so the capture can share the cell.
+        // because a nested function refers to the name, so the capture can share the cell.
         let (desc, is_const) = match self.resolve_at(level - 1, name) {
             Ref::Local { slot, is_const } => (
                 UpvalDesc {
@@ -311,6 +572,29 @@ impl Compiler {
         }
     }
 
+    /// The slot of a plain local that is neither a cell nor a constant.
+    fn plain_local(&mut self, name: &str) -> Option<u32> {
+        match self.resolve(name) {
+            Ref::Local {
+                slot,
+                is_const: false,
+            } if !self.slot_is_boxed(slot) => Some(slot),
+            _ => None,
+        }
+    }
+
+    /// The slot of a plain local that `e` reads (constant or not), if `e` is one.
+    fn local_operand(&mut self, e: &Expr) -> Option<u32> {
+        if let Expr::Ident(name) = e {
+            if let Ref::Local { slot, .. } = self.resolve(name) {
+                if !self.slot_is_boxed(slot) {
+                    return Some(slot);
+                }
+            }
+        }
+        None
+    }
+
     fn load_var(&mut self, name: &str) {
         match self.resolve(name) {
             Ref::Local { slot, .. } => self.get_slot(slot),
@@ -318,7 +602,7 @@ impl Compiler {
                 self.emit(Op::GetUpval(index));
             }
             Ref::Global => {
-                let c = self.str_const(name);
+                let c = self.name_const(name);
                 self.emit(Op::GetGlobal(c));
             }
         }
@@ -338,28 +622,39 @@ impl Compiler {
                 self.emit(Op::SetUpval(index));
             }
             Ref::Local { is_const: true, .. } | Ref::Upval { is_const: true, .. } => {
-                let c = self.str_const(name);
+                let c = self.name_const(name);
                 self.emit(Op::ConstAssign(c));
             }
             Ref::Global => {
-                let c = self.str_const(name);
+                let c = self.name_const(name);
                 self.emit(Op::SetGlobal(c));
             }
         }
     }
 
-    /// Initialises a declared variable of the current scope (ignores `const`).
-    fn init_var(&mut self, name: &str) {
+    /// Initialises a declared variable from the top of the stack and pops it.
+    /// `const` is allowed here, because this is the declaration itself.
+    fn init_var_pop(&mut self, name: &str) {
         match self.resolve(name) {
-            Ref::Local { slot, .. } => self.set_slot(slot),
-            _ => self.store_var(name),
+            Ref::Local { slot, .. } if !self.slot_is_boxed(slot) => {
+                self.emit(Op::PopToLocal(slot));
+            }
+            Ref::Local { slot, .. } => {
+                self.set_slot(slot);
+                self.emit(Op::Pop);
+            }
+            _ => {
+                self.store_var(name);
+                self.emit(Op::Pop);
+            }
         }
     }
 
     // ----- functions --------------------------------------------------------
 
     fn function(&mut self, def: &FuncDef) -> Result<Proto, String> {
-        self.funcs.push(FuncState::new(def.has_inner, def.line));
+        self.funcs
+            .push(FuncState::new(captured_names(def), def.line));
         self.enter_scope();
         let nfixed = def.params.len() as u32;
         for p in &def.params {
@@ -369,8 +664,8 @@ impl Compiler {
             self.declare(rest, false);
         }
         let nargs = nfixed + u32::from(def.rest.is_some());
-        if self.fs().boxed {
-            for i in 0..nargs {
+        for i in 0..nargs {
+            if self.slot_is_boxed(i) {
                 self.emit(Op::BoxParam(i));
             }
         }
@@ -401,6 +696,7 @@ impl Compiler {
             code: fs.code,
             lines: fs.lines,
             consts: fs.consts,
+            names: fs.names,
             protos: fs.protos,
             upvals: fs.upvals.iter().map(|(_, d, _)| *d).collect(),
             nparams: nfixed,
@@ -444,8 +740,8 @@ impl Compiler {
                 _ => {}
             }
         }
-        if self.fs().boxed {
-            for &slot in &declared {
+        for &slot in &declared {
+            if self.slot_is_boxed(slot) {
                 self.emit(Op::NewCell(slot));
             }
         }
@@ -503,8 +799,7 @@ impl Compiler {
                             self.emit(Op::Undef);
                         }
                     }
-                    self.init_var(name);
-                    self.emit(Op::Pop);
+                    self.init_var_pop(name);
                 }
             }
             Stmt::Func(..) | Stmt::Empty => {}
@@ -534,17 +829,20 @@ impl Compiler {
                 }
             }
             Stmt::While(cond, body, line) => {
+                // The test sits at the bottom, so each iteration takes one jump, not two.
                 self.line(*line);
-                let start = self.here() as u32;
-                let exit = self.jump_if_false(cond)?;
+                let to_test = self.emit(Op::Jump(0));
+                let body_start = self.here() as u32;
                 self.loop_push();
                 self.stmt(body)?;
                 let ctx = self.loop_pop();
+                let test = self.here() as u32;
                 for c in ctx.continues {
-                    self.patch_to(c, start);
+                    self.patch_to(c, test);
                 }
-                self.emit(Op::Jump(start));
-                self.patch(exit);
+                self.patch_to(to_test, test);
+                let back = self.jump_if_true(cond)?;
+                self.patch_to(back, body_start);
                 for b in ctx.breaks {
                     self.patch(b);
                 }
@@ -559,8 +857,8 @@ impl Compiler {
                 for c in ctx.continues {
                     self.patch_to(c, cont);
                 }
-                self.expr(cond)?;
-                self.emit(Op::JumpIfTrue(start));
+                let back = self.jump_if_true(cond)?;
+                self.patch_to(back, start);
                 for b in ctx.breaks {
                     self.patch(b);
                 }
@@ -579,11 +877,8 @@ impl Compiler {
                     loop_vars = self.declare_block(std::slice::from_ref(&**init))?;
                     self.stmt(init)?;
                 }
-                let start = self.here() as u32;
-                let exit = match test {
-                    Some(t) => Some(self.jump_if_false(t)?),
-                    None => None,
-                };
+                let to_test = self.emit(Op::Jump(0));
+                let body_start = self.here() as u32;
                 self.loop_push();
                 self.stmt(body)?;
                 let ctx = self.loop_pop();
@@ -593,17 +888,24 @@ impl Compiler {
                 }
                 // Each iteration gets fresh copies of captured loop variables, so closures
                 // created in earlier iterations keep the values they saw.
-                if self.fs().boxed {
-                    for slot in loop_vars {
+                for slot in loop_vars {
+                    if self.slot_is_boxed(slot) {
                         self.emit(Op::Rebox(slot));
                     }
                 }
                 if let Some(u) = update {
                     self.expr_discard(u)?;
                 }
-                self.emit(Op::Jump(start));
-                if let Some(e) = exit {
-                    self.patch(e);
+                let at_test = self.here() as u32;
+                self.patch_to(to_test, at_test);
+                match test {
+                    Some(t) => {
+                        let back = self.jump_if_true(t)?;
+                        self.patch_to(back, body_start);
+                    }
+                    None => {
+                        self.emit(Op::Jump(body_start));
+                    }
                 }
                 for b in ctx.breaks {
                     self.patch(b);
@@ -819,20 +1121,19 @@ impl Compiler {
         self.set_slot(index);
         self.emit(Op::Pop);
 
-        let length = self.str_const("length");
+        let length = self.name_const("length");
         let start = self.here() as u32;
         self.get_slot(index);
         self.get_slot(list);
         self.emit(Op::GetProp(length));
-        self.emit(Op::Lt);
-        let exit = self.emit(Op::JumpIfFalse(0));
+        let exit = self.emit(Op::JumpIfNotLt(0));
 
         // Per-iteration scope: a `let`/`const` binding is a new cell on every pass.
         self.enter_scope();
         let target = match kind {
             Some(k) => {
                 let slot = self.declare(name, k == VarKind::Const);
-                if self.fs().boxed {
+                if self.slot_is_boxed(slot) {
                     self.emit(Op::NewCell(slot));
                 }
                 Some(slot)
@@ -857,11 +1158,7 @@ impl Compiler {
         }
         self.exit_scope();
 
-        self.get_slot(index);
-        self.push_num(1.0);
-        self.emit(Op::Add);
-        self.set_slot(index);
-        self.emit(Op::Pop);
+        self.emit(Op::IncLocal(index));
         self.emit(Op::Jump(start));
         self.patch(exit);
         for b in ctx.breaks {
@@ -906,7 +1203,7 @@ impl Compiler {
                 self.enter_scope();
                 if let Some(name) = param {
                     let slot = self.declare(name, false);
-                    if self.fs().boxed {
+                    if self.slot_is_boxed(slot) {
                         self.emit(Op::NewCell(slot));
                     }
                     self.set_slot(slot);
@@ -1000,10 +1297,10 @@ impl Compiler {
                 }
             }
             Expr::Object(props) => {
-                self.emit(Op::NewObject);
+                self.emit(Op::NewObject(props.len() as u32));
                 for (key, value) in props {
                     self.expr(value)?;
-                    let c = self.str_const(key);
+                    let c = self.name_const(key);
                     self.emit(Op::InitProp(c));
                 }
             }
@@ -1015,7 +1312,7 @@ impl Compiler {
                 // `typeof name` must not throw for an undeclared global.
                 if let ("typeof", Expr::Ident(name)) = (*op, &**x) {
                     if let Ref::Global = self.resolve(name) {
-                        let c = self.str_const(name);
+                        let c = self.name_const(name);
                         self.emit(Op::GetGlobalOrUndef(c));
                         self.emit(Op::TypeOf);
                         return Ok(());
@@ -1032,6 +1329,13 @@ impl Compiler {
             }
             Expr::Update { op, prefix, target } => self.update(op, *prefix, target)?,
             Expr::Binary(op, a, b) => {
+                if let (Some(fused), Expr::Num(c)) = (fused_local_const(op), &**b) {
+                    if let Some(slot) = self.local_operand(a) {
+                        let k = self.num_const(*c);
+                        self.emit(fused(slot, k));
+                        return Ok(());
+                    }
+                }
                 self.expr(a)?;
                 self.expr(b)?;
                 self.emit(binop(op));
@@ -1049,8 +1353,7 @@ impl Compiler {
             }
             Expr::Assign(op, target, value) => self.assign(op, target, value)?,
             Expr::Cond(cond, a, b) => {
-                self.expr(cond)?;
-                let to_else = self.emit(Op::JumpIfFalse(0));
+                let to_else = self.jump_if_false(cond)?;
                 self.expr(a)?;
                 let to_end = self.emit(Op::Jump(0));
                 self.patch(to_else);
@@ -1061,11 +1364,19 @@ impl Compiler {
                 // Stack layout for calls: [callee, this, args...]
                 match &**callee {
                     Expr::Member(obj, name) => {
-                        self.expr(obj)?;
-                        self.emit(Op::Dup);
-                        let c = self.str_const(name);
-                        self.emit(Op::GetProp(c));
-                        self.emit(Op::Swap);
+                        let c = self.name_const(name);
+                        match self.local_operand(obj) {
+                            Some(slot) => {
+                                self.emit(Op::GetLocalProp(slot, c));
+                                self.emit(Op::GetLocal(slot));
+                            }
+                            None => {
+                                self.expr(obj)?;
+                                self.emit(Op::Dup);
+                                self.emit(Op::GetProp(c));
+                                self.emit(Op::Swap);
+                            }
+                        }
                     }
                     Expr::Index(obj, key) => {
                         self.expr(obj)?;
@@ -1092,9 +1403,16 @@ impl Compiler {
                 )
             }
             Expr::Member(obj, name) => {
-                self.expr(obj)?;
-                let c = self.str_const(name);
-                self.emit(Op::GetProp(c));
+                let c = self.name_const(name);
+                match self.local_operand(obj) {
+                    Some(slot) => {
+                        self.emit(Op::GetLocalProp(slot, c));
+                    }
+                    None => {
+                        self.expr(obj)?;
+                        self.emit(Op::GetProp(c));
+                    }
+                }
             }
             Expr::Index(obj, key) => {
                 self.expr(obj)?;
@@ -1105,10 +1423,21 @@ impl Compiler {
         Ok(())
     }
 
-    /// Emits a jump that is taken when `cond` is false, and returns its position for patching.
-    /// Comparisons are fused with the jump.
+    /// Emits a jump that is taken when `cond` is false. The caller patches its target.
+    /// Comparisons fuse with the jump, and comparisons on plain locals fuse entirely.
     fn jump_if_false(&mut self, cond: &Expr) -> Result<usize, String> {
         if let Expr::Binary(op, a, b) = cond {
+            if *op == "<" {
+                if let Some(slot) = self.local_operand(a) {
+                    if let Expr::Num(c) = &**b {
+                        let k = self.num_const(*c);
+                        return Ok(self.emit(Op::JumpIfNotLtLK(slot, k, 0)));
+                    }
+                    if let Some(other) = self.local_operand(b) {
+                        return Ok(self.emit(Op::JumpIfNotLtLL(slot, other, 0)));
+                    }
+                }
+            }
             let fused = match *op {
                 "<" => Some(Op::JumpIfNotLt(0)),
                 "<=" => Some(Op::JumpIfNotLe(0)),
@@ -1126,22 +1455,46 @@ impl Compiler {
         Ok(self.emit(Op::JumpIfFalse(0)))
     }
 
-    /// Compiles an expression whose value is discarded. `i++` only needs its prefix form here.
+    /// Emits a jump that is taken when `cond` is true. The caller patches its target.
+    fn jump_if_true(&mut self, cond: &Expr) -> Result<usize, String> {
+        if let Expr::Binary(op, a, b) = cond {
+            if *op == "<" {
+                if let Some(slot) = self.local_operand(a) {
+                    if let Expr::Num(c) = &**b {
+                        let k = self.num_const(*c);
+                        return Ok(self.emit(Op::JumpIfLtLK(slot, k, 0)));
+                    }
+                    if let Some(other) = self.local_operand(b) {
+                        return Ok(self.emit(Op::JumpIfLtLL(slot, other, 0)));
+                    }
+                }
+            }
+        }
+        self.expr(cond)?;
+        Ok(self.emit(Op::JumpIfTrue(0)))
+    }
+
+    /// Compiles an expression whose value is discarded. Assignments to plain locals and
+    /// increments of them write the local directly, without leaving a value to pop.
     fn expr_discard(&mut self, e: &Expr) -> Result<(), String> {
         if let Expr::Update { op, target, .. } = e {
             if let Expr::Ident(name) = &**target {
-                if let Ref::Local {
-                    slot,
-                    is_const: false,
-                } = self.resolve(name)
-                {
-                    if !self.fs().boxed {
-                        let step = if *op == "++" {
-                            Op::IncLocal(slot)
-                        } else {
-                            Op::DecLocal(slot)
-                        };
-                        self.emit(step);
+                if let Some(slot) = self.plain_local(name) {
+                    let step = if *op == "++" {
+                        Op::IncLocal(slot)
+                    } else {
+                        Op::DecLocal(slot)
+                    };
+                    self.emit(step);
+                    return Ok(());
+                }
+            }
+        }
+        if let Expr::Assign(op, target, value) = e {
+            if let Expr::Ident(name) = &**target {
+                if *op == "=" || *op == "+=" {
+                    if let Some(slot) = self.plain_local(name) {
+                        self.assign_plain_local(op, name, slot, value)?;
                         return Ok(());
                     }
                 }
@@ -1155,8 +1508,41 @@ impl Compiler {
         Ok(())
     }
 
+    /// `x = e` or `x += e` as a statement, for a plain local `x` at `slot`.
+    fn assign_plain_local(
+        &mut self,
+        op: &str,
+        name: &str,
+        slot: u32,
+        value: &Expr,
+    ) -> Result<(), String> {
+        if op == "=" {
+            if let Expr::Binary("+", lhs, rhs) = value {
+                let reads_itself = matches!(&**lhs, Expr::Ident(n) if n.as_str() == name);
+                if reads_itself && is_pure(rhs) {
+                    // `x = x + e` with a side-effect-free `e` is the same as `x += e`.
+                    self.expr(rhs)?;
+                    self.emit(Op::AddToLocal(slot));
+                    return Ok(());
+                }
+            }
+            self.expr(value)?;
+            self.emit(Op::PopToLocal(slot));
+        } else if is_pure(value) {
+            self.expr(value)?;
+            self.emit(Op::AddToLocal(slot));
+        } else {
+            // The right side might assign to `x`, so the old value is read first.
+            self.get_slot(slot);
+            self.expr(value)?;
+            self.emit(Op::ConcatLocal(slot));
+            self.emit(Op::Pop);
+        }
+        Ok(())
+    }
+
     fn assign(&mut self, op: &str, target: &Expr, value: &Expr) -> Result<(), String> {
-        // `x += e` and `x = x + e` on a local append in place (see `Op::ConcatLocal`).
+        // `x += e` and `x = x + e` on a plain local append in place (see `Op::ConcatLocal`).
         if let Expr::Ident(name) = target {
             if let Some(rhs) = concat_rhs(op, name, value) {
                 if let Ref::Local {
@@ -1164,10 +1550,12 @@ impl Compiler {
                     is_const: false,
                 } = self.resolve(name)
                 {
-                    self.get_slot(slot);
-                    self.expr(rhs)?;
-                    self.emit(Op::ConcatLocal(slot));
-                    return Ok(());
+                    if !self.slot_is_boxed(slot) {
+                        self.get_slot(slot);
+                        self.expr(rhs)?;
+                        self.emit(Op::ConcatLocal(slot));
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -1189,7 +1577,7 @@ impl Compiler {
             }
             Expr::Member(obj, name) => {
                 self.expr(obj)?;
-                let c = self.str_const(name);
+                let c = self.name_const(name);
                 if let Some(b) = compound {
                     self.emit(Op::Dup);
                     self.emit(Op::GetProp(c));
@@ -1239,7 +1627,7 @@ impl Compiler {
                 }
             }
             Expr::Member(obj, name) => {
-                let c = self.str_const(name);
+                let c = self.name_const(name);
                 if prefix {
                     self.expr(obj)?;
                     self.emit(Op::Dup);

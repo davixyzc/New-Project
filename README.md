@@ -23,7 +23,7 @@ depois do código síncrono
 ## Como compilar e rodar
 
 ```sh
-cargo build --release                  # gera target/release/fly (~730 KB)
+cargo build --release                  # gera target/release/fly (~740 KB)
 ./target/release/fly exemplo.fly       # roda um arquivo
 ./target/release/fly -e 'console.log(2 ** 10)'
 ./target/release/fly --help
@@ -75,25 +75,37 @@ Métodos de **number**: `toFixed`, `toString`.
 
 ## Desempenho (medido)
 
-Medidos nesta máquina (4 vCPU), tempo de parede, uma execução por ferramenta, com o mesmo algoritmo em cada linguagem. Os scripts estão em `benchmarks/`; rode `benchmarks/run.sh`.
+Medidos nesta máquina (Xeon 2,1 GHz, 4 vCPU), tempo de parede, mediana de 7 execuções, com o mesmo algoritmo em cada linguagem. Rode `benchmarks/run.sh` (ou `benchmarks/bench.py --fly <caminho>`). O script também confere se as saídas batem entre os runtimes.
 
-| carga | fly | Node 22 | Python 3 |
-| --- | ---: | ---: | ---: |
-| `fib(30)`, recursão | 285 ms | 46 ms | 105 ms |
-| laço de 20M com `%` | 1479 ms | 62 ms | 1718 ms |
-| `map`/`filter`/`reduce` em 1M | 481 ms | 86 ms | 134 ms |
-| 1M objetos literais | 323 ms | 31 ms | 281 ms |
-| 200k concatenações de string | 19 ms | 57 ms | 44 ms |
+| carga | fly | fly com PGO | Node 22 | Python 3 |
+| --- | ---: | ---: | ---: | ---: |
+| `fib(30)`, recursão | 135 ms | **102 ms** | 37 ms | 114 ms |
+| laço de 20M com `%` | 366 ms | **292 ms** | 57 ms | 1465 ms |
+| `map`/`filter`/`reduce` em 1M | 286 ms | **275 ms** | 93 ms | 134 ms |
+| 1M objetos literais | 142 ms | **104 ms** | 30 ms | 214 ms |
+| 200k concatenações de string | 8 ms | **8 ms** | 37 ms | 22 ms |
+
+Os números do Node incluem cerca de 25 ms de inicialização do processo. A variação entre rodadas nesta máquina é de cerca de 10%. Antes desta rodada de otimização, o fly levava 270, 1482, 461, 276 e 14 ms nas mesmas cargas: sem PGO, ficou entre 1,6× e 4× mais rápido.
 
 Outras medidas:
 
 | | fly | Node 22 | Python 3 |
 | --- | ---: | ---: | ---: |
-| tamanho do executável | **727 KB** | 118 MB | — |
-| inicialização (`-e 'console.log(1)'`) | **2 ms** | 27 ms | 15 ms |
+| tamanho do executável | **736 KB** | 118 MB | — |
+| inicialização (`-e 'console.log(1)'`) | **2 ms** | 24 ms | 15 ms |
 | memória de pico, 1M inteiros em array | **18 MB** | 80 MB | 48 MB |
 
-**Leitura honesta**: o fly ainda **não é "ultra rápido"**. Ele fica na faixa de um interpretador como o CPython: à frente só em laço numérico e concatenação de string, e atrás em chamadas de função, `map`/`filter` e criação de objetos. O Node é bem mais rápido em código pesado, porque usa JIT. O que o fly já entrega com vantagem clara é o **tamanho**, a **inicialização** e o **consumo de memória**, o que importa para scripts e ferramentas de linha de comando. Ganhar velocidade de verdade exige as etapas do roadmap abaixo.
+**Leitura honesta**: com PGO, o fly é mais rápido que o CPython em `fib` (por pouco), laço, objetos e strings. Ainda fica atrás em `map`/`filter`/`reduce`, porque cada callback paga o custo de uma chamada de função, que é o maior gargalo restante. O Node continua muito mais rápido em código pesado, porque compila para código de máquina com JIT. O fly não chega perto do Node em velocidade pura. O que ele entrega com vantagem clara é o tamanho, a inicialização e o consumo de memória.
+
+**Build com PGO**: `scripts/pgo-build.sh` treina o binário com os próprios benchmarks e fixtures e recompila com esse perfil, em cerca de 25 s. Precisa do componente `llvm-tools` do rustup (`rustup component add llvm-tools`). Dá cerca de 15 a 25% nos benchmarks. O `cargo build --release` comum continua funcionando sem ele.
+
+**Otimizações feitas**:
+
+- **Superinstruções**: `local < constante` com salto, `local + - * % constante`, `x += e` e `x = x + e` sem empilhar o valor antigo, `x = e` e `x++` sem valor residual, `obj.prop` lido direto de uma variável, e laços com o teste no fim (um salto a menos por iteração).
+- **Células só onde preciso**: uma variável vira célula (`Rc<RefCell>`) só quando uma função interna usa o nome dela. Antes, uma função com qualquer closure guardava todas as variáveis em células.
+- **Chaves compartilhadas**: nomes de propriedade ficam numa tabela do bytecode e são `Rc<str>` reaproveitados. Objetos literais não copiam as chaves a cada criação.
+- **Chamadas nativas sem alocação**: os argumentos vão para um buffer reaproveitado, e os callbacks de array recebem os valores por movimento.
+- **Escalares sem `drop`**: sobrescrever ou descartar um número não chama o destrutor do valor.
 
 ## Arquitetura
 
@@ -111,7 +123,7 @@ código-fonte
 Pontos de projeto:
 
 - **Módulos** são funções embrulhadas, como no CommonJS do Node: `exports`, `require`, `module`, `__filename`, `__dirname`.
-- **Closures**: uma função que contém outras funções guarda suas variáveis em células (`Rc<RefCell>`), que as funções internas compartilham. Funções sem closures usam só slots da pilha.
+- **Closures**: só as variáveis cujo nome é usado por uma função interna vão para células (`Rc<RefCell>`), que as funções internas compartilham. As demais ficam em slots da pilha, mesmo em funções que contêm closures.
 - **Strings** são `Rc<String>`. Em `s += x` (e `s = s + x`) a string é estendida no lugar quando a referência é única, então montar uma string em laço é linear.
 - **Event loop**: `nextTick` roda antes de qualquer timer. Timers ficam numa heap de (prazo, id). Erros não tratados imprimem `Uncaught …` e saem com código 1.
 - **Pilha de recursão**: recursão JavaScript pura estoura em `RangeError` (10 mil frames). Chamadas que passam por built-ins (como um callback de `map`) são limitadas a 2 mil, e o interpretador roda numa thread com 256 MB de pilha.
@@ -119,15 +131,17 @@ Pontos de projeto:
 ## Testes
 
 ```sh
-cargo test --release
+cargo test --release   # os fixtures rodam no binário otimizado
+cargo test             # e no de debug, com as asserções de limites ligadas
 ```
 
-Os scripts em `tests/fixtures/*.fly` são executados e a saída é comparada com os arquivos `.out`. Os `.out` foram conferidos contra o **Node.js 22**: todos batem, exceto `fs_path` e `require_local`, que dependem de decisões próprias do fly (`Buffer` e resolução de `.fly`).
+Os scripts em `tests/fixtures/*.fly` são executados e a saída é comparada com os arquivos `.out`. Os `.out` foram conferidos contra o **Node.js 22**: todos batem, exceto `fs_path` e `require_local`, que dependem de decisões próprias do fly (`Buffer` e resolução de `.fly`). O fixture `fast_paths` cobre os caminhos otimizados: superinstruções com tipos mistos, `+=` cujo lado direito altera a própria variável, laços com `continue`, células só onde necessário e reuso de slots.
 
 ## Roadmap
 
-1. **VM com registradores** e instruções fundidas para operações com constantes, reduzindo o tráfego da pilha. É o próximo passo mais direto para laços e chamadas.
-2. **Valores com NaN-boxing**, para evitar contagem de referências em cada cópia de número.
-3. **Caches inline** para acesso a propriedades (hoje é busca linear nas chaves do objeto).
-4. **Promises, async/await, classes e destructuring**, que são as partes de sintaxe mais usadas do Node moderno.
-5. **JIT** para código quente (por exemplo com Cranelift), o caminho para competir com o Node em código numérico.
+1. **Registradores em vez de pilha** para expressões. Hoje cada operação passa pela pilha em memória, e isso domina as chamadas e os laços.
+2. **Valores com NaN-boxing**, para que números não tenham contagem de referências nem destrutor.
+3. **Callbacks sem reentrada** no interpretador, para `map`, `filter` e `reduce` ficarem tão rápidos quanto um laço comum.
+4. **Caches inline** para propriedades (hoje busca linear) e para métodos de array (hoje comparação de texto a cada chamada).
+5. **Promises, async/await, classes e destructuring**, que são as partes de sintaxe mais usadas do Node moderno.
+6. **JIT** para código quente (por exemplo com Cranelift), o caminho para competir com o Node em código numérico.

@@ -1,0 +1,70 @@
+function sw(kind) {
+  const out = [];
+  switch (kind) {
+    case "a": {
+      let captured = "A";
+      out.push(() => captured);
+      break;
+    }
+    case "b": {
+      let plain = "B";
+      out.push(plain + "!");
+    }
+    default: {
+      let other = 0;
+      out.push(() => other + 1);
+    }
+  }
+  return out.map((f) => (typeof f === "function" ? f() : f));
+}
+console.log(JSON.stringify([sw("a"), sw("b"), sw("zzz")]));
+
+const keys = [];
+for (const k in { x: 1, y: 2, z: 3 }) {
+  if (k === "y") continue;
+  keys.push(() => k + "1");
+}
+console.log(JSON.stringify(keys.map((f) => f())));
+
+const log = [];
+for (let i = 0; i < 6; i++) {
+  switch (i % 3) {
+    case 0:
+      log.push("zero");
+      continue;
+    case 1:
+      log.push("one");
+      break;
+    default:
+      log.push("other" + i);
+  }
+  log.push("after" + i);
+}
+console.log(JSON.stringify(log));
+
+const counter = {
+  base: 10,
+  add(list) {
+    return list.map(function (x) { return x + this.base; }, this);
+  },
+};
+console.log(JSON.stringify(counter.add([1, 2])));
+
+function outer(n) {
+  let acc = 0;
+  function step(k) {
+    acc += k;
+    return acc;
+  }
+  let last = 0;
+  for (let i = 1; i <= n; i++) last = step(i);
+  return [acc, last];
+}
+console.log(JSON.stringify(outer(4)));
+
+let tally = 0;
+const bump = () => tally++;
+for (let i = 0; i < 3; i++) bump();
+let s = "";
+for (let i = 0; i < 3; i++) s = s + i + ",";
+console.log(tally, s, typeof tally, typeof s);

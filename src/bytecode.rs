@@ -3,6 +3,8 @@
 //! The VM is a stack machine. Each function frame owns a window of the value stack:
 //! `[callee, this, arg0 .. argN, locals .., temporaries ..]`. Locals that are captured
 //! by closures are stored as heap cells (`Value::Cell`) and accessed via `*Boxed` ops.
+//! All other locals are read and written in place. Common instruction pairs are fused
+//! into superinstructions, such as `AddLK` (`local + constant`).
 
 use std::rc::Rc;
 
@@ -25,26 +27,38 @@ pub enum Op {
     // locals (slot index into the frame window)
     GetLocal(u32),
     SetLocal(u32),
+    /// Pops the top of the stack into a plain local.
+    PopToLocal(u32),
     NewCell(u32),
     GetBoxed(u32),
     SetBoxed(u32),
     BoxParam(u32),
     Rebox(u32),
-    /// `x += rhs` on a local. Operands are [old value of x, rhs]; leaves the new value.
+    /// `x += rhs` on a plain local where `rhs` cannot write to `x`. Pops `rhs` and stores
+    /// `x + rhs` in place, without pushing a result.
+    AddToLocal(u32),
+    /// `x += rhs` in any other case. Operands are [old value of x, rhs]; leaves the new value.
     ConcatLocal(u32),
     /// `x++` / `x--` on a plain local whose value is not used.
     IncLocal(u32),
     DecLocal(u32),
+    /// `local.name` read directly from a plain local (operands: slot, name index).
+    GetLocalProp(u32, u32),
+    // superinstructions: a plain local and a constant (operands: slot, constant index)
+    AddLK(u32, u32),
+    SubLK(u32, u32),
+    MulLK(u32, u32),
+    ModLK(u32, u32),
     // captured variables
     GetUpval(u32),
     SetUpval(u32),
-    // globals (operand: constant index of the name)
+    // globals (operand: name index)
     GetGlobal(u32),
     /// Like `GetGlobal`, but yields `undefined` instead of throwing (used by `typeof`).
     GetGlobalOrUndef(u32),
     SetGlobal(u32),
     ConstAssign(u32),
-    // properties
+    // properties (operand: name index)
     GetProp(u32),
     SetProp(u32),
     GetIndex,
@@ -78,6 +92,13 @@ pub enum Op {
     JumpIfNotLe(u32),
     JumpIfNotGt(u32),
     JumpIfNotGe(u32),
+    /// `local < constant` (operands: slot, constant index, target) and `local < local`
+    /// (operands: slot, slot, target), each jumping when the test is true.
+    JumpIfLtLK(u32, u32, u32),
+    JumpIfLtLL(u32, u32, u32),
+    /// The same two tests, jumping when they are false.
+    JumpIfNotLtLK(u32, u32, u32),
+    JumpIfNotLtLL(u32, u32, u32),
     AndJump(u32),
     OrJump(u32),
     NullishJump(u32),
@@ -94,7 +115,8 @@ pub enum Op {
     /// Calls with arguments taken from an array on top of the stack (spread in calls).
     CallSpread,
     NewSpread,
-    NewObject,
+    /// Pushes an empty object; the operand is a capacity hint for its property list.
+    NewObject(u32),
     InitProp(u32),
     ToKeys,
     // exceptions
@@ -119,7 +141,11 @@ pub struct Proto {
     pub code: Vec<Op>,
     /// Source line of each instruction, parallel to `code`.
     pub lines: Vec<u32>,
+    /// Constant values (numbers and string literals).
     pub consts: Vec<Value>,
+    /// Property and variable names. Shared as `Rc<str>`, so objects built from literals
+    /// reuse these keys instead of copying them.
+    pub names: Vec<Rc<str>>,
     pub protos: Vec<Rc<Proto>>,
     pub upvals: Vec<UpvalDesc>,
     pub nparams: u32,

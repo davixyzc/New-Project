@@ -136,57 +136,57 @@ fn str_arg(args: &[Value], i: usize) -> String {
     to_str(&arg(args, i))
 }
 
-fn char_at_method(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn char_at_method(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_str(&this);
-    let i = to_num(&arg(&args, 0));
+    let i = to_num(&arg(args, 0));
     let i = if i.is_nan() { 0 } else { i as usize };
     Ok(Value::str(
         &char_at(&s, i).map(String::from).unwrap_or_default(),
     ))
 }
 
-fn char_code_at(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn char_code_at(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_str(&this);
-    let i = to_num(&arg(&args, 0));
+    let i = to_num(&arg(args, 0));
     let i = if i.is_nan() { 0 } else { i as usize };
     Ok(Value::Num(
         char_at(&s, i).map_or(f64::NAN, |c| c as u32 as f64),
     ))
 }
 
-fn index_of(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn index_of(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_str(&this);
-    let found = match s.find(&str_arg(&args, 0)) {
+    let found = match s.find(&str_arg(args, 0)) {
         Some(byte) => s[..byte].chars().count() as f64,
         None => -1.0,
     };
     Ok(Value::Num(found))
 }
 
-fn includes(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(Value::Bool(this_str(&this).contains(&str_arg(&args, 0))))
+fn includes(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Bool(this_str(&this).contains(&str_arg(args, 0))))
 }
 
-fn starts_with(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(Value::Bool(this_str(&this).starts_with(&str_arg(&args, 0))))
+fn starts_with(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Bool(this_str(&this).starts_with(&str_arg(args, 0))))
 }
 
-fn ends_with(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(Value::Bool(this_str(&this).ends_with(&str_arg(&args, 0))))
+fn ends_with(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Bool(this_str(&this).ends_with(&str_arg(args, 0))))
 }
 
-fn slice(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn slice(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let chars: Vec<char> = this_str(&this).chars().collect();
-    let (s, e) = bounds(chars.len(), &arg(&args, 0), &arg(&args, 1));
+    let (s, e) = bounds(chars.len(), &arg(args, 0), &arg(args, 1));
     Ok(Value::str(&chars[s..e].iter().collect::<String>()))
 }
 
-fn substring(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn substring(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let chars: Vec<char> = this_str(&this).chars().collect();
     let len = chars.len() as f64;
     let clamp = |v: f64| if v.is_nan() { 0.0 } else { v.clamp(0.0, len) } as usize;
-    let a = clamp(to_num(&arg(&args, 0)));
-    let b = match arg(&args, 1) {
+    let a = clamp(to_num(&arg(args, 0)));
+    let b = match arg(args, 1) {
         Value::Undef => chars.len(),
         v => clamp(to_num(&v)),
     };
@@ -194,29 +194,29 @@ fn substring(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value
     Ok(Value::str(&chars[s..e].iter().collect::<String>()))
 }
 
-fn to_upper(_vm: &mut Vm, this: Value, _args: Vec<Value>) -> Result<Value, Value> {
+fn to_upper(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(Value::str(&this_str(&this).to_uppercase()))
 }
 
-fn to_lower(_vm: &mut Vm, this: Value, _args: Vec<Value>) -> Result<Value, Value> {
+fn to_lower(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(Value::str(&this_str(&this).to_lowercase()))
 }
 
-fn trim(_vm: &mut Vm, this: Value, _args: Vec<Value>) -> Result<Value, Value> {
+fn trim(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(Value::str(this_str(&this).trim()))
 }
 
-fn trim_start(_vm: &mut Vm, this: Value, _args: Vec<Value>) -> Result<Value, Value> {
+fn trim_start(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(Value::str(this_str(&this).trim_start()))
 }
 
-fn trim_end(_vm: &mut Vm, this: Value, _args: Vec<Value>) -> Result<Value, Value> {
+fn trim_end(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(Value::str(this_str(&this).trim_end()))
 }
 
-fn split(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn split(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_str(&this);
-    let parts: Vec<Value> = match arg(&args, 0) {
+    let parts: Vec<Value> = match arg(args, 0) {
         Value::Undef => vec![Value::str(&s)],
         sep => {
             let sep = to_str(&sep);
@@ -230,17 +230,17 @@ fn split(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
     Ok(Value::arr(parts))
 }
 
-fn repeat(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let n = to_num(&arg(&args, 0));
+fn repeat(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let n = to_num(&arg(args, 0));
     let n = if n.is_nan() { 0 } else { n as usize };
     Ok(Value::str(&this_str(&this).repeat(n)))
 }
 
-fn replace(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn replace(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_str(&this);
     Ok(Value::str(&s.replacen(
-        &str_arg(&args, 0),
-        &str_arg(&args, 1),
+        &str_arg(args, 0),
+        &str_arg(args, 1),
         1,
     )))
 }
@@ -263,28 +263,28 @@ fn pad(this: &Value, args: &[Value], at_start: bool) -> Value {
     Value::str(&text)
 }
 
-fn pad_start(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(pad(&this, &args, true))
+fn pad_start(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(pad(&this, args, true))
 }
 
-fn pad_end(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    Ok(pad(&this, &args, false))
+fn pad_end(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(pad(&this, args, false))
 }
 
-fn concat(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+fn concat(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let mut s = this_str(&this);
-    for v in &args {
+    for v in args {
         s.push_str(&to_str(v));
     }
     Ok(Value::str(&s))
 }
 
-fn to_string(_vm: &mut Vm, this: Value, _args: Vec<Value>) -> Result<Value, Value> {
+fn to_string(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(Value::str(&this_str(&this)))
 }
 
-fn to_fixed(_vm: &mut Vm, this: Value, args: Vec<Value>) -> Result<Value, Value> {
-    let digits = to_num(&arg(&args, 0));
+fn to_fixed(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let digits = to_num(&arg(args, 0));
     let digits = if digits.is_nan() {
         0
     } else {
@@ -313,6 +313,6 @@ fn to_fixed_text(x: f64, digits: usize) -> String {
     }
 }
 
-fn number_to_string(_vm: &mut Vm, this: Value, _args: Vec<Value>) -> Result<Value, Value> {
+fn number_to_string(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
     Ok(Value::str(&num_to_string(to_num(&this))))
 }

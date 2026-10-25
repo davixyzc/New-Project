@@ -10,7 +10,8 @@ use crate::vm::Vm;
 pub type Props = Vec<(Rc<str>, Value)>;
 pub type ObjRef = Rc<RefCell<Props>>;
 pub type ArrRef = Rc<RefCell<Vec<Value>>>;
-pub type NativeFn = fn(&mut Vm, Value, Vec<Value>) -> Result<Value, Value>;
+/// Arguments arrive as a borrowed slice, so calls do not allocate.
+pub type NativeFn = fn(&mut Vm, Value, &[Value]) -> Result<Value, Value>;
 
 /// A built-in function. Lives in a `static` table, so values can point at it directly.
 pub struct NativeDef {
@@ -51,7 +52,11 @@ impl Value {
     }
 
     pub fn obj() -> Value {
-        Value::Obj(Rc::new(RefCell::new(Vec::new())))
+        Value::obj_with(0)
+    }
+
+    pub fn obj_with(capacity: usize) -> Value {
+        Value::Obj(Rc::new(RefCell::new(Vec::with_capacity(capacity))))
     }
 
     pub fn is_object(&self) -> bool {
@@ -64,6 +69,15 @@ impl Value {
     pub fn is_nullish(&self) -> bool {
         matches!(self, Value::Undef | Value::Null)
     }
+
+    /// True when dropping the value releases a reference. Scalars need no drop at all.
+    #[inline(always)]
+    pub fn owns_ref(&self) -> bool {
+        matches!(
+            self,
+            Value::Str(_) | Value::Arr(_) | Value::Obj(_) | Value::Func(_) | Value::Cell(_)
+        )
+    }
 }
 
 /// Sets (or replaces) an own property on a plain object.
@@ -72,6 +86,15 @@ pub fn obj_set(obj: &ObjRef, name: &str, v: Value) {
     match props.iter().position(|(k, _)| &**k == name) {
         Some(i) => props[i].1 = v,
         None => props.push((Rc::from(name), v)),
+    }
+}
+
+/// Sets an own property using a key that is already shared, so no string is copied.
+pub fn obj_put(obj: &ObjRef, key: &Rc<str>, v: Value) {
+    let mut props = obj.borrow_mut();
+    match props.iter().position(|(k, _)| **k == **key) {
+        Some(i) => props[i].1 = v,
+        None => props.push((key.clone(), v)),
     }
 }
 
