@@ -264,6 +264,26 @@ pub fn obj_get_key(obj: &ObjRef, key: &Rc<str>) -> Option<Value> {
     props.position_of_key(key).map(|i| props.value(i).clone())
 }
 
+/// A hasher for names, which are short: a rotate and a multiply per byte. The default hasher is built for long keys
+/// and is slow on short ones, and a built-in such as `Math` is looked up by name each time it is used.
+#[derive(Default)]
+pub struct NameHasher(u64);
+
+impl std::hash::Hasher for NameHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+}
+
+/// A table keyed by name, using the name hasher.
+pub type NameMap<V> = HashMap<Rc<str>, V, std::hash::BuildHasherDefault<NameHasher>>;
+
 thread_local! {
     static NAMES: RefCell<std::collections::HashMap<Box<str>, Rc<str>>> = RefCell::new(Default::default());
 }

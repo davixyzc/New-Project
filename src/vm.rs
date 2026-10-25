@@ -407,7 +407,7 @@ pub struct Timer {
 pub struct Vm {
     pub stack: Vec<Value>,
     pub frames: FrameStack,
-    pub globals: HashMap<Rc<str>, Value>,
+    pub globals: NameMap<Value>,
     /// Module objects (`{ exports }`) keyed by absolute path, so each file runs once.
     pub modules: HashMap<PathBuf, Value>,
     pub out: BufWriter<Stdout>,
@@ -505,7 +505,7 @@ impl Vm {
         let mut vm = Vm {
             stack: Vec::with_capacity(1024),
             frames: FrameStack::new(),
-            globals: HashMap::new(),
+            globals: NameMap::default(),
             modules: HashMap::new(),
             out: BufWriter::new(std::io::stdout()),
             ticks: VecDeque::new(),
