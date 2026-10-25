@@ -206,6 +206,12 @@ impl Asm {
         self.op(Some(0xF2), false, &[0x0F, 0x10], dst, Rm::Reg(src));
     }
 
+    /// `movapd dst, src`: copies a whole xmm register. Unlike `movsd` it does not merge with the
+    /// old value of `dst`, so it adds no dependency on that value.
+    pub fn movapd_rr(&mut self, dst: u8, src: u8) {
+        self.op(Some(0x66), false, &[0x0F, 0x28], dst, Rm::Reg(src));
+    }
+
     /// `addsd`, `mulsd`, `subsd` or `divsd` (`op` is one of the `SSE_` constants).
     pub fn sse(&mut self, op: u8, dst: u8, src: u8) {
         self.op(Some(0xF2), false, &[0x0F, op], dst, Rm::Reg(src));
@@ -404,6 +410,11 @@ mod tests {
         assert_eq!(
             encode(|a| a.movq_to_xmm(1, RAX)),
             [0x66, 0x48, 0x0F, 0x6E, 0xC8]
+        );
+        assert_eq!(encode(|a| a.movapd_rr(1, 2)), [0x66, 0x0F, 0x28, 0xCA]);
+        assert_eq!(
+            encode(|a| a.movapd_rr(9, 2)),
+            [0x66, 0x44, 0x0F, 0x28, 0xCA]
         );
         assert_eq!(encode(|a| a.idiv32(RCX)), [0xF7, 0xF9]);
         assert_eq!(encode(|a| a.cdq()), [0x99]);

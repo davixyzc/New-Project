@@ -200,6 +200,63 @@ fn jump_target(op: Op) -> Option<u32> {
     }
 }
 
+/// The xmm registers that can hold local numbers. xmm0 and xmm1 stay free as scratch registers.
+const CACHE_REGS: std::ops::Range<u8> = 2..10;
+
+/// The locals that a fast path reads or writes as a number.
+fn local_uses(op: Op) -> Vec<u32> {
+    match op {
+        Op::GetLocal(i)
+        | Op::PopToLocal(i)
+        | Op::SetLocal(i)
+        | Op::IncLocal(i)
+        | Op::DecLocal(i)
+        | Op::AddToLocal(i) => vec![i],
+        Op::AddLK(s, _) | Op::SubLK(s, _) | Op::MulLK(s, _) | Op::ModLK(s, _) => vec![s],
+        Op::JumpIfLtLK(s, _, _) | Op::JumpIfNotLtLK(s, _, _) => vec![s],
+        Op::JumpIfLtLL(p, q, _) | Op::JumpIfNotLtLL(p, q, _) => vec![p, q],
+        _ => Vec::new(),
+    }
+}
+
+/// Picks the locals whose numbers stay in xmm registers while the code runs. A loop's counter and
+/// accumulator are read and written on every iteration, and a trip through the frame adds the
+/// latency of a store and a load to each step. Only locals used inside loops are chosen, the most
+/// used first. A cached register always holds the payload of its slot, so it is only read when the
+/// tag says number, and it is reloaded whenever the slot is written by other code.
+fn cached_locals(proto: &Proto) -> Vec<Option<u8>> {
+    let n = proto.code.len();
+    // How many loops each instruction is in. A jump back from `ip` to `t` makes `t..=ip` a loop.
+    let mut loops = vec![0u64; n];
+    for (ip, &op) in proto.code.iter().enumerate() {
+        for (t, _) in successors(op, ip, 0) {
+            if t < n && t <= ip {
+                for count in &mut loops[t..=ip] {
+                    *count += 1;
+                }
+            }
+        }
+    }
+    let mut uses = vec![0u64; proto.nlocals as usize];
+    for (ip, &op) in proto.code.iter().enumerate() {
+        if loops[ip] == 0 {
+            continue;
+        }
+        for i in local_uses(op) {
+            if let Some(count) = uses.get_mut(i as usize) {
+                *count += loops[ip];
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..uses.len()).filter(|&i| uses[i] > 0).collect();
+    order.sort_by_key(|&i| (std::cmp::Reverse(uses[i]), i));
+    let mut cache = vec![None; uses.len()];
+    for (reg, i) in CACHE_REGS.zip(order) {
+        cache[i] = Some(reg);
+    }
+    cache
+}
+
 /// An argument of a value helper: the VM, an immediate, or the address of a value.
 #[derive(Clone, Copy)]
 enum Arg {
@@ -241,6 +298,8 @@ struct Gen<'a> {
     threw: Label,
     /// Leaves the function after it returned.
     done: Label,
+    /// The xmm register that holds each local's number, for the locals used in loops.
+    cache: Vec<Option<u8>>,
 }
 
 impl<'a> Gen<'a> {
@@ -258,6 +317,7 @@ impl<'a> Gen<'a> {
             slow: Vec::new(),
             threw,
             done,
+            cache: cached_locals(proto),
         }
     }
 
@@ -326,6 +386,47 @@ impl<'a> Gen<'a> {
         self.a.mov_store8(dst.at(1), RAX);
     }
 
+    /// The xmm register that holds local `i`'s number, if it has one.
+    fn cached(&self, i: u32) -> Option<u8> {
+        self.cache.get(i as usize).copied().flatten()
+    }
+
+    /// Copies local `i`'s number into xmm `x`. The local must hold a number.
+    fn load_num(&mut self, i: u32, x: u8) {
+        match self.cached(i) {
+            Some(r) => self.a.movapd_rr(x, r),
+            None => {
+                let m = self.local(i).at(8);
+                self.a.movsd_load(x, m);
+            }
+        }
+    }
+
+    /// Stores the number in xmm `x` as local `i`'s payload, and keeps the register in step.
+    fn store_payload(&mut self, i: u32, x: u8) {
+        let m = self.local(i).at(8);
+        self.a.movsd_store(m, x);
+        if let Some(r) = self.cached(i) {
+            self.a.movapd_rr(r, x);
+        }
+    }
+
+    /// Reloads local `i`'s register after its frame slot was written by other code.
+    fn reload_local(&mut self, i: u32) {
+        if let Some(r) = self.cached(i) {
+            let m = self.local(i).at(8);
+            self.a.movsd_load(r, m);
+        }
+    }
+
+    /// Reloads every cached local. Helpers can write any frame slot, and they clobber every xmm
+    /// register, so this follows each call and comes first in the function.
+    fn reload_all(&mut self) {
+        for i in 0..self.cache.len() {
+            self.reload_local(i as u32);
+        }
+    }
+
     /// After `ucomisd xmm1, xmm0` (which compares y with x): jumps to `t` when `x < y` if
     /// `when_less`, and when `x < y` is false otherwise. NaN makes `x < y` false.
     fn jump_on_less(&mut self, when_less: bool, t: u32) {
@@ -338,11 +439,11 @@ impl<'a> Gen<'a> {
     fn step_local(&mut self, i: u32, sse: u8, slow: Label) -> Fast {
         let x = self.local(i);
         self.check_tag(x, TAG_NUM, slow);
-        self.a.movsd_load(0, x.at(8));
+        self.load_num(i, 0);
         self.a.mov_imm64(RAX, 1f64.to_bits());
         self.a.movq_to_xmm(1, RAX);
         self.a.sse(sse, 0, 1);
-        self.a.movsd_store(x.at(8), 0);
+        self.store_payload(i, 0);
         Fast::Guarded
     }
 
@@ -354,7 +455,7 @@ impl<'a> Gen<'a> {
         let dst = self.temp(d);
         let (zero, nonzero, store) = (self.a.label(), self.a.label(), self.a.label());
         self.check_tag(x, TAG_NUM, slow);
-        self.a.movsd_load(0, x.at(8));
+        self.load_num(i, 0);
         self.a.cvttsd2si(RAX, 0);
         self.a.cvtsi2sd(1, RAX);
         // The integer converted back must equal x. A NaN compares unordered, which the parity check catches.
@@ -391,6 +492,7 @@ impl<'a> Gen<'a> {
     /// Loads the frame address the helper returned, since the stack may have moved.
     fn after_helper(&mut self, jump: Option<u32>) {
         self.a.mov_rr(R12, RDX);
+        self.reload_all();
         if let Some(t) = jump {
             self.a.cmp32_imm8(RAX, STATUS_JUMP as u8);
             let target = self.target(t);
@@ -424,6 +526,7 @@ impl<'a> Gen<'a> {
         }
         self.a.mov_imm64(RAX, func as u64);
         self.a.call_reg(RAX);
+        self.reload_all();
     }
 
     /// Runs a call or construct (`flags` is `rt::CALL_NEW` and/or `rt::CALL_SPREAD`).
@@ -463,6 +566,7 @@ impl<'a> Gen<'a> {
         self.a.sub_rsp(8);
         self.a.mov_rr(RBX, RDI);
         self.a.mov_rr(R12, RSI);
+        self.reload_all();
         self.a.jmp_reg(RDX);
     }
 
@@ -585,6 +689,7 @@ impl<'a> Gen<'a> {
                 self.check_plain(src, slow);
                 self.check_plain(dst, slow);
                 self.copy(src, dst);
+                self.reload_local(i);
                 let assign = rt::assign_clone as *const () as usize;
                 Fast::Direct(assign, vec![Arg::Addr(src), Arg::Addr(dst)])
             }
@@ -593,6 +698,7 @@ impl<'a> Gen<'a> {
                 let (src, dst) = (self.temp(d - 1), self.local(i));
                 self.check_plain(dst, slow);
                 self.copy(src, dst);
+                self.reload_local(i);
                 let move_ = rt::move_into as *const () as usize;
                 Fast::Direct(move_, vec![Arg::Addr(src), Arg::Addr(dst)])
             }
@@ -651,10 +757,10 @@ impl<'a> Gen<'a> {
                 let (rhs, x) = (self.temp(d - 1), self.local(i));
                 self.check_tag(rhs, TAG_NUM, slow);
                 self.check_tag(x, TAG_NUM, slow);
-                self.a.movsd_load(0, x.at(8));
+                self.load_num(i, 0);
                 self.a.movsd_load(1, rhs.at(8));
                 self.a.sse(SSE_ADD, 0, 1);
-                self.a.movsd_store(x.at(8), 0);
+                self.store_payload(i, 0);
                 Fast::Guarded
             }
             Op::AddLK(s, k) | Op::SubLK(s, k) | Op::MulLK(s, k) => {
@@ -668,7 +774,7 @@ impl<'a> Gen<'a> {
                 };
                 let (x, dst) = (self.local(s), self.temp(d));
                 self.check_tag(x, TAG_NUM, slow);
-                self.a.movsd_load(0, x.at(8));
+                self.load_num(s, 0);
                 self.a.mov_imm64(RAX, c.to_bits());
                 self.a.movq_to_xmm(1, RAX);
                 self.a.sse(sse, 0, 1);
@@ -793,7 +899,7 @@ impl<'a> Gen<'a> {
                 };
                 let x = self.local(s);
                 self.check_tag(x, TAG_NUM, slow);
-                self.a.movsd_load(0, x.at(8));
+                self.load_num(s, 0);
                 self.a.mov_imm64(RAX, c.to_bits());
                 self.a.movq_to_xmm(1, RAX);
                 self.jump_on_less(matches!(op, Op::JumpIfLtLK(..)), t);
@@ -803,8 +909,8 @@ impl<'a> Gen<'a> {
                 let (x, y) = (self.local(p), self.local(q));
                 self.check_tag(x, TAG_NUM, slow);
                 self.check_tag(y, TAG_NUM, slow);
-                self.a.movsd_load(0, x.at(8));
-                self.a.movsd_load(1, y.at(8));
+                self.load_num(p, 0);
+                self.load_num(q, 1);
                 self.jump_on_less(matches!(op, Op::JumpIfLtLL(..)), t);
                 Fast::Guarded
             }
@@ -881,5 +987,35 @@ mod tests {
         let (depth, deepest) = depths(&proto).unwrap();
         assert_eq!(depth, [0, 1, 2, 1, 0, 1, 0, 1]);
         assert_eq!(deepest, 2);
+    }
+
+    #[test]
+    fn loop_locals_get_registers_by_use() {
+        let proto = Proto {
+            name: String::new(),
+            file: Rc::from(""),
+            // A loop that counts local 1 and adds to local 0, with local 2 outside it.
+            code: vec![
+                Op::JumpIfNotLtLK(1, 0, 6),
+                Op::IncLocal(1),
+                Op::AddLK(0, 0),
+                Op::PopToLocal(0),
+                Op::Jump(0),
+                Op::Undef,
+                Op::Return,
+            ],
+            lines: vec![0; 7],
+            consts: vec![Value::Num(0.0)],
+            names: Vec::new(),
+            protos: Vec::new(),
+            upvals: Vec::new(),
+            nparams: 0,
+            has_rest: false,
+            nlocals: 3,
+            is_arrow: false,
+            native: Default::default(),
+        };
+        // Locals 0 and 1 are each used twice in the loop, so they get the first two registers.
+        assert_eq!(cached_locals(&proto), [Some(2), Some(3), None]);
     }
 }

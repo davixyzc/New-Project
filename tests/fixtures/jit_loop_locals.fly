@@ -1,0 +1,67 @@
+// Locals used in a loop are kept in registers while it runs. These loops change the kind of a
+// local, call functions, and throw, and each one must see the current values afterwards.
+
+function kinds(n) {
+  let sum = 0;
+  let text = "";
+  let flag = false;
+  for (let i = 0; i < n; i++) {
+    sum += i;
+    if (i === 3) text += "x";
+    if (i === 5) sum = "five";
+    if (i === 6) sum = 10;
+    if (i === 8) flag = !flag;
+  }
+  console.log(sum, text, flag);
+}
+
+function add(a, b) {
+  return a + b;
+}
+
+function calls(n) {
+  let acc = 0;
+  for (let i = 0; i < n; i++) {
+    acc = add(acc, i);
+    acc += 1;
+  }
+  console.log(acc);
+}
+
+function thrown(limit) {
+  let i = 0;
+  let total = 0;
+  try {
+    while (true) {
+      i++;
+      total += i;
+      if (i === limit) throw total;
+    }
+  } catch (e) {
+    console.log(i, total, e);
+  }
+}
+
+function strings() {
+  let s = "5";
+  let count = 0;
+  for (let i = 0; i < 4; i++) {
+    s++;
+    count += s;
+  }
+  console.log(s, count);
+}
+
+function negzero() {
+  let z = -0;
+  for (let i = 0; i < 3; i++) {
+    z = z * 1;
+  }
+  console.log(1 / z);
+}
+
+kinds(10);
+calls(5);
+thrown(4);
+strings();
+negzero();
