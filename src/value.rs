@@ -369,6 +369,19 @@ pub fn add(a: &Value, b: &Value) -> Value {
     }
 }
 
+/// The longest text the string operations build, in bytes. It is V8's limit, which V8 counts in characters.
+pub const MAX_STRING_LEN: usize = (1 << 29) - 24;
+
+/// Whether joining `a` and `b` would give a string over `MAX_STRING_LEN`. Only string operands are measured,
+/// since their size is known without converting them.
+pub fn joins_too_long(a: &Value, b: &Value) -> bool {
+    let size = |v: &Value| match v {
+        Value::Str(s) => s.len(),
+        _ => 0,
+    };
+    size(a) + size(b) > MAX_STRING_LEN
+}
+
 /// `old + rhs` where `old` is owned. A string held only by `old` is extended in place,
 /// which keeps loops that build a string linear instead of quadratic.
 pub fn concat_owned(old: Value, rhs: Value) -> Value {

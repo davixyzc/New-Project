@@ -1,0 +1,15 @@
+// The builtins that now follow JavaScript: split with a limit, the keys of a string, repeat and padding limits, and
+// a numeric function that overflows the native stack inside a loop with try.
+console.log("a,b,c".split(",", 2).join("|"), "abc".split("", 2).join("-"), "a,b".split(",", 0).length, "a,b,c".split(",", -1).length, "a,b".split(",", NaN).length);
+console.log(Object.keys("ab").join(","), Object.values("ab").join(","), Object.entries("ab").map(p => p.join(":")).join(" "));
+for (const k in "xy") console.log("k", k);
+try { "x".repeat(1e10); } catch (e) { console.log(e.name, e.message); }
+try { "x".repeat(-1); } catch (e) { console.log(e.name, e.message); }
+try { "x".repeat(Infinity); } catch (e) { console.log(e.name, e.message); }
+console.log("".repeat(1e12) === "", "ab".repeat(3), "x".repeat(0) === "");
+try { "x".padStart(Infinity, "a"); } catch (e) { console.log(e.name, e.message); }
+console.log("7".padStart(3, "0"), "abc".padEnd(2, "z"), "x".padStart(4, "ab"));
+function f(k) { return f(k + 1) + 1; }
+let n = 0;
+for (let i = 0; i < 20; i++) { try { f(0); } catch (e) { n++; } }
+console.log(n, "fim");

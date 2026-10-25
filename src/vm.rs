@@ -18,7 +18,7 @@ use crate::value::*;
 /// Maximum nesting of JavaScript-level calls before a RangeError is thrown.
 const MAX_FRAMES: usize = 10_000;
 /// Largest array index that `arr[i] = v` will grow the array to.
-const MAX_ARRAY_GROW: usize = 50_000_000;
+pub(crate) const MAX_ARRAY_GROW: usize = 50_000_000;
 /// JavaScript calls made from Rust (e.g. a `map` callback) recurse on the Rust stack,
 /// so they are capped separately from `MAX_FRAMES`.
 const MAX_NESTED_CALLS: usize = 2_000;
@@ -424,6 +424,9 @@ pub struct Vm {
     /// The exception that native code reported, waiting for the dispatcher to take it.
     pub(crate) pending: Option<Value>,
     pub argv: Vec<String>,
+    /// Set after a native numeric call ran out of stack. Native calls stay off above this many frames, until the
+    /// call that ran out returns (see `native_suspended`).
+    native_off: Option<usize>,
 }
 
 /// Discards a value. Scalars own nothing, so their drop glue is skipped; others are dropped.
@@ -484,6 +487,7 @@ impl Vm {
             arg_buf: Vec::new(),
             pending: None,
             argv,
+            native_off: None,
         };
         builtins::install(&mut vm);
         vm
@@ -1126,6 +1130,23 @@ impl Vm {
         Some(code as *const Native)
     }
 
+    /// Whether native numeric calls are suspended. They are while the frames above the one that ran out of native
+    /// stack run, so the calls made from there do not each recurse natively to the limit again.
+    pub(crate) fn native_suspended(&mut self) -> bool {
+        match self.native_off {
+            Some(depth) if self.frames.len() > depth => true,
+            _ => {
+                self.native_off = None;
+                false
+            }
+        }
+    }
+
+    /// Suspends native numeric calls above the frame that is running now (see `native_suspended`).
+    pub(crate) fn suspend_native(&mut self) {
+        self.native_off = Some(self.frames.len());
+    }
+
     pub(crate) fn call_op(&mut self, argc: usize, is_new: bool, spread: bool) -> Result<(), Value> {
         let argc = if spread {
             let list = self.pop();
@@ -1367,6 +1388,9 @@ impl Vm {
             Op::AddToLocal(i) => {
                 let rhs = self.pop();
                 let idx = base + i as usize;
+                if joins_too_long(self.local(idx), &rhs) {
+                    return Err(self.make_error("RangeError", "Invalid string length"));
+                }
                 // Moving the value out first lets a string be extended in place.
                 let old = std::mem::replace(self.local_mut(idx), Value::Undef);
                 let result = match (&old, &rhs) {
@@ -1383,6 +1407,9 @@ impl Vm {
             Op::ConcatLocal(i) => {
                 let rhs = self.pop();
                 let old = self.pop();
+                if joins_too_long(&old, &rhs) {
+                    return Err(self.make_error("RangeError", "Invalid string length"));
+                }
                 let idx = base + i as usize;
                 let result = match (&old, &rhs) {
                     (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
@@ -1522,6 +1549,9 @@ impl Vm {
                 Some((x, y)) => self.replace_top2(Value::Num(x + y)),
                 None => {
                     let (a, b) = self.pop_pair();
+                    if joins_too_long(&a, &b) {
+                        return Err(self.make_error("RangeError", "Invalid string length"));
+                    }
                     self.stack.push(add(&a, &b));
                 }
             },

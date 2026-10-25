@@ -414,6 +414,7 @@ fn keys_of(v: &Value) -> Vec<String> {
             order.into_iter().map(|i| props[i].0.to_string()).collect()
         }
         Value::Arr(a) => (0..a.borrow().len()).map(|i| i.to_string()).collect(),
+        Value::Str(s) => (0..s.chars().count()).map(|i| i.to_string()).collect(),
         _ => Vec::new(),
     }
 }
@@ -426,6 +427,11 @@ fn value_of_key(v: &Value, key: &str) -> Value {
             .ok()
             .and_then(|i| a.borrow().get(i).cloned())
             .unwrap_or(Value::Undef),
+        Value::Str(s) => key
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| s.chars().nth(i))
+            .map_or(Value::Undef, |c| Value::str(&c.to_string())),
         _ => Value::Undef,
     }
 }

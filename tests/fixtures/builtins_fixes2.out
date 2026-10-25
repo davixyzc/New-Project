@@ -1,0 +1,11 @@
+a|b a-b 0 3 0
+0,1 a,b 0:a 1:b
+k 0
+k 1
+RangeError Invalid string length
+RangeError Invalid count value: -1
+RangeError Invalid count value: Infinity
+true ababab true
+RangeError Invalid string length
+007 abc abax
+20 fim

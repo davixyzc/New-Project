@@ -2,7 +2,7 @@
 
 use crate::builtins::arg;
 use crate::builtins::array::bounds;
-use crate::value::{num_to_string, to_num, to_str, NativeDef, Value};
+use crate::value::{num_to_string, to_num, to_str, NativeDef, Value, MAX_STRING_LEN};
 use crate::vm::Vm;
 
 pub static METHODS: &[NativeDef] = &[
@@ -254,7 +254,7 @@ fn trim_end(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> 
 
 fn split(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_str(&this);
-    let parts: Vec<Value> = match arg(args, 0) {
+    let mut parts: Vec<Value> = match arg(args, 0) {
         Value::Undef => vec![Value::str(&s)],
         sep => {
             let sep = to_str(&sep);
@@ -265,13 +265,34 @@ fn split(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
             }
         }
     };
+    // The optional limit keeps that many pieces. It is read as ToUint32 reads it.
+    if !matches!(arg(args, 1), Value::Undef) {
+        let limit = to_num(&arg(args, 1));
+        let limit = if limit.is_finite() {
+            limit.trunc().rem_euclid(4_294_967_296.0) as usize
+        } else {
+            0
+        };
+        parts.truncate(limit);
+    }
     Ok(Value::arr(parts))
 }
 
-fn repeat(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+fn repeat(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let n = to_num(&arg(args, 0));
-    let n = if n.is_nan() { 0 } else { n as usize };
-    Ok(Value::str(&this_str(&this).repeat(n)))
+    let n = if n.is_nan() { 0.0 } else { n.trunc() };
+    if n < 0.0 || n.is_infinite() {
+        let text = to_str(&Value::Num(n));
+        return Err(vm.make_error("RangeError", &format!("Invalid count value: {}", text)));
+    }
+    let s = this_str(&this);
+    if s.is_empty() {
+        return Ok(Value::str(""));
+    }
+    if n * char_len(&s) as f64 > MAX_STRING_LEN as f64 {
+        return Err(vm.make_error("RangeError", "Invalid string length"));
+    }
+    Ok(Value::str(&s.repeat(n as usize)))
 }
 
 fn replace(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -284,35 +305,41 @@ fn replace(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 /// Pads to `width` characters, repeating `fill` at the start (or end) of the string.
-fn pad(this: &Value, args: &[Value], at_start: bool) -> Value {
+fn pad(vm: &mut Vm, this: &Value, args: &[Value], at_start: bool) -> Result<Value, Value> {
     let s = this_str(this);
     let width = to_num(&arg(args, 0));
-    let width = if width.is_nan() { 0 } else { width as usize };
+    let width = if width.is_nan() { 0.0 } else { width.trunc() };
     let fill = match arg(args, 1) {
         Value::Undef => " ".to_string(),
         v => to_str(&v),
     };
     let len = char_len(&s);
-    if width <= len || fill.is_empty() {
-        return Value::str(&s);
+    if width <= len as f64 || fill.is_empty() {
+        return Ok(Value::str(&s));
     }
-    let padding: String = fill.chars().cycle().take(width - len).collect();
+    if width > MAX_STRING_LEN as f64 {
+        return Err(vm.make_error("RangeError", "Invalid string length"));
+    }
+    let padding: String = fill.chars().cycle().take(width as usize - len).collect();
     let text = if at_start { padding + &s } else { s + &padding };
-    Value::str(&text)
+    Ok(Value::str(&text))
 }
 
-fn pad_start(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(pad(&this, args, true))
+fn pad_start(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    pad(vm, &this, args, true)
 }
 
-fn pad_end(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(pad(&this, args, false))
+fn pad_end(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    pad(vm, &this, args, false)
 }
 
-fn concat(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+fn concat(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let mut s = this_str(&this);
     for v in args {
         s.push_str(&to_str(v));
+        if s.len() > MAX_STRING_LEN {
+            return Err(vm.make_error("RangeError", "Invalid string length"));
+        }
     }
     Ok(Value::str(&s))
 }

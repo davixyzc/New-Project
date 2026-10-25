@@ -134,6 +134,9 @@ pub unsafe extern "C" fn call_plain(
 /// arguments it uses are numbers. Returns false, and leaves the stack as it is, when the call must run
 /// in the interpreter.
 fn call_plain_numbers(vm: &mut Vm, argc: usize) -> bool {
+    if vm.native_suspended() {
+        return false;
+    }
     let idx = vm.stack.len() - argc - 2;
     let closure = match &vm.stack[idx] {
         Value::Func(c) => Rc::clone(c),
@@ -153,6 +156,9 @@ fn call_plain_numbers(vm: &mut Vm, argc: usize) -> bool {
         }
     }
     let Some(out) = call_numbers(&closure, &args[..n]) else {
+        // The native stack ran out, so the interpreter makes this call. The calls it makes from there run in the
+        // interpreter too, until this call returns, instead of recursing natively to the limit each time.
+        vm.suspend_native();
         return false;
     };
     // The result replaces the callee, and the `this` and the arguments above it are dropped.

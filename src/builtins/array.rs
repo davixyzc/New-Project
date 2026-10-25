@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 
 use crate::builtins::arg;
 use crate::value::{strict_eq, to_num, to_str, truthy, ArrRef, NativeDef, Value};
-use crate::vm::{Callback, Vm};
+use crate::vm::{Callback, Vm, MAX_ARRAY_GROW};
 
 pub static METHODS: &[NativeDef] = &[
     NativeDef {
@@ -220,6 +220,18 @@ fn join(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
 
 fn concat(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let a = array_of(vm, &this)?;
+    // The size of the result is known before anything is copied, so a huge concat fails without allocating.
+    let total = a.borrow().len()
+        + args
+            .iter()
+            .map(|v| match v {
+                Value::Arr(b) => b.borrow().len(),
+                _ => 1,
+            })
+            .sum::<usize>();
+    if total > MAX_ARRAY_GROW {
+        return Err(vm.make_error("RangeError", "Invalid array length"));
+    }
     let mut out = a.borrow().clone();
     for v in args {
         match v {
