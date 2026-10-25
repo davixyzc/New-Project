@@ -1,0 +1,26 @@
+const o = { a: 1, b: undefined };
+console.log("a" in o, "b" in o, "c" in o, "toString" in o === false || true, 0 in [5], 3 in [5], "length" in [1], "0" in ["x"]);
+let k = "b";
+console.log(k in o, !("z" in o), (1 + 1) in [1, 2, 3]);
+let p = null, q = 0, r = "keep";
+p ||= "filled";
+q ||= 7;
+r &&= r + "!";
+let s;
+s ??= "default";
+let t = 5;
+t &&= 0;
+console.log(p, q, r, s, t);
+const cfg = { mode: null, n: 3 };
+cfg.mode ??= "auto";
+cfg.n ||= 99;
+cfg.zero ||= "z";
+console.log(cfg.mode, cfg.n, cfg.zero);
+const arr = [0, 1];
+arr[0] ||= 5;
+arr[1] &&= 9;
+console.log(arr.join(","));
+for (const key in o) console.log("key", key);
+let idx = 0;
+for (idx in [7, 8]) console.log("idx", idx);
+try { "x" in 5; } catch (e) { console.log(e.name); }

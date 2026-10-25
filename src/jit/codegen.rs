@@ -170,6 +170,7 @@ pub(super) fn delta(op: Op) -> i32 {
         | Op::Shl
         | Op::Shr
         | Op::UShr
+        | Op::In
         | Op::Eq
         | Op::Ne
         | Op::StrictEq

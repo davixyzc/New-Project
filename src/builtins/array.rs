@@ -91,6 +91,26 @@ pub static METHODS: &[NativeDef] = &[
         name: "toString",
         func: to_string_method,
     },
+    NativeDef {
+        name: "splice",
+        func: splice,
+    },
+    NativeDef {
+        name: "flat",
+        func: flat,
+    },
+    NativeDef {
+        name: "reduceRight",
+        func: reduce_right,
+    },
+    NativeDef {
+        name: "at",
+        func: at,
+    },
+    NativeDef {
+        name: "fill",
+        func: fill,
+    },
 ];
 
 /// The `push` method. It is the first entry of `METHODS`, and the VM runs it in place (see
@@ -238,6 +258,97 @@ fn last_index_of(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Valu
         .rev()
         .find(|&i| strict_eq(&items[i], &target));
     Ok(Value::Num(found.map_or(-1.0, |i| i as f64)))
+}
+
+/// `splice(start, deleteCount, ...items)`: removes items from the array and inserts `items` in their place. The
+/// removed items are returned. With no `deleteCount`, everything from `start` on is removed.
+fn splice(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let a = array_of(vm, &this)?;
+    let len = a.borrow().len();
+    let (start, _) = bounds(len, &arg(args, 0), &Value::Undef);
+    let count = match args.len() {
+        0 => 0,
+        1 => len - start,
+        _ => {
+            let n = to_num(&args[1]);
+            let n = if n.is_nan() { 0.0 } else { n.trunc() };
+            n.clamp(0.0, (len - start) as f64) as usize
+        }
+    };
+    let items = args.iter().skip(2).cloned();
+    let removed: Vec<Value> = a.borrow_mut().splice(start..start + count, items).collect();
+    Ok(Value::arr(removed))
+}
+
+/// `flat(depth)`: the items with nested arrays flattened `depth` levels down (one by default).
+fn flat(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let a = array_of(vm, &this)?;
+    let depth = match arg(args, 0) {
+        Value::Undef => 1.0,
+        v => to_num(&v).trunc(),
+    };
+    let mut out = Vec::new();
+    flatten_into(&a.borrow(), depth, &mut out);
+    Ok(Value::arr(out))
+}
+
+fn flatten_into(items: &[Value], depth: f64, out: &mut Vec<Value>) {
+    for item in items {
+        match item {
+            Value::Arr(inner) if depth >= 1.0 => flatten_into(&inner.borrow(), depth - 1.0, out),
+            other => out.push(other.clone()),
+        }
+    }
+}
+
+/// `reduceRight(f, initial)`: `reduce` from the end of the array.
+fn reduce_right(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let a = array_of(vm, &this)?;
+    let f = arg(args, 0);
+    let mut cb = Callback::new(vm, &f, Value::Undef);
+    let len = a.borrow().len();
+    let (mut acc, end) = if args.len() >= 2 {
+        (args[1].clone(), len)
+    } else if len == 0 {
+        cb.finish(vm);
+        return Err(vm.make_error("TypeError", "Reduce of empty array with no initial value"));
+    } else {
+        (element(&a, len - 1).unwrap_or(Value::Undef), len - 1)
+    };
+    for i in (0..end).rev() {
+        let item = match element(&a, i) {
+            Some(v) => v,
+            None => break,
+        };
+        acc = cb.call(vm, [acc, item, Value::Num(i as f64), this.clone()])?;
+    }
+    cb.finish(vm);
+    Ok(acc)
+}
+
+/// `at(index)`: the item at `index`, counting a negative index from the end. Outside the array is undefined.
+fn at(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let a = array_of(vm, &this)?;
+    let len = a.borrow().len() as f64;
+    let n = to_num(&arg(args, 0));
+    let n = if n.is_nan() { 0.0 } else { n.trunc() };
+    let i = if n < 0.0 { len + n } else { n };
+    if i < 0.0 || i >= len {
+        return Ok(Value::Undef);
+    }
+    Ok(element(&a, i as usize).unwrap_or(Value::Undef))
+}
+
+/// `fill(value, start, end)`: sets the items in the range to `value`, and returns the array.
+fn fill(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let a = array_of(vm, &this)?;
+    let len = a.borrow().len();
+    let (start, end) = bounds(len, &arg(args, 1), &arg(args, 2));
+    let value = arg(args, 0);
+    for slot in &mut a.borrow_mut()[start..end] {
+        *slot = value.clone();
+    }
+    Ok(this)
 }
 
 /// `Array.prototype.toString`: the items joined with commas, as `String(array)` gives.

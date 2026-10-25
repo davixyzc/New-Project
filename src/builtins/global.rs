@@ -1,10 +1,11 @@
 //! Global functions, the Object/Array/Date/Math/process namespaces, and `require`.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::builtins::{arg, fs, table_object};
-use crate::value::{key_order, obj_set, to_num, to_str, truthy, NativeDef, Value};
+use crate::value::{key_order, obj_set, to_int32, to_num, to_str, truthy, NativeDef, Value};
 use crate::vm::Vm;
 
 pub static FUNCTIONS: &[NativeDef] = &[
@@ -94,6 +95,10 @@ pub static OBJECT: &[NativeDef] = &[
     NativeDef {
         name: "entries",
         func: object_entries,
+    },
+    NativeDef {
+        name: "assign",
+        func: object_assign,
     },
 ];
 
@@ -193,6 +198,42 @@ pub static MATH: &[NativeDef] = &[
         name: "random",
         func: random,
     },
+    NativeDef {
+        name: "imul",
+        func: imul,
+    },
+    NativeDef {
+        name: "hypot",
+        func: hypot,
+    },
+    NativeDef {
+        name: "cbrt",
+        func: cbrt,
+    },
+    NativeDef {
+        name: "log2",
+        func: log2,
+    },
+    NativeDef {
+        name: "log10",
+        func: log10,
+    },
+    NativeDef {
+        name: "log1p",
+        func: log1p,
+    },
+    NativeDef {
+        name: "expm1",
+        func: expm1,
+    },
+    NativeDef {
+        name: "clz32",
+        func: clz32,
+    },
+    NativeDef {
+        name: "fround",
+        func: fround,
+    },
 ];
 
 /// `require` is also reachable as a global; modules get their own copy as a parameter.
@@ -235,8 +276,176 @@ pub fn math_object() -> Value {
     if let Value::Obj(o) = &math {
         obj_set(o, "PI", Value::Num(std::f64::consts::PI));
         obj_set(o, "E", Value::Num(std::f64::consts::E));
+        obj_set(o, "LN2", Value::Num(std::f64::consts::LN_2));
+        obj_set(o, "LN10", Value::Num(std::f64::consts::LN_10));
+        obj_set(o, "LOG2E", Value::Num(std::f64::consts::LOG2_E));
+        obj_set(o, "LOG10E", Value::Num(std::f64::consts::LOG10_E));
+        obj_set(o, "SQRT2", Value::Num(std::f64::consts::SQRT_2));
+        obj_set(o, "SQRT1_2", Value::Num(std::f64::consts::FRAC_1_SQRT_2));
     }
     math
+}
+
+/// `Object.assign(target, ...sources)`: copies the own properties of each source onto the target, in order.
+fn object_assign(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let target = arg(args, 0);
+    let Value::Obj(t) = &target else {
+        return Err(vm.make_error("TypeError", "Object.assign needs an object as its target"));
+    };
+    for source in args.iter().skip(1) {
+        if let Value::Obj(s) = source {
+            let props: Vec<(Rc<str>, Value)> = s.borrow().iter().cloned().collect();
+            for (key, v) in props {
+                crate::value::obj_put(t, &key, v);
+            }
+        }
+    }
+    Ok(target)
+}
+
+fn imul(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let a = to_int32(to_num(&arg(args, 0)));
+    let b = to_int32(to_num(&arg(args, 1)));
+    Ok(Value::Num(f64::from(a.wrapping_mul(b))))
+}
+
+/// `Math.hypot(...values)`: the square root of the sum of the squares. An infinite value makes the result infinite
+/// even when another value is NaN.
+fn hypot(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let values: Vec<f64> = args.iter().map(|v| to_num(v).abs()).collect();
+    if values.iter().any(|x| x.is_infinite()) {
+        return Ok(Value::Num(f64::INFINITY));
+    }
+    if values.iter().any(|x| x.is_nan()) {
+        return Ok(Value::Num(f64::NAN));
+    }
+    Ok(Value::Num(values.iter().map(|x| x * x).sum::<f64>().sqrt()))
+}
+
+fn cbrt(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(to_num(&arg(args, 0)).cbrt()))
+}
+
+fn log2(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(to_num(&arg(args, 0)).log2()))
+}
+
+fn log10(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(to_num(&arg(args, 0)).log10()))
+}
+
+fn log1p(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(to_num(&arg(args, 0)).ln_1p()))
+}
+
+fn expm1(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(to_num(&arg(args, 0)).exp_m1()))
+}
+
+/// `Math.clz32(x)`: the number of leading zero bits of `x` as an unsigned 32-bit integer.
+fn clz32(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let x = to_int32(to_num(&arg(args, 0))) as u32;
+    Ok(Value::Num(f64::from(x.leading_zeros())))
+}
+
+/// `Math.fround(x)`: `x` rounded to the nearest single-precision float.
+fn fround(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(f64::from(to_num(&arg(args, 0)) as f32)))
+}
+
+/// The function members of `Number` and `String`. Those constructors are plain functions, so their members are found
+/// by name (see `native_static`).
+pub static NUMBER_STATICS: &[NativeDef] = &[
+    NativeDef {
+        name: "isInteger",
+        func: number_is_integer,
+    },
+    NativeDef {
+        name: "isSafeInteger",
+        func: number_is_safe_integer,
+    },
+    NativeDef {
+        name: "isFinite",
+        func: number_is_finite,
+    },
+    NativeDef {
+        name: "isNaN",
+        func: number_is_nan,
+    },
+    NativeDef {
+        name: "parseFloat",
+        func: parse_float,
+    },
+    NativeDef {
+        name: "parseInt",
+        func: parse_int,
+    },
+];
+
+pub static STRING_STATICS: &[NativeDef] = &[NativeDef {
+    name: "fromCharCode",
+    func: from_char_code,
+}];
+
+/// The member `name` of the built-in `owner`, such as `Number.isInteger` or `Number.MAX_SAFE_INTEGER`.
+pub fn native_static(owner: &str, name: &str) -> Option<Value> {
+    let table = match owner {
+        "Number" => NUMBER_STATICS,
+        "String" => STRING_STATICS,
+        _ => return None,
+    };
+    if let Some(def) = table.iter().find(|d| d.name == name) {
+        return Some(Value::Native(def));
+    }
+    match (owner, name) {
+        ("Number", "MAX_SAFE_INTEGER") => Some(Value::Num(9_007_199_254_740_991.0)),
+        ("Number", "MIN_SAFE_INTEGER") => Some(Value::Num(-9_007_199_254_740_991.0)),
+        ("Number", "EPSILON") => Some(Value::Num(f64::EPSILON)),
+        ("Number", "MAX_VALUE") => Some(Value::Num(f64::MAX)),
+        ("Number", "MIN_VALUE") => Some(Value::Num(f64::from_bits(1))),
+        ("Number", "NaN") => Some(Value::Num(f64::NAN)),
+        ("Number", "POSITIVE_INFINITY") => Some(Value::Num(f64::INFINITY)),
+        ("Number", "NEGATIVE_INFINITY") => Some(Value::Num(f64::NEG_INFINITY)),
+        _ => None,
+    }
+}
+
+fn number_is_integer(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Bool(
+        matches!(arg(args, 0), Value::Num(n) if n.is_finite() && n.trunc() == n),
+    ))
+}
+
+fn number_is_safe_integer(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Bool(matches!(
+        arg(args, 0),
+        Value::Num(n) if n.is_finite() && n.trunc() == n && n.abs() <= 9_007_199_254_740_991.0
+    )))
+}
+
+fn number_is_finite(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Bool(
+        matches!(arg(args, 0), Value::Num(n) if n.is_finite()),
+    ))
+}
+
+fn number_is_nan(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Bool(
+        matches!(arg(args, 0), Value::Num(n) if n.is_nan()),
+    ))
+}
+
+/// `String.fromCharCode(...codes)`: the characters with those UTF-16 code units. A lone surrogate has no character
+/// in fly's UTF-8 strings, so it reads as U+FFFD.
+fn from_char_code(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let text: String = args
+        .iter()
+        .map(|v| {
+            let unit = (to_int32(to_num(v)) as u32) & 0xffff;
+            char::from_u32(unit).unwrap_or('\u{fffd}')
+        })
+        .collect();
+    Ok(Value::str(&text))
 }
 
 // ----- errors and conversions ------------------------------------------------

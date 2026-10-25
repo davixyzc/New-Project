@@ -91,6 +91,8 @@ pub enum Op {
     Shr,
     UShr,
     BitNot,
+    /// `key in object`: pops the object and the key, and pushes whether the object has the key.
+    In,
     // control flow (operand: absolute instruction index)
     Jump(u32),
     JumpIfFalse(u32),

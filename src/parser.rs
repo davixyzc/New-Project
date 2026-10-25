@@ -615,6 +615,9 @@ impl Parser {
                         | "<<="
                         | ">>="
                         | ">>>="
+                        | "&&="
+                        | "||="
+                        | "??="
                 ) =>
             {
                 *p
@@ -624,6 +627,23 @@ impl Parser {
         check_target(&left).map_err(|_| self.unexpected("assignment target"))?;
         self.pos += 1;
         let right = self.assign()?;
+        // `a ||= b` is `a || (a = b)`, and likewise for `&&=` and `??=`. The target is read twice, so it must be a
+        // name or a property of a name, which reads the same both times.
+        let short_circuit = match op {
+            "&&=" => Some("&&"),
+            "||=" => Some("||"),
+            "??=" => Some("??"),
+            _ => None,
+        };
+        if let Some(logic) = short_circuit {
+            if !is_plain_target(&left) {
+                return Err(self.unexpected(
+                    "a name or a property of a name as the target of `&&=`, `||=` or `??=`",
+                ));
+            }
+            let assign = Expr::Assign("=", Box::new(left.clone()), Box::new(right));
+            return Ok(Expr::Logical(logic, Box::new(left), Box::new(assign)));
+        }
         Ok(Expr::Assign(op, Box::new(left), Box::new(right)))
     }
 
@@ -640,8 +660,12 @@ impl Parser {
 
     fn binary(&mut self, min: u8) -> Result<Expr, String> {
         let mut left = self.unary()?;
-        while let Tok::Punct(p) = self.peek() {
-            let op = *p;
+        loop {
+            let op: &'static str = match self.peek() {
+                Tok::Punct(p) => *p,
+                Tok::Ident(s) if s.as_str() == "in" => "in",
+                _ => break,
+            };
             let prec = match binop_prec(op) {
                 Some(p) if p >= min => p,
                 _ => break,
@@ -882,6 +906,18 @@ impl Parser {
     }
 }
 
+/// A name, or a property of a name, which reads and writes the same place each time it is used.
+fn is_plain_target(e: &Expr) -> bool {
+    match e {
+        Expr::Ident(_) => true,
+        Expr::Member(obj, _) => matches!(&**obj, Expr::Ident(_)),
+        Expr::Index(obj, key) => {
+            matches!(&**obj, Expr::Ident(_)) && matches!(&**key, Expr::Ident(_) | Expr::Num(_))
+        }
+        _ => false,
+    }
+}
+
 fn check_target(e: &Expr) -> Result<(), ()> {
     match e {
         Expr::Ident(_) | Expr::Member(..) | Expr::Index(..) => Ok(()),
@@ -898,7 +934,7 @@ fn binop_prec(op: &str) -> Option<u8> {
         "^" => 5,
         "&" => 6,
         "==" | "!=" | "===" | "!==" => 7,
-        "<" | "<=" | ">" | ">=" => 8,
+        "<" | "<=" | ">" | ">=" | "in" => 8,
         "<<" | ">>" | ">>>" => 9,
         "+" | "-" => 10,
         "*" | "/" | "%" => 11,

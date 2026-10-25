@@ -344,6 +344,7 @@ fn binop(op: &str) -> Op {
         "<<" => Op::Shl,
         ">>" => Op::Shr,
         ">>>" => Op::UShr,
+        "in" => Op::In,
         _ => unreachable!("unknown binary operator {}", op),
     }
 }

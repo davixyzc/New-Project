@@ -92,6 +92,14 @@ pub static METHODS: &[NativeDef] = &[
         name: "toString",
         func: to_string,
     },
+    NativeDef {
+        name: "at",
+        func: at_method,
+    },
+    NativeDef {
+        name: "codePointAt",
+        func: code_point_at,
+    },
 ];
 
 pub static NUMBER_METHODS: &[NativeDef] = &[
@@ -390,6 +398,30 @@ fn concat(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
         }
     }
     Ok(Value::str(&s))
+}
+
+/// `at(index)`: the character at `index`, counting a negative index from the end. Outside the string is undefined.
+fn at_method(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let s = this_str(&this);
+    let len = char_len(&s) as f64;
+    let n = to_num(&arg(args, 0));
+    let n = if n.is_nan() { 0.0 } else { n.trunc() };
+    let i = if n < 0.0 { len + n } else { n };
+    if i < 0.0 || i >= len {
+        return Ok(Value::Undef);
+    }
+    Ok(char_at(&s, i as usize).map_or(Value::Undef, crate::value::char_value))
+}
+
+/// `codePointAt(index)`: the code point of the character at `index`, or undefined outside the string.
+fn code_point_at(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let s = this_str(&this);
+    Ok(
+        match index_arg(&arg(args, 0)).and_then(|i| char_at(&s, i)) {
+            Some(c) => Value::Num(f64::from(u32::from(c))),
+            None => Value::Undef,
+        },
+    )
 }
 
 fn to_string(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {

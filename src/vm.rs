@@ -1616,6 +1616,31 @@ impl Vm {
                 self.stack
                     .push(Value::Num(f64::from(!to_int32(to_num(&a)))));
             }
+            Op::In => {
+                let (key, target) = self.pop_pair();
+                let name = to_str(&key);
+                let found = match &target {
+                    Value::Obj(o) => o.borrow().position(&name).is_some(),
+                    Value::Arr(a) => {
+                        let len = a.borrow().len();
+                        match &key {
+                            Value::Num(n) => index_of(*n).is_some_and(|i| i < len),
+                            _ => {
+                                name == "length" || array_key_index(&name).is_some_and(|i| i < len)
+                            }
+                        }
+                    }
+                    _ => {
+                        let msg = format!(
+                            "Cannot use 'in' operator to search for '{}' in {}",
+                            name,
+                            to_str(&target)
+                        );
+                        return Err(self.make_error("TypeError", &msg));
+                    }
+                };
+                self.stack.push(Value::Bool(found));
+            }
             Op::Mod => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Num(js_mod(x, y))),
                 None => {
@@ -1949,7 +1974,7 @@ impl Vm {
                 if name == "name" {
                     Value::str(d.name)
                 } else {
-                    Value::Undef
+                    builtins::global::native_static(d.name, name).unwrap_or(Value::Undef)
                 }
             }
             Value::Undef | Value::Null => {
