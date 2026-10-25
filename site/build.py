@@ -132,6 +132,14 @@ def run(cmd, cwd):
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def scrub(result, folder):
+    """Tira o diretório temporário da saída: o nome aleatório mudaria a página a cada build."""
+    def clean(text):
+        return text.replace(folder + os.sep, "").replace(folder, ".")
+    rc, out, err = result
+    return rc, clean(out), clean(err)
+
+
 def run_example(ex):
     """Roda o exemplo com o fly e, se pedido, com o Node no mesmo diretório."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -145,8 +153,8 @@ def run_example(ex):
             args = ex.get("args", [])
             fly_cmd = [FLY, ex["file"], *args]
             node_cmd = [NODE, ex["file"], *args]
-        fly = run(fly_cmd, tmp)
-        node = run(node_cmd, tmp) if ex.get("node", True) else None
+        fly = scrub(run(fly_cmd, tmp), tmp)
+        node = scrub(run(node_cmd, tmp), tmp) if ex.get("node", True) else None
     return fly, node
 
 
@@ -156,7 +164,7 @@ def probe_result(code, runtime):
         name = "probe.fly" if runtime == "fly" else "probe.js"
         write_files(tmp, {name: code})
         cmd = [FLY, name] if runtime == "fly" else [NODE, name]
-        rc, out, err = run(cmd, tmp)
+        rc, out, err = scrub(run(cmd, tmp), tmp)
     if rc == 0:
         return out.rstrip() or "(sem saída)"
     first = next((line for line in err.splitlines() if line.strip()), "erro")
