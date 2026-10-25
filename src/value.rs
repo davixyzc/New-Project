@@ -252,11 +252,11 @@ fn could_tie(x: f64) -> bool {
 }
 
 pub fn to_str(v: &Value) -> String {
-    to_str_in(v, &mut Vec::new())
+    to_str_in(v, None)
 }
 
-/// `to_str`, where `joining` lists the arrays whose text is still being built further out.
-fn to_str_in(v: &Value, joining: &mut Vec<*const RefCell<Vec<Value>>>) -> String {
+/// `to_str`, where `joining` is the chain of arrays whose text is still being built further out.
+fn to_str_in(v: &Value, joining: Option<&Joining>) -> String {
     match v {
         Value::Undef => "undefined".to_string(),
         Value::Null => "null".to_string(),
@@ -270,28 +270,35 @@ fn to_str_in(v: &Value, joining: &mut Vec<*const RefCell<Vec<Value>>>) -> String
     }
 }
 
-/// Joins the items of an array with `sep`; a null or undefined item is empty. An array that is already in `joining`
-/// is empty too, so an array that contains itself ends there, as in `Array.prototype.join`.
-pub fn join_items(a: &ArrRef, sep: &str, joining: &mut Vec<*const RefCell<Vec<Value>>>) -> String {
+/// An array whose text is being built, and the arrays it sits in. Each one lives on the stack of its `join_items` call.
+pub struct Joining<'a> {
+    id: *const RefCell<Vec<Value>>,
+    outer: Option<&'a Joining<'a>>,
+}
+
+/// Joins the items of an array with `sep`; a null or undefined item is empty. An array that is already being joined
+/// further out is empty too, so an array that contains itself ends there, as in `Array.prototype.join`.
+pub fn join_items(a: &ArrRef, sep: &str, outer: Option<&Joining>) -> String {
     let id = Rc::as_ptr(a);
-    if joining.contains(&id) {
-        return String::new();
+    let mut link = outer;
+    while let Some(j) = link {
+        if j.id == id {
+            return String::new();
+        }
+        link = j.outer;
     }
-    joining.push(id);
-    let text = a
-        .borrow()
+    let joining = Joining { id, outer };
+    a.borrow()
         .iter()
         .map(|item| {
             if item.is_nullish() {
                 String::new()
             } else {
-                to_str_in(item, joining)
+                to_str_in(item, Some(&joining))
             }
         })
         .collect::<Vec<_>>()
-        .join(sep);
-    joining.pop();
-    text
+        .join(sep)
 }
 
 /// `Number(text)` for a string: decimal numbers, `0x`, `0o` and `0b` integers, and the names `Infinity` and
