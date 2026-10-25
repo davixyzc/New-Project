@@ -8,10 +8,16 @@ pub const RCX: u8 = 1;
 pub const RDX: u8 = 2;
 pub const RBX: u8 = 3;
 pub const RSP: u8 = 4;
+pub const RBP: u8 = 5;
 pub const RSI: u8 = 6;
 pub const RDI: u8 = 7;
 pub const R8: u8 = 8;
+pub const R9: u8 = 9;
+pub const R10: u8 = 10;
 pub const R12: u8 = 12;
+pub const R13: u8 = 13;
+pub const R14: u8 = 14;
+pub const R15: u8 = 15;
 
 /// Condition codes: the low nibble of `Jcc` and `SETcc`.
 pub const CC_B: u8 = 0x2;
@@ -20,9 +26,10 @@ pub const CC_E: u8 = 0x4;
 pub const CC_NE: u8 = 0x5;
 pub const CC_BE: u8 = 0x6;
 pub const CC_A: u8 = 0x7;
-pub const CC_NS: u8 = 0x9;
 pub const CC_P: u8 = 0xA;
 pub const CC_NP: u8 = 0xB;
+pub const CC_L: u8 = 0xC;
+pub const CC_G: u8 = 0xF;
 
 /// The second opcode byte of the scalar double operations (`F2 0F xx`).
 pub const SSE_ADD: u8 = 0x58;
@@ -184,11 +191,6 @@ impl Asm {
         self.op(None, true, &[0x89], src, Rm::Reg(dst));
     }
 
-    /// `mov dst32, src32`.
-    pub fn mov_rr32(&mut self, dst: u8, src: u8) {
-        self.op(None, false, &[0x89], src, Rm::Reg(dst));
-    }
-
     // ----- scalar doubles ---------------------------------------------------
 
     /// `movsd x, [m]`.
@@ -201,15 +203,15 @@ impl Asm {
         self.op(Some(0xF2), false, &[0x0F, 0x11], x, Rm::Mem(m));
     }
 
-    /// `movsd dst, src` between two xmm registers.
-    pub fn movsd_rr(&mut self, dst: u8, src: u8) {
-        self.op(Some(0xF2), false, &[0x0F, 0x10], dst, Rm::Reg(src));
-    }
-
     /// `movapd dst, src`: copies a whole xmm register. Unlike `movsd` it does not merge with the
     /// old value of `dst`, so it adds no dependency on that value.
     pub fn movapd_rr(&mut self, dst: u8, src: u8) {
         self.op(Some(0x66), false, &[0x0F, 0x28], dst, Rm::Reg(src));
+    }
+
+    /// `xorpd dst, src`: a bitwise xor of two xmm registers, which sets no flags.
+    pub fn xorpd(&mut self, dst: u8, src: u8) {
+        self.op(Some(0x66), false, &[0x0F, 0x57], dst, Rm::Reg(src));
     }
 
     /// `addsd`, `mulsd`, `subsd` or `divsd` (`op` is one of the `SSE_` constants).
@@ -240,14 +242,62 @@ impl Asm {
 
     // ----- integers and flags -----------------------------------------------
 
-    /// `cdq`: sign-extends eax into edx.
-    pub fn cdq(&mut self) {
-        self.code.push(0x99);
+    /// `movsxd dst, src32`: sign-extends a 32-bit register into 64 bits.
+    pub fn movsxd(&mut self, dst: u8, src: u8) {
+        self.op(None, true, &[0x63], dst, Rm::Reg(src));
     }
 
-    /// `idiv r32`: edx:eax divided by `r`; quotient in eax, remainder in edx.
-    pub fn idiv32(&mut self, r: u8) {
-        self.op(None, false, &[0xF7], 7, Rm::Reg(r));
+    /// `shr r64, imm8`.
+    pub fn shr64_imm(&mut self, r: u8, imm: u8) {
+        self.op(None, true, &[0xC1], 5, Rm::Reg(r));
+        self.code.push(imm);
+    }
+
+    /// `shl r64, imm8`.
+    pub fn shl64_imm(&mut self, r: u8, imm: u8) {
+        self.op(None, true, &[0xC1], 4, Rm::Reg(r));
+        self.code.push(imm);
+    }
+
+    /// `cmovs dst, src` (64-bit): copies `src` when the sign flag is set.
+    pub fn cmovs(&mut self, dst: u8, src: u8) {
+        self.op(None, true, &[0x0F, 0x48], dst, Rm::Reg(src));
+    }
+
+    /// `cmov<cc> dst, src` (64-bit): copies `src` when condition `cc` holds on the flags.
+    pub fn cmov(&mut self, cc: u8, dst: u8, src: u8) {
+        self.op(None, true, &[0x0F, 0x40 | cc], dst, Rm::Reg(src));
+    }
+
+    /// `movmskpd dst32, src`: the sign bits of the two doubles in `src`, in bits 0 and 1 of `dst`.
+    pub fn movmskpd(&mut self, dst: u8, src: u8) {
+        self.op(Some(0x66), false, &[0x0F, 0x50], dst, Rm::Reg(src));
+    }
+
+    /// `sub dst, src` (64-bit).
+    pub fn sub64(&mut self, dst: u8, src: u8) {
+        self.op(None, true, &[0x29], src, Rm::Reg(dst));
+    }
+
+    /// `imul dst, src` (64-bit): the low 64 bits of the product.
+    pub fn imul64(&mut self, dst: u8, src: u8) {
+        self.op(None, true, &[0x0F, 0xAF], dst, Rm::Reg(src));
+    }
+
+    /// `imul dst, src, imm32` (64-bit).
+    pub fn imul64_imm(&mut self, dst: u8, src: u8, imm: i32) {
+        self.op(None, true, &[0x69], dst, Rm::Reg(src));
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `neg r64`.
+    pub fn neg64(&mut self, r: u8) {
+        self.op(None, true, &[0xF7], 3, Rm::Reg(r));
+    }
+
+    /// `cvtsi2sd dst, src` with a 64-bit source.
+    pub fn cvtsi2sd64(&mut self, dst: u8, src: u8) {
+        self.op(Some(0xF2), true, &[0x0F, 0x2A], dst, Rm::Reg(src));
     }
 
     /// `test a32, b32`.
@@ -275,6 +325,18 @@ impl Asm {
     pub fn cmp64_imm8(&mut self, r: u8, imm: u8) {
         self.op(None, true, &[0x83], 7, Rm::Reg(r));
         self.code.push(imm);
+    }
+
+    /// `add r64, imm8` (a negative `imm` subtracts).
+    pub fn add64_imm8(&mut self, r: u8, imm: i8) {
+        self.op(None, true, &[0x83], 0, Rm::Reg(r));
+        self.code.push(imm as u8);
+    }
+
+    /// `cmp r64, imm32`.
+    pub fn cmp64_imm32(&mut self, r: u8, imm: i32) {
+        self.op(None, true, &[0x81], 7, Rm::Reg(r));
+        self.code.extend_from_slice(&imm.to_le_bytes());
     }
 
     /// `xor r32, imm8`.
@@ -326,6 +388,12 @@ impl Asm {
         self.op(None, false, &[0xFF], 2, Rm::Reg(r));
     }
 
+    /// `call` to a label in this code.
+    pub fn call_label(&mut self, label: Label) {
+        self.code.push(0xE8);
+        self.rel32(label);
+    }
+
     /// `jmp r64`.
     pub fn jmp_reg(&mut self, r: u8) {
         self.op(None, false, &[0xFF], 4, Rm::Reg(r));
@@ -355,6 +423,23 @@ impl Asm {
     pub fn sub_rsp(&mut self, imm: u8) {
         self.op(None, true, &[0x83], 5, Rm::Reg(RSP));
         self.code.push(imm);
+    }
+
+    /// `sub rsp, imm32`.
+    pub fn sub_rsp32(&mut self, imm: i32) {
+        self.op(None, true, &[0x81], 5, Rm::Reg(RSP));
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `add rsp, imm32`.
+    pub fn add_rsp32(&mut self, imm: i32) {
+        self.op(None, true, &[0x81], 0, Rm::Reg(RSP));
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `cmp a, b` (64-bit): the flags of `a - b`.
+    pub fn cmp_rr64(&mut self, a: u8, b: u8) {
+        self.op(None, true, &[0x39], b, Rm::Reg(a));
     }
 
     pub fn ret(&mut self) {
@@ -427,9 +512,12 @@ mod tests {
             encode(|a| a.movapd_rr(9, 2)),
             [0x66, 0x44, 0x0F, 0x28, 0xCA]
         );
-        assert_eq!(encode(|a| a.idiv32(RCX)), [0xF7, 0xF9]);
-        assert_eq!(encode(|a| a.cdq()), [0x99]);
-        assert_eq!(encode(|a| a.mov_rr32(R8, RAX)), [0x41, 0x89, 0xC0]);
+        assert_eq!(encode(|a| a.movsxd(RCX, RAX)), [0x48, 0x63, 0xC8]);
+        assert_eq!(encode(|a| a.neg64(R9)), [0x49, 0xF7, 0xD9]);
+        assert_eq!(
+            encode(|a| a.cvtsi2sd64(1, R9)),
+            [0xF2, 0x49, 0x0F, 0x2A, 0xC9]
+        );
         assert_eq!(encode(|a| a.test32(R8, R8)), [0x45, 0x85, 0xC0]);
         assert_eq!(encode(|a| a.btc_imm(RAX, 63)), [0x48, 0x0F, 0xBA, 0xF8, 63]);
         assert_eq!(encode(|a| a.bt(RCX, RAX)), [0x0F, 0xA3, 0xC1]);
@@ -439,6 +527,22 @@ mod tests {
         assert_eq!(encode(|a| a.cmp32_imm8(RAX, 2)), [0x83, 0xF8, 2]);
         assert_eq!(encode(|a| a.xor32_imm8(RAX, 1)), [0x83, 0xF0, 1]);
         assert_eq!(encode(|a| a.mov_imm32(R8, 5)), [0x41, 0xB8, 5, 0, 0, 0]);
+        assert_eq!(
+            encode(|a| a.cmp64_imm32(RAX, 5)),
+            [0x48, 0x81, 0xF8, 5, 0, 0, 0]
+        );
+        assert_eq!(encode(|a| a.xorpd(0, 0)), [0x66, 0x0F, 0x57, 0xC0]);
+        assert_eq!(
+            encode(|a| a.movmskpd(RDX, 9)),
+            [0x66, 0x41, 0x0F, 0x50, 0xD1]
+        );
+        assert_eq!(encode(|a| a.cmovs(R8, RCX)), [0x4C, 0x0F, 0x48, 0xC1]);
+        assert_eq!(encode(|a| a.shl64_imm(RDX, 63)), [0x48, 0xC1, 0xE2, 63]);
+        assert_eq!(encode(|a| a.cmp_rr64(RSP, R13)), [0x4C, 0x39, 0xEC]);
+        assert_eq!(
+            encode(|a| a.sub_rsp32(0x100)),
+            [0x48, 0x81, 0xEC, 0x00, 0x01, 0, 0]
+        );
     }
 
     #[test]
@@ -456,6 +560,16 @@ mod tests {
         assert_eq!(encode(|a| a.call_reg(RAX)), [0xFF, 0xD0]);
         assert_eq!(encode(|a| a.jmp_reg(RDX)), [0xFF, 0xE2]);
         assert_eq!(encode(|a| a.ret()), [0xC3]);
+    }
+
+    #[test]
+    fn calls_to_labels_resolve() {
+        let mut a = Asm::default();
+        let top = a.label();
+        a.bind(top);
+        a.call_label(top);
+        // The displacement counts from the end of the call, five bytes on.
+        assert_eq!(a.finish().unwrap(), [0xE8, 0xFB, 0xFF, 0xFF, 0xFF]);
     }
 
     #[test]

@@ -80,47 +80,47 @@ Métodos de **number**: `toFixed`, `toString`.
 
 ## Desempenho (medido)
 
-Medidos nesta máquina (Xeon 2,1 GHz, 4 vCPU), tempo de parede, com a mediana de 7 execuções (5 no interpretador) e o mesmo algoritmo em cada linguagem. `benchmarks/bench.py --fly <caminho>` roda tudo e confere se as saídas batem entre os runtimes. **A máquina varia muito entre sessões**: nesta, o Node fez `array` em 203 ms, contra 87 ms numa sessão anterior, então compare as colunas dentro de uma mesma tabela, nunca tabelas de sessões diferentes.
+Medido nesta máquina (Xeon 2,1 GHz, 4 vCPU), em tempo de parede. Cada número é a mediana de execuções intercaladas entre os runtimes, então a variação da máquina atinge todos igual, e o mesmo algoritmo roda em cada linguagem com a mesma saída. `benchmarks/bench.py` roda os programas com Node e Python e confere as saídas; o Bun foi medido com o mesmo critério num script à parte. **A máquina varia bastante entre sessões**: compare as colunas dentro de uma mesma tabela, nunca tabelas de sessões diferentes.
 
-A coluna **fly (JIT)** usa o binário com PGO (`scripts/pgo-build.sh`), com código nativo ligado. A coluna **interpretador** é o mesmo binário com `FLY_JIT=0`. O melhor de cada linha está em negrito.
+A coluna **fly** usa o binário com PGO (`scripts/pgo-build.sh`), com código nativo ligado. A coluna **interpretador** é o mesmo binário com `FLY_JIT=0` (mediana de 7 execuções). O melhor de cada linha está em negrito.
 
-| carga | fly (JIT) | fly (interpretador) | Node 22 | Python 3 |
+| carga | fly (JIT) | interpretador | Bun 1.4 | Node 22 | Python 3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `fib(30)`, recursão | **13,4 ms** | 225 ms | 26,8 ms | 70,2 ms | 213 ms |
+| laço de 20M com `%` | **32,0 ms** | 896 ms | 77,9 ms | 105,6 ms | 2799 ms |
+| 1M `push`, depois `map`/`filter`/`reduce` | **67,8 ms** | 419 ms | 91,2 ms | 177,8 ms | 276 ms |
+| 1M objetos literais | **5,8 ms** | 75 ms | 34,9 ms | 53,7 ms | 389 ms |
+| 200k concatenações de string | **9,1 ms** | 13 ms | 29,2 ms | 68,1 ms | 42 ms |
+
+Outras medidas, com o mesmo binário (a inicialização é a mediana de 15 execuções):
+
+| | fly | Bun 1.4 | Node 22 | Python 3 |
 | --- | ---: | ---: | ---: | ---: |
-| `fib(30)`, recursão | 97 ms | 260 ms | **91 ms** | 250 ms |
-| laço de 20M com `%` | 161 ms | 1181 ms | **139 ms** | 3381 ms |
-| 1M `push`, depois `map`/`filter`/`reduce` | **180 ms** | 616 ms | 222 ms | 312 ms |
-| 1M objetos literais | **14 ms** | 89 ms | 73 ms | 449 ms |
-| 200k concatenações de string | **9 ms** | 15 ms | 71 ms | 57 ms |
+| tamanho do executável | **963 KB** | 107 MB | 123 MB | 6,5 MB |
+| inicialização (`-e 'console.log(1)'`) | **3,4 ms** | 8,6 ms | 42,7 ms | 20,6 ms |
+| memória de pico, 1M inteiros em array | **19 MB** | 57 MB | 81 MB | 49 MB |
 
-Outras medidas, com o binário com PGO (a inicialização é a mediana de 400 execuções intercaladas com Node e Python, numa mesma medição; entre medições a variação chega a 0,3 ms):
+**Leitura**: o fly ficou na frente do Bun e do Node em todas as cargas. A menor margem é a do `array`, com cerca de 1,35× sobre o Bun na mediana acima e cerca de 1,25× numa segunda medição, de 25 rodadas intercaladas (72 ms contra 90 ms). `fib` e o laço ficam perto de 2× e 2,4× sobre o Bun. Diferenças desse tamanho ainda dependem da máquina, então a medida mais estável é a contagem de instruções (`callgrind`), que não depende dela: sem PGO, o `array` caiu de 477 para 251 milhões de instruções (−47%) nesta etapa.
 
-| | fly | Node 22 | Python 3 |
-| --- | ---: | ---: | ---: |
-| tamanho do executável | **900 KB** (PGO); 846 KB sem PGO | 123 MB | — |
-| inicialização (`-e 'console.log(1)'`) | **3,5 ms** | 48 ms | 24 ms |
-| memória de pico, 1M inteiros em array | **18 MB** | 77 MB | 47 MB |
-
-**Leitura honesta**: nesta sessão o fly ficou em 97 ms no `fib`, contra 91 do Node, e em 161 ms no laço, contra 139 do Node. Nos dois é mais rápido que o CPython. Em `push` seguido de `map`/`filter`/`reduce`, em objetos e em strings ele fica na frente. Essas diferenças com o Node são pequenas, e a sessão anterior mostrou que o Node pode variar bem mais que isso, então elas não bastam para uma conclusão. A medida mais estável do próprio fly é a **contagem de instruções** (`callgrind`), que não depende da máquina. Em relação ao commit anterior (mesmo build, sem PGO): `fib` caiu de 917 para 822 milhões de instruções (−10%), e o `array` de 1213 para 1076 milhões (−11%). Laço, objetos e strings ficaram iguais. Dentro do `array`, um `push` caiu de cerca de 383 para cerca de 258 instruções, e um elemento de `map` ainda custa cerca de 320.
-
-**A meta de 2× não foi alcançada.** O que resta no caminho de chamada: cada chamada ainda passa por uma função auxiliar em Rust para empurrar e tirar o quadro, para soltar a referência do callee e para buscar o upvalue, e os closures são contados por `Rc`. Passar disso exige que o próprio código nativo empurre os quadros e um layout fixo para os closures.
-
-**Build com PGO**: `scripts/pgo-build.sh` treina o binário com os próprios benchmarks e fixtures e recompila com esse perfil, em cerca de 25 s. Precisa do componente `llvm-tools` do rustup (`rustup component add llvm-tools`). Dá cerca de 15 a 25% nos benchmarks. O `cargo build --release` comum continua funcionando sem ele.
+**Build com PGO**: `scripts/pgo-build.sh` treina o binário com os próprios benchmarks e fixtures e recompila com esse perfil. Precisa do componente `llvm-tools` do rustup (`rustup component add llvm-tools`). Nesta etapa o ganho foi pequeno e desigual: cerca de 6% a 13% no `array`, e nenhum ganho claro em `fib` e no laço. O `cargo build --release` comum já fica perto.
 
 **Otimizações feitas**:
 
 - **Código nativo (x86-64)**: cada função é traduzida para máquina na primeira vez que roda. O código trabalha sobre a mesma pilha de valores do interpretador, então os dois caminhos convivem. Números, variáveis locais, saltos e comparações ficam direto no código gerado; o resto chama a própria VM, e cada instrução tem uma só definição. Em outras plataformas, ou com `FLY_JIT=0`, roda o interpretador.
-- **Locais de laço em registradores**: até oito locais usados dentro de laços ficam em `xmm2` a `xmm9`. Cada escrita atualiza o registrador e o quadro, então um contador não precisa passar pela memória a cada passo. Um laço vazio de 20M passos caiu de cerca de 56 para 18 ms (sem PGO). Chamadas de auxiliares recarregam esses registradores, porque podem mudar qualquer local.
+- **Locais de laço em registradores**: até seis locais usados dentro de laços ficam em `xmm2` a `xmm7`. Cada escrita atualiza o registrador e o quadro, então um contador não precisa passar pela memória a cada passo. Chamadas de auxiliares recarregam esses registradores, porque podem mudar qualquer local.
+- **Resto com passo**: num laço cujo contador `i` só sobe de um em um e é dividido por uma constante (`i % 7`), o resto fica num registrador que sobe junto com `i`: soma um, compara com a constante e zera ao chegar nela. Não há multiplicação a cada passo. Um laço de 20M com `sum += i % 7` caiu de cerca de 55 para 41 ms, sem PGO. Se `i` começa negativo, ou muda de outro jeito dentro do laço, vale o cálculo normal.
 - **Tipos conhecidos**: uma análise do bytecode prova quais locais e temporários guardam número em cada instrução (`jit/types.rs`), e o código nativo não verifica o tipo deles. Num laço de `%`, isso tirou cerca de um quinto das instruções.
+- **Callbacks numéricos em lote**: `map`, `filter` e `reduce` com uma função que só faz conta com números rodam num laço nativo sobre o array, sem voltar ao Rust a cada elemento (`jit/region.rs`, `emit_batch`). O laço para no primeiro valor que não é número, e o interpretador segue dali, então o resultado é o mesmo.
+- **Funções numéricas que se chamam**: uma função como `fib`, só de números, roda direto em código nativo, com pilha limitada a 1 MB. Se a pilha acabar, a chamada volta para o interpretador.
 - **Superinstruções**: `local < constante` com salto, `local + - * % constante`, `x += e` e `x = x + e` sem empilhar o valor antigo, `x = e` e `x++` sem valor residual, `obj.prop` lido direto de uma variável, e laços com o teste no fim (um salto a menos por iteração).
 - **Substituição escalar**: `const p = { x, y }` que não escapa vira duas variáveis, `p.x` e `p.y`, e o objeto não é criado. É o caso do benchmark de objetos, que caiu de 58 para 11 ms.
 - **Células só onde preciso**: uma variável vira célula (`Rc<RefCell>`) só quando uma função interna usa o nome dela. Antes, uma função com qualquer closure guardava todas as variáveis em células.
 - **Chaves compartilhadas**: nomes de propriedade ficam numa tabela do bytecode e são `Rc<str>` reaproveitados. Objetos literais não copiam as chaves a cada criação, e a busca compara primeiro o ponteiro.
 - **Chamadas sem alocação**: os argumentos vão para um buffer reaproveitado, e os callbacks de array recebem os valores por movimento. Chamadas diretas de funções compiladas montam o quadro sem passar pelo caminho geral.
 - **Chamadas diretas entre funções compiladas**: o código nativo chama o código do callee sem passar pelo despacho geral. Os quadros ficam num buffer de layout fixo (`FrameStack`), e a volta informa onde o quadro do chamador ficou, porque a pilha pode ter sido realocada.
-- **`push` no lugar**: `arr.push(v)` com um argumento move o valor para o array e troca o `this` pelo resultado, sem montar a lista de argumentos. Só vale quando o método é o `push` embutido.
+- **`push` no código nativo**: `arr.push(v)`, com `arr` numa variável e `push` embutido, é feito por uma função direta (`rt::push_call`), sem montar a chamada geral. O valor vai para o array, e o novo tamanho substitui o `push`.
 - **Inicialização**: o binário não tem `main` do Rust. O `main` do C (`#![no_main]`) pula a inicialização padrão do runtime, que custa cerca de 0,2 ms, e mantém o que o runtime fazia: `SIGPIPE` ignorado e a saída descarregada no fim. `--version` e `--help` não criam a thread do interpretador. A thread de 256 MB custa cerca de 0,5 ms, mas é ela que sustenta a liberação recursiva de estruturas longas (uma lista de 300 mil nós estoura uma pilha de 8 MB). A linkagem estática pouparia cerca de 0,7 ms, mas o binário passaria de 900 KB para 1,9 MB, então não é o padrão.
 - **Escalares sem `drop`**: sobrescrever ou descartar um número não chama o destrutor do valor.
-- **Testado e descartado**: divisão por constante com multiplicação mágica (Hacker's Delight, figura 10-1). Estava correta e foi testada contra `%`, mas nesta CPU o `idiv` de 32 bits continuou mais rápido, e o código saiu.
 
 ## Arquitetura
 
@@ -133,7 +133,8 @@ código-fonte
   └─ vm.rs         máquina de pilha, frames, exceções por tabela de handlers,
                    propriedades, event loop com timers e nextTick
   └─ jit/          código nativo x86-64 por função (codegen.rs), análise de
-                   números por slot (types.rs), funções que o código nativo
+                   números por slot (types.rs), laços e funções de números em
+                   registradores (region.rs), funções que o código nativo
                    chama (rt.rs), montador (x64.rs) e memória executável (mem.rs)
   └─ builtins/     console, globais, array, string, json, fs/path
 ```

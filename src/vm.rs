@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::builtins::{self, console, string};
 use crate::bytecode::{Op, Proto};
 use crate::compiler::compile_module;
-use crate::jit::Native;
+use crate::jit::{self, Native};
 use crate::value::*;
 
 /// Maximum nesting of JavaScript-level calls before a RangeError is thrown.
@@ -175,7 +175,17 @@ impl Frame {
 /// the frame. A call that fails has already popped it.
 pub enum Callback {
     Session(Session),
-    Generic { f: Value, this: Value },
+    Generic {
+        f: Value,
+        this: Value,
+    },
+    /// A function that native code runs on numbers. A call with numbers takes that path, and any
+    /// other call goes through `base`.
+    Numbers {
+        closure: Rc<Closure>,
+        nparams: usize,
+        base: Box<Callback>,
+    },
 }
 
 pub struct Session {
@@ -196,6 +206,21 @@ pub struct Session {
 impl Callback {
     /// Prepares calls to `f` with `this`. Nothing is pushed until the first call.
     pub fn new(vm: &Vm, f: &Value, this: Value) -> Callback {
+        let base = Callback::interpreted(vm, f, this);
+        if let Value::Func(c) = f {
+            if let Some(nparams) = jit::numbers_arity(c) {
+                return Callback::Numbers {
+                    closure: c.clone(),
+                    nparams,
+                    base: Box::new(base),
+                };
+            }
+        }
+        base
+    }
+
+    /// The callback through the interpreter: a session for a compiled function, otherwise a generic call.
+    fn interpreted(vm: &Vm, f: &Value, this: Value) -> Callback {
         if let Value::Func(c) = f {
             let proto: *const Proto = Rc::as_ptr(&c.proto);
             // SAFETY: `c` owns the prototype, and the session keeps `c` alive.
@@ -229,6 +254,7 @@ impl Callback {
         match self {
             Callback::Session(s) => s.nparams,
             Callback::Generic { .. } => usize::MAX,
+            Callback::Numbers { base, .. } => base.arity(),
         }
     }
 
@@ -237,13 +263,52 @@ impl Callback {
         match self {
             Callback::Session(s) => s.call(vm, args),
             Callback::Generic { f, this } => vm.call_moved(f, this.clone(), args),
+            Callback::Numbers {
+                closure,
+                nparams,
+                base,
+            } => {
+                let mut nums = [0.0; jit::MAX_NUMBER_ARGS];
+                let numeric = *nparams <= N
+                    && args
+                        .iter()
+                        .take(*nparams)
+                        .enumerate()
+                        .all(|(j, arg)| match arg {
+                            Value::Num(x) => {
+                                nums[j] = *x;
+                                true
+                            }
+                            _ => false,
+                        });
+                if numeric {
+                    if let Some(v) = jit::call_numbers(closure, &nums[..*nparams]) {
+                        return Ok(v);
+                    }
+                }
+                base.call(vm, args)
+            }
+        }
+    }
+
+    /// The function's entry for numbers, for a builtin that makes many calls in a row with numbers.
+    pub fn numeric_entry(&self) -> Option<jit::Numeric<'_>> {
+        match self {
+            Callback::Numbers { closure, .. } => jit::numeric_entry(closure),
+            _ => None,
         }
     }
 
     /// Ends the calls, popping the session's frame if it is still on the stack.
     pub fn finish(mut self, vm: &mut Vm) {
-        if let Callback::Session(s) = &mut self {
-            s.finish(vm);
+        self.finish_calls(vm);
+    }
+
+    fn finish_calls(&mut self, vm: &mut Vm) {
+        match self {
+            Callback::Session(s) => s.finish(vm),
+            Callback::Generic { .. } => {}
+            Callback::Numbers { base, .. } => base.finish_calls(vm),
         }
     }
 }
@@ -993,28 +1058,29 @@ impl Vm {
     /// result replaces the callee. Returns false, and changes nothing, for any other call.
     #[inline(always)]
     pub(crate) fn push_in_place(&mut self, idx: usize, argc: usize) -> bool {
-        let is_push = matches!(&self.stack[idx], Value::Native(def)
+        // The callee, `this` and the argument are the top three slots, so the slice has exactly those.
+        let [callee, this, arg] = &mut self.stack[idx..] else {
+            return false;
+        };
+        let is_push = matches!(callee, Value::Native(def)
             if std::ptr::eq(*def, builtins::array::push_def()));
-        if !is_push || argc != 1 {
+        if !is_push || argc != 1 || !matches!(this, Value::Arr(_)) {
             return false;
         }
-        let arr: *const RefCell<Vec<Value>> = match &self.stack[idx + 1] {
-            Value::Arr(a) => Rc::as_ptr(a),
-            _ => return false,
+        let Value::Arr(items) = std::mem::replace(this, Value::Undef) else {
+            unreachable!("`this` was checked to be an array")
         };
-        let v = std::mem::replace(&mut self.stack[idx + 2], Value::Undef);
-        // SAFETY: the `this` slot holds the array until it is dropped below.
-        let len = unsafe {
-            let mut items = (*arr).borrow_mut();
-            items.push(v);
-            items.len()
+        let v = std::mem::replace(arg, Value::Undef);
+        let len = {
+            let mut vec = items.borrow_mut();
+            vec.push(v);
+            vec.len()
         };
-        drop(std::mem::replace(&mut self.stack[idx + 1], Value::Undef));
-        // SAFETY: the callee slot holds a built-in, which owns nothing, so the result overwrites it
-        // without a drop. The slots above the result are dead.
+        drop(items);
+        // SAFETY: the callee is a built-in, which owns nothing, so the result overwrites it without a
+        // drop. The slots above the result are dead.
         unsafe {
-            let p = self.stack.as_mut_ptr();
-            std::ptr::write(p.add(idx), Value::Num(len as f64));
+            std::ptr::write(callee, Value::Num(len as f64));
             self.stack.set_len(idx + 1);
         }
         true

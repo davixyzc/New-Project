@@ -1,0 +1,26 @@
+// Numeric callbacks over arrays run in batches. These cases cover where a batch stops and what it keeps.
+const xs = [1, 2, 3, 4, 5, 6];
+console.log(xs.map(x => x * 2).join(","));
+console.log(xs.map(x => x % 2 === 0).join(","));
+console.log(xs.filter(x => x % 3 === 0).join(","));
+console.log(xs.filter((x, i) => i % 2 === 1).join(","));
+console.log(xs.map((x, i) => x + i).join(","));
+console.log(xs.reduce((a, b) => a + b, 0));
+console.log(xs.reduce((a, b) => a + b));
+console.log(xs.reduce((a, b, i) => a + b * i, 0));
+console.log([1, 2, 3].reduce((a, b) => a < b));
+const mixed = [1, "two", 3, 4];
+console.log(mixed.map(x => x * 10).join(","));
+console.log(mixed.filter(x => x > 2).join(","));
+const withNaN = [1, 0, -1, 2];
+console.log(withNaN.map(x => x / 0 * 0).join(","));
+console.log(withNaN.filter(x => x / 0 * 0).length);
+console.log([0.5, 1.5, 2.5].filter(x => x - 1).join(","));
+const isBig = x => x > 2;
+console.log(xs.filter(isBig).map(x => x - 2).join(","));
+function fold(acc, x) { return acc + x; }
+console.log([1, 2, 3].reduce(fold, 10));
+const big = [];
+for (let i = 0; i < 2000; i++) big.push(i);
+console.log(big.map(x => x + 1).filter(x => x % 7 === 0).reduce((a, b) => a + b, 0));
+console.log([].map(x => x * 2).length, [].filter(x => x).length, [].reduce((a, b) => a + b, 5));

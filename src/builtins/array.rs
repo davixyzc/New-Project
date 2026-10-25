@@ -241,7 +241,13 @@ fn map(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let mut cb = Callback::new(vm, &arg(args, 0), arg(args, 1));
     let len = a.borrow().len();
     let mut out = Vec::with_capacity(len);
-    for i in 0..len {
+    let mut start = 0;
+    // While the elements are numbers and the callback runs on numbers, no interpreter code runs, so the
+    // array can stay borrowed.
+    if let Some(entry) = cb.numeric_entry() {
+        start += entry.map(&a.borrow(), start, &mut out);
+    }
+    for i in start..len {
         let item = match element(&a, i) {
             Some(v) => v,
             None => break,
@@ -262,7 +268,11 @@ fn filter(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let mut cb = Callback::new(vm, &arg(args, 0), arg(args, 1));
     let len = a.borrow().len();
     let mut out = Vec::new();
-    for i in 0..len {
+    let mut start = 0;
+    if let Some(entry) = cb.numeric_entry() {
+        start += entry.filter(&a.borrow(), start, &mut out);
+    }
+    for i in start..len {
         let item = match element(&a, i) {
             Some(v) => v,
             None => break,
@@ -318,7 +328,15 @@ fn reduce(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
             }
         }
     };
-    for i in start..len {
+    let mut i = start;
+    if let Some(entry) = cb.numeric_entry() {
+        if let Value::Num(first) = acc {
+            let (value, done) = entry.reduce(&a.borrow(), i, first);
+            acc = Value::Num(value);
+            i += done;
+        }
+    }
+    for i in i..len {
         let item = match element(&a, i) {
             Some(v) => v,
             None => break,

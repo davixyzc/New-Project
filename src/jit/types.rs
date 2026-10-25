@@ -15,10 +15,13 @@ use crate::value::Value;
 pub type Numbers = Vec<Vec<bool>>;
 
 /// Computes the number slots before each instruction. `depth` and `deepest` come from `depths`.
-pub fn number_slots(proto: &Proto, depth: &[i32], deepest: i32) -> Numbers {
+/// The first `params` locals are known to be numbers on entry, which is the case for a function that
+/// native code calls with numbers. Other code passes 0.
+pub fn number_slots(proto: &Proto, depth: &[i32], deepest: i32, params: usize) -> Numbers {
     let width = proto.nlocals as usize + deepest.max(0) as usize + 1;
     let mut before: Numbers = vec![Vec::new(); proto.code.len()];
     before[0] = vec![false; width];
+    before[0][..params].fill(true);
     let mut work = vec![0];
     while let Some(ip) = work.pop() {
         let (op, d) = (proto.code[ip], depth[ip]);
@@ -185,7 +188,7 @@ mod tests {
 
     fn numbers(p: &Proto) -> Numbers {
         let (depth, deepest) = depths(p).unwrap();
-        number_slots(p, &depth, deepest)
+        number_slots(p, &depth, deepest, 0)
     }
 
     #[test]

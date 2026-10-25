@@ -13,6 +13,7 @@
 
 use std::rc::Rc;
 
+use super::region;
 use super::rt::{self, STATUS_JUMP};
 use super::types::{number_slots, Numbers};
 use super::x64::*;
@@ -22,23 +23,54 @@ use crate::value::Value;
 /// Tags of `Value`, the discriminants `#[repr(u8)]` gives its variants.
 const TAG_UNDEF: u8 = 0;
 const TAG_NULL: u8 = 1;
-const TAG_BOOL: u8 = 2;
-const TAG_NUM: u8 = 3;
+pub(super) const TAG_BOOL: u8 = 2;
+pub(super) const TAG_NUM: u8 = 3;
+const TAG_ARR: u8 = 5;
+const TAG_NATIVE: u8 = 8;
 /// Bit `n` is set when tag `n` owns a reference (see `Value::owns_ref`).
 const OWNING: u32 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 9);
 
-/// Compiles `proto`. Returns the machine code, the offset of each instruction's code (with one
-/// extra entry for the end) and the number of stack slots a frame needs.
-pub fn compile(proto: &Proto) -> Option<(Vec<u8>, Vec<usize>, usize)> {
+/// The machine code of a function, and what the VM needs to run it.
+pub(super) struct Compiled {
+    pub(super) code: Vec<u8>,
+    /// The offset of each instruction's code, with one extra entry for the end.
+    pub(super) offsets: Vec<usize>,
+    /// The stack slots a frame needs: its locals and its deepest operand stack.
+    pub(super) frame_len: usize,
+    /// The offset of the wrapper of the function region, and what the region needs, if the function
+    /// has one.
+    pub(super) function: Option<(region::Entries<usize>, region::Function)>,
+}
+
+/// Compiles `proto`.
+pub(super) fn compile(proto: &Proto) -> Option<Compiled> {
     let (depth, deepest) = depths(proto)?;
-    let types = number_slots(proto, &depth, deepest);
+    let types = number_slots(proto, &depth, deepest, 0);
+    // A function region sees its parameters as numbers, which only its own wrapper guarantees.
+    let plan = region::plan_function(
+        proto,
+        &depth,
+        &number_slots(proto, &depth, deepest, proto.nparams as usize),
+    );
     let mut gen = Gen::new(proto, &depth, types);
     gen.prologue();
     gen.body();
     gen.epilogue();
+    let entries = plan
+        .as_ref()
+        .map(|lp| region::emit_function(&mut gen.a, lp, proto, &depth));
     let offsets = gen.ops.iter().map(|&l| gen.a.offset(l)).collect();
-    let bytes = gen.a.finish()?;
-    Some((bytes, offsets, proto.nlocals as usize + deepest as usize))
+    let function = match (plan, entries) {
+        (Some(lp), Some(entries)) => lp.function.map(|f| (entries.offsets(&gen.a), f)),
+        _ => None,
+    };
+    let code = gen.a.finish()?;
+    Some(Compiled {
+        code,
+        offsets,
+        frame_len: proto.nlocals as usize + deepest as usize,
+        function,
+    })
 }
 
 /// The operand depth before each instruction (-1 when it cannot run), and the deepest one.
@@ -206,7 +238,7 @@ fn jump_target(op: Op) -> Option<u32> {
 const CACHE_REGS: std::ops::Range<u8> = 2..10;
 
 /// The locals that a fast path reads or writes as a number.
-fn local_uses(op: Op) -> Vec<u32> {
+pub(super) fn local_uses(op: Op) -> Vec<u32> {
     match op {
         Op::GetLocal(i)
         | Op::PopToLocal(i)
@@ -259,6 +291,69 @@ fn cached_locals(proto: &Proto) -> Vec<Option<u8>> {
     cache
 }
 
+/// The reciprocal `m` and shift `s` with `n / c == (n * m) >> s` for every `n` in 0..=2^31 and every
+/// `c >= 2`: `s = 32 + ceil(log2 c)` and `m = ceil(2^s / c)`. Then `m` is below 2^33, so `n * m` fits in 64 bits.
+pub(super) fn magic(c: u32) -> (u64, u8) {
+    let k = 32 - (c - 1).leading_zeros();
+    let s = 32 + k;
+    let m = ((1u128 << s) + c as u128 - 1) / c as u128;
+    (m as u64, s as u8)
+}
+
+/// The divisor of `x % c` as an integer, when the reciprocal of `c` gives the quotient: an integer
+/// from 2 to i32::MAX.
+pub(super) fn int_divisor(c: f64) -> Option<u32> {
+    (c >= 2.0 && c <= i32::MAX as f64 && c.fract() == 0.0).then_some(c as u32)
+}
+
+/// `x % c` for an integer divisor `c`: x is in `src` and the result goes to `dst`, which may be `src`.
+/// xmm0 is scratch. The remainder takes the sign of x, sign bit included, so -0 stays -0. Jumps to
+/// `slow` when x is not an integer in the 32-bit range, where the reciprocal is not exact. Binds
+/// `join` after the code, which is where the result is ready.
+pub(super) fn emit_mod_const(a: &mut Asm, c: u32, src: u8, dst: u8, slow: Label, join: Label) {
+    let (m, s) = magic(c);
+    a.cvttsd2si(RAX, src);
+    a.cvtsi2sd(0, RAX);
+    // The integer converted back must equal x. A NaN compares unordered, which the parity check catches.
+    a.ucomisd(0, src);
+    a.jcc(CC_NE, slow);
+    a.jcc(CC_P, slow);
+    // rcx = x and r8 = |x|, which is at most 2^31: `neg` sets the sign flag when x is positive, and then
+    // cmovs takes x back. r9 = |x| - q * c, where q = (|x| * m) >> s is |x| / c.
+    a.movsxd(RCX, RAX);
+    a.mov_rr(R8, RCX);
+    a.neg64(R8);
+    a.cmovs(R8, RCX);
+    a.mov_rr(R9, R8);
+    a.mov_imm64(R10, m);
+    a.imul64(R8, R10);
+    a.shr64_imm(R8, s);
+    a.imul64_imm(R8, R8, c as i32);
+    a.sub64(R9, R8);
+    // The sign bit of x, which a negative remainder takes, and which -0 needs.
+    a.movmskpd(RDX, src);
+    a.shl64_imm(RDX, 63);
+    a.movq_to_xmm(0, RDX);
+    // cvtsi2sd keeps the destination's old upper bits, so zeroing it first breaks a false dependency.
+    a.xorpd(dst, dst);
+    a.cvtsi2sd64(dst, R9);
+    a.xorpd(dst, 0);
+    a.bind(join);
+}
+
+/// The instructions that jumps go back to, which are the first instruction of each loop.
+fn loop_headers(proto: &Proto) -> Vec<usize> {
+    let mut heads = Vec::new();
+    for (ip, &op) in proto.code.iter().enumerate() {
+        for (t, _) in successors(op, ip, 0) {
+            if t <= ip && !heads.contains(&t) {
+                heads.push(t);
+            }
+        }
+    }
+    heads
+}
+
 /// An argument of a value helper: the VM, an immediate, or the address of a value.
 #[derive(Clone, Copy)]
 enum Arg {
@@ -306,6 +401,10 @@ struct Gen<'a> {
     types: Numbers,
     /// The instruction being translated.
     cur: usize,
+    /// The loops that run as regions, each with the label its entry is called through.
+    regions: Vec<(region::Region, Label)>,
+    /// For each instruction that a region is entered at, the region.
+    entry_at: Vec<Option<usize>>,
 }
 
 impl<'a> Gen<'a> {
@@ -314,6 +413,20 @@ impl<'a> Gen<'a> {
         let ops = (0..=proto.code.len()).map(|_| a.label()).collect();
         let threw = a.label();
         let done = a.label();
+        let mut regions = Vec::new();
+        let mut entry_at = vec![None; proto.code.len()];
+        for header in loop_headers(proto) {
+            if let Some(lp) = region::plan(proto, depth, &types, header) {
+                // A region is entered where the generic code reaches it, so each entry needs one
+                // region. The first region to claim an entry keeps it.
+                for &e in &lp.entries {
+                    if entry_at[e].is_none() {
+                        entry_at[e] = Some(regions.len());
+                    }
+                }
+                regions.push((lp, a.label()));
+            }
+        }
         Gen {
             proto,
             depth,
@@ -326,6 +439,8 @@ impl<'a> Gen<'a> {
             cache: cached_locals(proto),
             types,
             cur: 0,
+            regions,
+            entry_at,
         }
     }
 
@@ -469,42 +584,15 @@ impl<'a> Gen<'a> {
         Fast::Guarded
     }
 
-    /// `local % c` for a positive integer `c`, by integer division. The division is exact only
-    /// when the local is an integer, so anything else (NaN, fractions, huge values) takes the
-    /// slow path. A zero result keeps the sign of the dividend, so -4 % 2 is -0.
-    fn mod_local(&mut self, i: u32, c: i32, d: i32, slow: Label) {
+    /// `local % c` for an integer divisor `c` (see `int_divisor`). A local that is not an integer
+    /// takes the slow path, which the exact check of `emit_mod_const` sends it to.
+    fn mod_local(&mut self, i: u32, c: u32, d: i32, slow: Label) {
         let x = self.local(i);
         let dst = self.temp(d);
-        let (zero, nonzero, store) = (self.a.label(), self.a.label(), self.a.label());
         self.check_tag(x, TAG_NUM, slow);
-        self.load_num(i, 0);
-        self.a.cvttsd2si(RAX, 0);
-        self.a.cvtsi2sd(1, RAX);
-        // The integer converted back must equal x. A NaN compares unordered, which the parity check catches.
-        self.a.ucomisd(1, 0);
-        self.a.jcc(CC_NE, slow);
-        self.a.jcc(CC_P, slow);
-        self.a.test32(RAX, RAX);
-        self.a.jcc(CC_E, zero);
-        self.a.mov_rr32(R8, RAX);
-        self.a.mov_imm32(RCX, c as u32);
-        self.a.cdq();
-        self.a.idiv32(RCX);
-        self.a.test32(RDX, RDX);
-        self.a.jcc(CC_NE, nonzero);
-        self.a.test32(R8, R8);
-        self.a.jcc(CC_NS, nonzero);
-        // A zero remainder from a negative dividend is -0.
-        self.a.mov_imm64(RAX, 1 << 63);
-        self.a.movq_to_xmm(1, RAX);
-        self.a.jmp(store);
-        self.a.bind(nonzero);
-        self.a.cvtsi2sd(1, RDX);
-        self.a.jmp(store);
-        // 0 % c is x itself, so -0 stays -0.
-        self.a.bind(zero);
-        self.a.movsd_rr(1, 0);
-        self.a.bind(store);
+        self.load_num(i, 1);
+        let join = self.a.label();
+        emit_mod_const(&mut self.a, c, 1, 1, slow, join);
         self.store_num(dst, 1);
     }
 
@@ -566,6 +654,25 @@ impl<'a> Gen<'a> {
     /// A plain call. `rt::call_plain` pushes the callee's frame when it can, and then native code
     /// runs the callee's code itself. Otherwise the call has already run when the helper returns.
     fn plain_call(&mut self, ip: usize, d: i32, argc: u32) {
+        let (generic, done) = (self.a.label(), self.a.label());
+        if argc == 1 {
+            // A call of the built-in `push` on an array runs in place (see `rt::push_call`). Any other
+            // callee takes the generic path below, and so does an array push that the helper declines.
+            let callee = self.temp(d - 3);
+            let push = crate::builtins::array::push_def() as *const _ as usize as u64;
+            self.check_tag(callee, TAG_NATIVE, generic);
+            self.a.mov_load(RAX, callee.at(8));
+            self.a.mov_imm64(RCX, push);
+            self.a.cmp_rr64(RAX, RCX);
+            self.a.jcc(CC_NE, generic);
+            self.a.lea(RDI, callee);
+            self.a
+                .mov_imm64(RAX, rt::push_call as *const () as usize as u64);
+            self.a.call_reg(RAX);
+            self.a.test8(RAX, RAX);
+            self.a.jcc(CC_NE, done);
+        }
+        self.a.bind(generic);
         self.a.mov_rr(RDI, RBX);
         self.a.mov_imm32(RSI, ip as u32);
         self.a.mov_imm32(RDX, d as u32);
@@ -590,7 +697,27 @@ impl<'a> Gen<'a> {
         let threw = self.threw;
         self.a.jcc(CC_NE, threw);
         self.a.mov_rr(R12, RDX);
+        self.a.bind(done);
         self.reload_all();
+    }
+
+    /// Runs the region entered at instruction `ip`, then continues at the exit it left by. When a
+    /// guard failed the region did not run, and the instruction at `ip` runs here instead.
+    fn enter_region(&mut self, entry: Label, ip: usize, exits: &[usize]) {
+        self.a.mov_imm32(RDX, ip as u32);
+        self.a.call_label(entry);
+        self.reload_all();
+        let generic = self.a.label();
+        // The region returns -1 when it did not run, which is NOT_ENTERED (u64::MAX).
+        self.a.cmp64_imm8(RAX, 0xFF);
+        self.a.jcc(CC_E, generic);
+        for &t in exits {
+            self.a.cmp64_imm32(RAX, t as i32);
+            let target = self.target(t as u32);
+            self.a.jcc(CC_E, target);
+        }
+        self.a.ud2();
+        self.a.bind(generic);
     }
 
     /// Returns from the function, through its helper, which pops the frame.
@@ -653,6 +780,10 @@ impl<'a> Gen<'a> {
                 self.a.ud2();
                 continue;
             }
+            if let Some(r) = self.entry_at[ip] {
+                let (exits, entry) = (self.regions[r].0.exits.clone(), self.regions[r].1);
+                self.enter_region(entry, ip, &exits);
+            }
             let op = self.proto.code[ip];
             self.cur = ip;
             match op {
@@ -691,6 +822,9 @@ impl<'a> Gen<'a> {
             }
             let next = self.ops[ip + 1];
             self.a.jmp(next);
+        }
+        for (lp, entry) in std::mem::take(&mut self.regions) {
+            region::emit(&mut self.a, &lp, entry, self.proto, self.depth);
         }
     }
 
@@ -797,9 +931,21 @@ impl<'a> Gen<'a> {
                 let (src, dst) = (self.local(s), self.temp(d));
                 let get = rt::get_prop_into as *const () as usize;
                 let args = [Arg::Addr(src), Arg::Imm(name as u64), Arg::Addr(dst)];
+                let (lookup, done) = (self.a.label(), self.a.label());
+                if &*self.proto.names[n as usize] == "push" {
+                    // The `push` of an array is the built-in, so it is written here, without a lookup.
+                    self.check_tag(src, TAG_ARR, lookup);
+                    let push = crate::builtins::array::push_def() as *const _ as usize as u64;
+                    self.a.mov8_imm(dst, TAG_NATIVE);
+                    self.a.mov_imm64(RAX, push);
+                    self.a.mov_store(dst.at(8), RAX);
+                    self.a.jmp(done);
+                }
+                self.a.bind(lookup);
                 self.direct_call(get, &args);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
+                self.a.bind(done);
                 Fast::Guarded
             }
             Op::GetBoxed(i) => {
@@ -839,9 +985,9 @@ impl<'a> Gen<'a> {
                 Fast::Guarded
             }
             Op::ModLK(s, k) => {
-                let c = match self.num_const(k) {
-                    Some(c) if c >= 1.0 && c <= i32::MAX as f64 && c.fract() == 0.0 => c as i32,
-                    _ => return Fast::Generic,
+                let c = match self.num_const(k).and_then(int_divisor) {
+                    Some(c) => c,
+                    None => return Fast::Generic,
                 };
                 self.mod_local(s, c, d, slow);
                 Fast::Guarded
@@ -981,6 +1127,20 @@ mod tests {
     use super::*;
     use crate::bytecode::Proto;
     use std::rc::Rc;
+
+    #[test]
+    fn tags_match_the_value_layout() {
+        // Native code reads a value's tag from its first byte, so the constants must match the layout.
+        let tag = |v: &Value| unsafe { *(v as *const Value as *const u8) };
+        assert_eq!(tag(&Value::Undef), TAG_UNDEF);
+        assert_eq!(tag(&Value::Bool(true)), TAG_BOOL);
+        assert_eq!(tag(&Value::Num(0.0)), TAG_NUM);
+        assert_eq!(tag(&Value::arr(Vec::new())), TAG_ARR);
+        assert_eq!(
+            tag(&Value::Native(crate::builtins::array::push_def())),
+            TAG_NATIVE
+        );
+    }
 
     /// The tag byte native code tests must be the variant order `Value` declares.
     #[test]

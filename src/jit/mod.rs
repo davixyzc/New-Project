@@ -3,18 +3,23 @@
 //! Instructions that are not plain numbers, locals or jumps call back into the VM (see `rt`),
 //! so every instruction has one definition. The interpreter stays as the fallback. It runs
 //! on platforms without native code, and everywhere when `FLY_JIT=0` is set.
+//!
+//! Code that works on numbers only can also run without the VM: a function whose arguments are
+//! numbers is called as plain machine code (see `region` and `call_numbers`).
 
 mod codegen;
 mod mem;
+mod region;
 mod rt;
 mod types;
 mod x64;
 
 use std::cell::OnceCell;
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use crate::bytecode::Proto;
-use crate::value::Value;
+use crate::value::{Closure, Value};
 use crate::vm::Vm;
 use mem::ExecMem;
 
@@ -23,6 +28,66 @@ const SUPPORTED: bool = cfg!(all(
     target_arch = "x86_64",
     any(target_os = "linux", target_os = "macos")
 ));
+
+/// The most parameters a function that runs on numbers takes.
+pub(crate) const MAX_NUMBER_ARGS: usize = region::MAX_ARGS;
+
+/// What the wrapper of a function region returns: its result in xmm0, and in rax 0, or 1 when the native
+/// stack ran out. The C calling convention returns a struct of a double and an integer in those registers.
+#[repr(C)]
+struct Ret {
+    value: f64,
+    status: u64,
+}
+
+/// A wrapper of a function region, which takes the parameters as doubles.
+type Wrapper = unsafe extern "C" fn(*const f64) -> Ret;
+
+/// A batch entry of a function region, which runs the function over the elements of a batch (see `Batch`).
+/// It reads the elements from its first argument, and writes results to its second.
+type BatchFn = unsafe extern "C" fn(*const Value, *mut Value, *mut Batch) -> u64;
+
+/// The progress of a batch of numeric calls, which native code updates as it goes (see
+/// `region::emit_batch`). The batch runs the elements from `start` to `end`. `done` counts the elements
+/// that ran, `kept` the elements that a filter kept, and `acc` is the accumulator of a reduce. Native code
+/// finds the fields by `offset_of!`.
+#[repr(C)]
+struct Batch {
+    start: u64,
+    end: u64,
+    done: u64,
+    kept: u64,
+    acc: f64,
+}
+
+impl Batch {
+    fn new(items: &[Value], start: usize, acc: f64) -> Batch {
+        Batch {
+            start: start as u64,
+            end: items.len() as u64,
+            done: 0,
+            kept: 0,
+            acc,
+        }
+    }
+}
+
+/// What a function that runs on numbers returns: a number, or a boolean. Both are plain data, so a
+/// caller that loops over them drops nothing.
+#[derive(Clone, Copy)]
+pub(crate) enum Number {
+    Num(f64),
+    Bool(bool),
+}
+
+impl Number {
+    pub(crate) fn value(self) -> Value {
+        match self {
+            Number::Num(n) => Value::Num(n),
+            Number::Bool(b) => Value::Bool(b),
+        }
+    }
+}
 
 /// Whether functions are compiled. `FLY_JIT=0` turns it off.
 pub fn enabled() -> bool {
@@ -41,6 +106,41 @@ pub struct Native {
     offsets: Vec<usize>,
     /// Stack slots a frame needs: its locals and its deepest operand stack.
     frame_len: usize,
+    /// The function's entry for numbers, when it has one.
+    spec: Option<Spec>,
+}
+
+/// The entry of a function region: a wrapper that takes the parameters as doubles.
+struct Spec {
+    /// The wrapper, which runs the function's code.
+    wrapper: Wrapper,
+    /// The batch entries of `array::map`, `filter` and `reduce`, where the function has them.
+    map: Option<BatchFn>,
+    filter: Option<BatchFn>,
+    reduce: Option<BatchFn>,
+    /// How many parameters the wrapper takes.
+    nparams: u32,
+    /// The upvalue that the function calls itself through, if it does (see `region::Function`).
+    self_upval: Option<u32>,
+    /// Whether the function returns a boolean, which the wrapper gives as 0.0 or 1.0.
+    returns_bool: bool,
+}
+
+impl Spec {
+    /// Runs the function on `args`, which are its parameters. `None` when the native stack ran out.
+    #[inline]
+    fn call(&self, args: &[f64]) -> Option<Number> {
+        debug_assert_eq!(args.len(), self.nparams as usize);
+        // SAFETY: the wrapper reads `nparams` doubles from `args`, and the caller passes exactly that many.
+        let ret = unsafe { (self.wrapper)(args.as_ptr()) };
+        (ret.status == 0).then(|| {
+            if self.returns_bool {
+                Number::Bool(ret.value != 0.0)
+            } else {
+                Number::Num(ret.value)
+            }
+        })
+    }
 }
 
 impl Native {
@@ -53,6 +153,12 @@ impl Native {
     /// at the first instruction.
     pub fn entry(&self) -> *const u8 {
         self.mem.ptr()
+    }
+
+    /// Runs the function on the numbers in `args`, its parameters. Returns its result, or `None` when
+    /// the native stack ran out, and the call must run in the interpreter instead.
+    fn call_numbers(&self, args: &[f64]) -> Option<Value> {
+        self.spec.as_ref()?.call(args).map(Number::value)
     }
 
     /// Runs the function from instruction `ip`. Returns 0 when the frame returned, and 1 when
@@ -69,16 +175,141 @@ impl Native {
     }
 }
 
+/// How many parameters a call of `closure` passes when it runs on numbers, or `None` when the function
+/// has no entry for numbers.
+pub(crate) fn numbers_arity(closure: &Closure) -> Option<usize> {
+    let spec = closure.proto.native()?.spec.as_ref()?;
+    Some(spec.nparams as usize)
+}
+
+/// A function that runs on numbers, held by a builtin that calls it many times in a row. It needs no
+/// check per call, which is why a function that calls itself through an upvalue has none.
+pub(crate) struct Numeric<'a> {
+    spec: &'a Spec,
+}
+
+impl Numeric<'_> {
+    /// Maps the elements of `items` from `start` on through the function, appending the results to `out`.
+    /// Returns how many elements ran. A batch stops at the first element that is not a number, and the
+    /// interpreter runs the rest, starting with that element.
+    pub(crate) fn map(&self, items: &[Value], start: usize, out: &mut Vec<Value>) -> usize {
+        let Some(batch) = self.spec.map else {
+            return 0;
+        };
+        out.reserve(items.len() - start);
+        let base = out.len();
+        let mut progress = Batch::new(items, start, 0.0);
+        // SAFETY: the batch reads the elements from `start` on, which exist, and writes one result per
+        // element into the room that `reserve` made.
+        unsafe {
+            batch(
+                items.as_ptr().add(start),
+                out.as_mut_ptr().add(base),
+                &mut progress,
+            );
+            out.set_len(base + progress.done as usize);
+        }
+        progress.done as usize
+    }
+
+    /// Keeps the elements from `start` on that the function finds true, appending them to `out`. Returns
+    /// how many elements ran (see `map`).
+    pub(crate) fn filter(&self, items: &[Value], start: usize, out: &mut Vec<Value>) -> usize {
+        let Some(batch) = self.spec.filter else {
+            return 0;
+        };
+        out.reserve(items.len() - start);
+        let base = out.len();
+        let mut progress = Batch::new(items, start, 0.0);
+        // SAFETY: as for `map`, and a filter writes at most one element per element it runs.
+        unsafe {
+            batch(
+                items.as_ptr().add(start),
+                out.as_mut_ptr().add(base),
+                &mut progress,
+            );
+            out.set_len(base + progress.kept as usize);
+        }
+        progress.done as usize
+    }
+
+    /// Folds the elements from `start` on into `acc` through the function. Returns the new accumulator, and
+    /// how many elements ran (see `map`).
+    pub(crate) fn reduce(&self, items: &[Value], start: usize, acc: f64) -> (f64, usize) {
+        let Some(batch) = self.spec.reduce else {
+            return (acc, 0);
+        };
+        let mut progress = Batch::new(items, start, acc);
+        // SAFETY: as for `map`. A reduce writes no results, so it is given no output.
+        unsafe {
+            batch(
+                items.as_ptr().add(start),
+                std::ptr::null_mut(),
+                &mut progress,
+            )
+        };
+        (progress.acc, progress.done as usize)
+    }
+}
+
+/// The entry of `closure` for numbers, when it has one that needs no check per call.
+pub(crate) fn numeric_entry(closure: &Closure) -> Option<Numeric<'_>> {
+    let spec = closure.proto.native()?.spec.as_ref()?;
+    spec.self_upval.is_none().then_some(Numeric { spec })
+}
+
+/// Runs `closure` on `args`, its parameters as numbers, when it has an entry for numbers and calls
+/// through its self-reference, if it has one, reach the function itself. `None` when the interpreter
+/// must make the call: the native stack ran out, or the function is not the one its code expects.
+pub(crate) fn call_numbers(closure: &Rc<Closure>, args: &[f64]) -> Option<Value> {
+    let native = closure.proto.native()?;
+    let spec = native.spec.as_ref()?;
+    if args.len() != spec.nparams as usize {
+        return None;
+    }
+    if let Some(upval) = spec.self_upval {
+        let is_self = match closure.upvals.get(upval as usize) {
+            Some(cell) => matches!(&*cell.borrow(), Value::Func(f) if Rc::ptr_eq(f, closure)),
+            None => false,
+        };
+        if !is_self {
+            return None;
+        }
+    }
+    native.call_numbers(args)
+}
+
 /// Compiles a function to native code. `None` when native code is disabled or unavailable.
 pub fn compile(proto: &Proto) -> Option<Box<Native>> {
     if !enabled() {
         return None;
     }
-    let (code, offsets, frame_len) = codegen::compile(proto)?;
-    let mem = ExecMem::new(&code)?;
+    let compiled = codegen::compile(proto)?;
+    let mem = ExecMem::new(&compiled.code)?;
+    let spec = compiled.function.map(|(entries, function)| {
+        // SAFETY: each offset is an entry in `mem`, which is not moved by `Native` and lives as long as the
+        // spec does. Each entry is called with the signature of its type.
+        let at = |offset: usize| unsafe { mem.ptr().add(offset) };
+        Spec {
+            wrapper: unsafe { std::mem::transmute::<*const u8, Wrapper>(at(entries.wrapper)) },
+            map: entries
+                .map
+                .map(|o| unsafe { std::mem::transmute::<*const u8, BatchFn>(at(o)) }),
+            filter: entries
+                .filter
+                .map(|o| unsafe { std::mem::transmute::<*const u8, BatchFn>(at(o)) }),
+            reduce: entries
+                .reduce
+                .map(|o| unsafe { std::mem::transmute::<*const u8, BatchFn>(at(o)) }),
+            nparams: function.nparams,
+            self_upval: function.self_upval,
+            returns_bool: function.returns_bool,
+        }
+    });
     Some(Box::new(Native {
         mem,
-        offsets,
-        frame_len,
+        offsets: compiled.offsets,
+        frame_len: compiled.frame_len,
+        spec,
     }))
 }

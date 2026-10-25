@@ -1,0 +1,25 @@
+const nums = [];
+for (let i = 0; i < 5; i++) console.log(nums.push(i));
+const a = [];
+const b = a;
+a.push("x");
+console.log(b.length, b[0]);
+const obj = { push: (v) => v * 10 };
+console.log(obj.push(4));
+const s = "abc";
+console.log(s.length);
+function run() {
+  const xs = [];
+  for (let k = 0; k < 3; k++) xs.push(k * k);
+  return xs.join(",");
+}
+console.log(run());
+console.log(nums.push(7, 8), nums.length);
+const p = nums.push;
+try { p(1); } catch (e) { console.log("threw", typeof e); }
+let holder = { items: [] };
+holder.items.push(42);
+console.log(holder.items[0]);
+const big = [];
+for (let q = 0; q < 100000; q++) big.push(q);
+console.log(big.length, big[99999]);

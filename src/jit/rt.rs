@@ -9,6 +9,8 @@ use crate::bytecode::Proto;
 use crate::value::{obj_get_key, obj_put, ArrRef, Value};
 use crate::vm::Vm;
 
+use super::{call_numbers, numbers_arity, MAX_NUMBER_ARGS};
+
 /// Status codes, returned in `rax`.
 pub const STATUS_DONE: u64 = 0;
 pub const STATUS_THREW: u64 = 1;
@@ -65,6 +67,12 @@ unsafe fn finish(vm: &mut Vm, result: Result<usize, Value>, next: usize) -> Help
     }
 }
 
+/// `x % y` for numbers: the remainder with the sign of `x`, which is JavaScript's `%`. Native code
+/// calls it when its inline path does not cover the operands.
+pub extern "C" fn js_mod(x: f64, y: f64) -> f64 {
+    x % y
+}
+
 /// Runs the instruction at `ip`, which native code does not handle itself.
 ///
 /// # Safety
@@ -102,13 +110,15 @@ pub unsafe extern "C" fn call_plain(
 ) -> PlainCall {
     let vm = &mut *vm;
     let (_, base) = enter(vm, ip + 1, depth);
-    let code = match vm.push_callee(argc) {
-        Some(code) => (*code).entry() as u64,
-        None => {
-            let idx = vm.stack.len() - argc - 2;
-            if vm.push_in_place(idx, argc) {
-                STATUS_DONE
-            } else {
+    // The callee is one of a push, a number function or a compiled closure, and each test is a
+    // single comparison of its tag, so the push, the most common call in array code, goes first.
+    let idx = vm.stack.len() - argc - 2;
+    let code = if vm.push_in_place(idx, argc) || call_plain_numbers(vm, argc) {
+        STATUS_DONE
+    } else {
+        match vm.push_callee(argc) {
+            Some(code) => (*code).entry() as u64,
+            None => {
                 let result = vm.call_op(argc, false, false).map(|()| ip + 1);
                 finish(vm, result, ip + 1).status
             }
@@ -118,6 +128,37 @@ pub unsafe extern "C" fn call_plain(
         code,
         base: vm.stack.as_mut_ptr().add(base),
     }
+}
+
+/// Runs the call of a function that native code compiled for numbers (see `call_numbers`), when the
+/// arguments it uses are numbers. Returns false, and leaves the stack as it is, when the call must run
+/// in the interpreter.
+fn call_plain_numbers(vm: &mut Vm, argc: usize) -> bool {
+    let idx = vm.stack.len() - argc - 2;
+    let closure = match &vm.stack[idx] {
+        Value::Func(c) => Rc::clone(c),
+        _ => return false,
+    };
+    let Some(n) = numbers_arity(&closure) else {
+        return false;
+    };
+    if argc < n || n > MAX_NUMBER_ARGS {
+        return false;
+    }
+    let mut args = [0.0; MAX_NUMBER_ARGS];
+    for (j, arg) in args.iter_mut().take(n).enumerate() {
+        match &vm.stack[idx + 2 + j] {
+            Value::Num(x) => *arg = *x,
+            _ => return false,
+        }
+    }
+    let Some(out) = call_numbers(&closure, &args[..n]) else {
+        return false;
+    };
+    // The result replaces the callee, and the `this` and the arguments above it are dropped.
+    vm.stack.truncate(idx);
+    vm.stack.push(out);
+    true
 }
 
 /// Runs the call or construct at `ip` with `argc` arguments. The callee has finished on return.
@@ -164,6 +205,33 @@ pub unsafe extern "C" fn assign_clone(src: *const Value, dst: *mut Value) {
 /// `p` must point at a valid value, which is not used again.
 pub unsafe extern "C" fn drop_value(p: *mut Value) {
     ptr::drop_in_place(p);
+}
+
+/// Runs `arr.push(v)` for native code, when the callee at `callee` is the built-in `push` and `this`,
+/// the slot above it, is an array. The argument, the slot above `this`, moves into the array, and the
+/// result replaces the callee. Returns false, and changes nothing, when `this` is not an array.
+///
+/// # Safety
+/// `callee` must point at three valid values, the callee being the built-in `push`. The argument slot
+/// is dead afterwards.
+pub unsafe extern "C" fn push_call(callee: *mut Value) -> bool {
+    let (this, arg) = (callee.add(1), callee.add(2));
+    let Value::Arr(items) = &*this else {
+        return false;
+    };
+    let v = ptr::read(arg);
+    let len = {
+        let mut vec = items.borrow_mut();
+        vec.push(v);
+        vec.len()
+    };
+    // `this` held one reference to the array, which is released here, as the slot is dead after.
+    let Value::Arr(items) = ptr::read(this) else {
+        unreachable!("`this` was checked to be an array")
+    };
+    drop(items);
+    ptr::write(callee, Value::Num(len as f64));
+    true
 }
 
 /// Moves the value at `src` into `dst`, dropping what `dst` held. `src` is dead afterwards.
