@@ -241,6 +241,15 @@ pub fn type_of(v: &Value) -> &'static str {
     }
 }
 
+/// `ToInt32`: the number as the 32-bit integer that the bitwise operators work on. Infinities and NaN are 0, and
+/// anything else is truncated and wrapped modulo 2^32.
+pub fn to_int32(n: f64) -> i32 {
+    if !n.is_finite() {
+        return 0;
+    }
+    (n.trunc().rem_euclid(4_294_967_296.0) as u32) as i32
+}
+
 pub fn to_num(v: &Value) -> f64 {
     match v {
         Value::Undef => f64::NAN,

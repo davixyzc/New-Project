@@ -83,6 +83,14 @@ pub enum Op {
     ToNumber,
     TypeOf,
     ToStr,
+    // bitwise operators, on 32-bit integers
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    UShr,
+    BitNot,
     // control flow (operand: absolute instruction index)
     Jump(u32),
     JumpIfFalse(u32),

@@ -164,6 +164,12 @@ pub(super) fn delta(op: Op) -> i32 {
         | Op::Div
         | Op::Mod
         | Op::Pow
+        | Op::BitAnd
+        | Op::BitOr
+        | Op::BitXor
+        | Op::Shl
+        | Op::Shr
+        | Op::UShr
         | Op::Eq
         | Op::Ne
         | Op::StrictEq
@@ -188,6 +194,7 @@ pub(super) fn delta(op: Op) -> i32 {
         | Op::GetProp(_)
         | Op::Neg
         | Op::Not
+        | Op::BitNot
         | Op::ToNumber
         | Op::TypeOf
         | Op::ToStr

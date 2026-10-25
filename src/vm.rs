@@ -458,6 +458,21 @@ fn put(slot: &mut Value, v: Value) {
     }
 }
 
+/// A bitwise operator on two numbers, computed on 32-bit integers as JavaScript does. A shift counts only the low
+/// five bits of its right operand.
+fn bitwise(op: Op, a: f64, b: f64) -> f64 {
+    let (x, y) = (to_int32(a), to_int32(b));
+    let shift = (y as u32) & 31;
+    f64::from(match op {
+        Op::BitAnd => x & y,
+        Op::BitOr => x | y,
+        Op::BitXor => x ^ y,
+        Op::Shl => x.wrapping_shl(shift),
+        Op::Shr => x >> shift,
+        _ => return f64::from((x as u32) >> shift),
+    })
+}
+
 /// The array index a property name spells, such as "2" but not "02" or "-1": digits without a leading zero,
 /// below the array size limit.
 fn array_key_index(name: &str) -> Option<usize> {
@@ -1591,6 +1606,16 @@ impl Vm {
                     self.stack.push(Value::Num(to_num(&a) / to_num(&b)));
                 }
             },
+            Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr => {
+                let (a, b) = self.pop_pair();
+                self.stack
+                    .push(Value::Num(bitwise(op, to_num(&a), to_num(&b))));
+            }
+            Op::BitNot => {
+                let a = self.pop();
+                self.stack
+                    .push(Value::Num(f64::from(!to_int32(to_num(&a)))));
+            }
             Op::Mod => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Num(js_mod(x, y))),
                 None => {

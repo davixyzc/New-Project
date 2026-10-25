@@ -600,7 +600,25 @@ impl Parser {
         }
         let left = self.conditional()?;
         let op = match self.peek() {
-            Tok::Punct(p) if matches!(*p, "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "**=") => *p,
+            Tok::Punct(p)
+                if matches!(
+                    *p,
+                    "=" | "+="
+                        | "-="
+                        | "*="
+                        | "/="
+                        | "%="
+                        | "**="
+                        | "&="
+                        | "|="
+                        | "^="
+                        | "<<="
+                        | ">>="
+                        | ">>>="
+                ) =>
+            {
+                *p
+            }
             _ => return Ok(left),
         };
         check_target(&left).map_err(|_| self.unexpected("assignment target"))?;
@@ -647,7 +665,7 @@ impl Parser {
     fn unary(&mut self) -> Result<Expr, String> {
         if let Tok::Punct(p) = self.peek() {
             let p = *p;
-            if matches!(p, "!" | "-" | "+") {
+            if matches!(p, "!" | "-" | "+" | "~") {
                 self.pos += 1;
                 let e = self.unary()?;
                 return Ok(Expr::Unary(p, Box::new(e)));
@@ -876,11 +894,15 @@ fn binop_prec(op: &str) -> Option<u8> {
         "??" => 1,
         "||" => 2,
         "&&" => 3,
-        "==" | "!=" | "===" | "!==" => 4,
-        "<" | "<=" | ">" | ">=" => 5,
-        "+" | "-" => 6,
-        "*" | "/" | "%" => 7,
-        "**" => 8,
+        "|" => 4,
+        "^" => 5,
+        "&" => 6,
+        "==" | "!=" | "===" | "!==" => 7,
+        "<" | "<=" | ">" | ">=" => 8,
+        "<<" | ">>" | ">>>" => 9,
+        "+" | "-" => 10,
+        "*" | "/" | "%" => 11,
+        "**" => 12,
         _ => return None,
     })
 }

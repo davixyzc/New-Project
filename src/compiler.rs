@@ -338,6 +338,12 @@ fn binop(op: &str) -> Op {
         "<=" => Op::Le,
         ">" => Op::Gt,
         ">=" => Op::Ge,
+        "&" => Op::BitAnd,
+        "|" => Op::BitOr,
+        "^" => Op::BitXor,
+        "<<" => Op::Shl,
+        ">>" => Op::Shr,
+        ">>>" => Op::UShr,
         _ => unreachable!("unknown binary operator {}", op),
     }
 }
@@ -1333,6 +1339,7 @@ impl Compiler {
                     "-" => Op::Neg,
                     "!" => Op::Not,
                     "+" => Op::ToNumber,
+                    "~" => Op::BitNot,
                     _ => Op::TypeOf,
                 };
                 self.emit(code);
