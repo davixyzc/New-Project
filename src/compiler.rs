@@ -14,7 +14,8 @@ use crate::value::Value;
 
 /// Compiles one source file into the prototype of its module wrapper function.
 pub fn compile_module(file: &str, src: &str) -> Result<Proto, String> {
-    let def = parse_program(src)?;
+    let mut def = parse_program(src)?;
+    crate::scalar::run(&mut def);
     let mut c = Compiler {
         funcs: Vec::new(),
         file: Rc::from(file),

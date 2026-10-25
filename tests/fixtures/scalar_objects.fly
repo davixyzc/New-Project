@@ -1,0 +1,70 @@
+// Objects that never escape are kept in plain variables. Each line is checked against Node.
+let total = 0;
+for (let i = 0; i < 5; i++) {
+  const p = { x: i, y: i * 2 };
+  p.x += 10;
+  p.y++;
+  total += p.x + p.y;
+}
+console.log(total);
+
+// Passing the object on, or using it as a value, keeps the object.
+function show(o) { return o.x + ":" + o.y; }
+const q = { x: 1, y: 2 };
+console.log(show(q), typeof q, JSON.stringify(q));
+
+// A method call keeps `this`.
+const m = { n: 3, add(k) { return this.n + k; } };
+console.log(m.add(4));
+
+// Closures read and write the properties.
+function counter() {
+  const c = { n: 0 };
+  return () => { c.n += 1; return c.n; };
+}
+const next = counter();
+next();
+next();
+console.log(next());
+
+// The same name declared twice is never rewritten.
+{
+  const d = { v: 1 };
+  console.log(d.v);
+}
+{
+  const d = { v: 2 };
+  console.log(d.v);
+}
+
+// A property the literal does not set reads as undefined; writing a new one keeps the object.
+const r = { a: 1 };
+console.log(r.b, r.a);
+r.b = 5;
+console.log(r.b);
+
+// Reassigning the name keeps the object.
+let s = { k: 7 };
+const t = s;
+s = { k: 8 };
+console.log(t.k, s.k);
+
+// Index access keeps the object.
+const idx = { z: 9 };
+console.log(idx["z"]);
+
+// Values that are objects and arrays.
+const nested = { inner: { deep: 4 }, list: [1, 2, 3] };
+console.log(nested.inner.deep, nested.list.length);
+
+// A rewritten object inside a function, with the same name used in another function.
+function f() {
+  const k = { w: 3 };
+  return k.w * 2;
+}
+function g(k) { return k + 1; }
+console.log(f(), g(1));
+
+// Duplicate keys keep the object.
+const dup = { a: 1, a: 2 };
+console.log(dup.a);

@@ -7,6 +7,7 @@ mod compiler;
 mod jit;
 mod lexer;
 mod parser;
+mod scalar;
 mod value;
 mod vm;
 
