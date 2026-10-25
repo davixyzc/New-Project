@@ -581,8 +581,17 @@ impl Parser {
 
     // ----- expressions ------------------------------------------------------
 
+    /// An expression, which may be a comma-separated sequence. Its value is that of the last item.
     pub fn expression(&mut self) -> Result<Expr, String> {
-        self.assign()
+        let first = self.assign()?;
+        if !self.is_punct(",") {
+            return Ok(first);
+        }
+        let mut items = vec![first];
+        while self.eat(",") {
+            items.push(self.assign()?);
+        }
+        Ok(Expr::Sequence(items))
     }
 
     fn assign(&mut self) -> Result<Expr, String> {
@@ -657,6 +666,10 @@ impl Parser {
         if self.eat_word("typeof") {
             let e = self.unary()?;
             return Ok(Expr::Unary("typeof", Box::new(e)));
+        }
+        if self.eat_word("void") {
+            let e = self.unary()?;
+            return Ok(Expr::Unary("void", Box::new(e)));
         }
         self.postfix()
     }

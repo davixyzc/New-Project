@@ -153,6 +153,22 @@ impl Lexer {
     }
 
     fn number(&mut self) -> Result<Tok, String> {
+        if self.peek(0) == '0' && matches!(self.peek(1), 'b' | 'B' | 'o' | 'O') {
+            let radix: u32 = if matches!(self.peek(1), 'b' | 'B') {
+                2
+            } else {
+                8
+            };
+            self.pos += 2;
+            let start = self.pos;
+            while self.peek(0).is_digit(radix) {
+                self.pos += 1;
+            }
+            let digits: String = self.chars[start..self.pos].iter().collect();
+            return u64::from_str_radix(&digits, radix)
+                .map(|n| Tok::Num(n as f64))
+                .map_err(|_| self.err("invalid binary or octal literal"));
+        }
         if self.peek(0) == '0' && matches!(self.peek(1), 'x' | 'X') {
             self.pos += 2;
             let start = self.pos;

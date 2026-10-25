@@ -19,6 +19,10 @@ pub static METHODS: &[NativeDef] = &[
         func: index_of,
     },
     NativeDef {
+        name: "lastIndexOf",
+        func: last_index_of,
+    },
+    NativeDef {
         name: "includes",
         func: includes,
     },
@@ -162,6 +166,37 @@ fn position_arg(args: &[Value], i: usize, default: usize, len: usize) -> usize {
 /// The byte offset of character `pos`, which is at most the length of `s` in characters.
 fn byte_offset(s: &str, pos: usize) -> usize {
     s.char_indices().nth(pos).map_or(s.len(), |(b, _)| b)
+}
+
+fn last_index_of(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let s = this_str(&this);
+    let needle = str_arg(args, 0);
+    let len = s.chars().count();
+    let m = needle.chars().count();
+    if m > len {
+        return Ok(Value::Num(-1.0));
+    }
+    // A missing or NaN position lets the match start anywhere, as in JavaScript.
+    let from = match arg(args, 1) {
+        Value::Undef => len,
+        v => {
+            let n = to_num(&v);
+            if n.is_nan() {
+                len
+            } else {
+                n.trunc().clamp(0.0, len as f64) as usize
+            }
+        }
+    };
+    let offsets: Vec<usize> = s
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(s.len()))
+        .collect();
+    let found = (0..=from.min(len - m))
+        .rev()
+        .find(|&k| s[offsets[k]..].starts_with(needle.as_str()));
+    Ok(Value::Num(found.map_or(-1.0, |k| k as f64)))
 }
 
 fn char_at_method(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {

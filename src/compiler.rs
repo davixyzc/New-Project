@@ -253,7 +253,7 @@ fn scan_expr(e: &Expr, nested: bool, out: &mut HashSet<String>) {
     match e {
         Expr::Ident(name) => note(name, nested, out),
         Expr::Func(def) => scan_func(def, out),
-        Expr::Template(_, parts) | Expr::Array(parts) => {
+        Expr::Template(_, parts) | Expr::Array(parts) | Expr::Sequence(parts) => {
             for p in parts {
                 scan_expr(p, nested, out);
             }
@@ -306,6 +306,7 @@ fn is_pure(e: &Expr) -> bool {
             is_pure(a) && is_pure(b)
         }
         Expr::Cond(a, b, c) => is_pure(a) && is_pure(b) && is_pure(c),
+        Expr::Sequence(items) => items.iter().all(is_pure),
         Expr::Update { .. } | Expr::Assign(..) | Expr::Call(..) | Expr::New(..) => false,
     }
 }
@@ -1320,6 +1321,13 @@ impl Compiler {
                         return Ok(());
                     }
                 }
+                if *op == "void" {
+                    // `void x` evaluates `x`, then yields undefined.
+                    self.expr(x)?;
+                    self.emit(Op::Pop);
+                    self.emit(Op::Undef);
+                    return Ok(());
+                }
                 self.expr(x)?;
                 let code = match *op {
                     "-" => Op::Neg,
@@ -1328,6 +1336,15 @@ impl Compiler {
                     _ => Op::TypeOf,
                 };
                 self.emit(code);
+            }
+            Expr::Sequence(items) => {
+                if let Some((last, rest)) = items.split_last() {
+                    for item in rest {
+                        self.expr(item)?;
+                        self.emit(Op::Pop);
+                    }
+                    self.expr(last)?;
+                }
             }
             Expr::Update { op, prefix, target } => self.update(op, *prefix, target)?,
             Expr::Binary(op, a, b) => {

@@ -100,4 +100,6 @@ pub enum Expr {
     Index(Box<Expr>, Box<Expr>),
     /// `...expr`; only valid inside array literals and call arguments.
     Spread(Box<Expr>),
+    /// `a, b, c`: each item is evaluated in turn, and the value is the last item's.
+    Sequence(Vec<Expr>),
 }

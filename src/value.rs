@@ -252,28 +252,46 @@ fn could_tie(x: f64) -> bool {
 }
 
 pub fn to_str(v: &Value) -> String {
+    to_str_in(v, &mut Vec::new())
+}
+
+/// `to_str`, where `joining` lists the arrays whose text is still being built further out.
+fn to_str_in(v: &Value, joining: &mut Vec<*const RefCell<Vec<Value>>>) -> String {
     match v {
         Value::Undef => "undefined".to_string(),
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Num(n) => num_to_string(*n),
         Value::Str(s) => s.to_string(),
-        Value::Arr(a) => a
-            .borrow()
-            .iter()
-            .map(|item| {
-                if item.is_nullish() {
-                    String::new()
-                } else {
-                    to_str(item)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(","),
+        Value::Arr(a) => join_items(a, ",", joining),
         Value::Obj(o) => error_text(o).unwrap_or_else(|| "[object Object]".to_string()),
         Value::Func(_) | Value::Native(_) => "function".to_string(),
-        Value::Cell(c) => to_str(&c.borrow()),
+        Value::Cell(c) => to_str_in(&c.borrow(), joining),
     }
+}
+
+/// Joins the items of an array with `sep`; a null or undefined item is empty. An array that is already in `joining`
+/// is empty too, so an array that contains itself ends there, as in `Array.prototype.join`.
+pub fn join_items(a: &ArrRef, sep: &str, joining: &mut Vec<*const RefCell<Vec<Value>>>) -> String {
+    let id = Rc::as_ptr(a);
+    if joining.contains(&id) {
+        return String::new();
+    }
+    joining.push(id);
+    let text = a
+        .borrow()
+        .iter()
+        .map(|item| {
+            if item.is_nullish() {
+                String::new()
+            } else {
+                to_str_in(item, joining)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(sep);
+    joining.pop();
+    text
 }
 
 /// `Number(text)` for a string: decimal numbers, `0x`, `0o` and `0b` integers, and the names `Infinity` and
@@ -438,7 +456,17 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Num(x), Value::Num(y)) => x.partial_cmp(y),
         (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+        _ if a.is_object() || b.is_object() => compare(&to_primitive(a), &to_primitive(b)),
         _ => to_num(a).partial_cmp(&to_num(b)),
+    }
+}
+
+/// Objects, arrays and functions take their text, as `ToPrimitive` does before a relational comparison.
+fn to_primitive(v: &Value) -> Value {
+    if v.is_object() {
+        Value::str(&to_str(v))
+    } else {
+        v.clone()
     }
 }
 

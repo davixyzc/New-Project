@@ -603,6 +603,7 @@ fn children(e: &Expr) -> Vec<&Expr> {
             vec![a.as_ref(), b.as_ref()]
         }
         Expr::Cond(a, b, c) => vec![a.as_ref(), b.as_ref(), c.as_ref()],
+        Expr::Sequence(items) => items.iter().collect(),
         Expr::Call(callee, args) | Expr::New(callee, args) => std::iter::once(callee.as_ref())
             .chain(args.iter())
             .collect(),
@@ -626,6 +627,7 @@ fn children_mut(e: &mut Expr) -> Vec<&mut Expr> {
             vec![a.as_mut(), b.as_mut()]
         }
         Expr::Cond(a, b, c) => vec![a.as_mut(), b.as_mut(), c.as_mut()],
+        Expr::Sequence(items) => items.iter_mut().collect(),
         Expr::Call(callee, args) | Expr::New(callee, args) => std::iter::once(callee.as_mut())
             .chain(args.iter_mut())
             .collect(),

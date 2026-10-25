@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 
 use crate::builtins::arg;
-use crate::value::{strict_eq, to_num, to_str, truthy, ArrRef, NativeDef, Value};
+use crate::value::{join_items, strict_eq, to_num, to_str, truthy, ArrRef, NativeDef, Value};
 use crate::vm::{Callback, Vm, MAX_ARRAY_GROW};
 
 pub static METHODS: &[NativeDef] = &[
@@ -83,6 +83,14 @@ pub static METHODS: &[NativeDef] = &[
         name: "sort",
         func: sort,
     },
+    NativeDef {
+        name: "lastIndexOf",
+        func: last_index_of,
+    },
+    NativeDef {
+        name: "toString",
+        func: to_string_method,
+    },
 ];
 
 /// The `push` method. It is the first entry of `METHODS`, and the VM runs it in place (see
@@ -108,26 +116,21 @@ fn element(a: &ArrRef, i: usize) -> Option<Value> {
     a.borrow().get(i).cloned()
 }
 
-/// Turns optional start/end arguments into a valid range. Negative values count from the end.
+/// Turns start/end arguments into a valid range. Negative values count from the end, and fractions drop toward
+/// zero first. Only a missing `end` means the end of the sequence; `null` is zero.
 pub fn bounds(len: usize, start: &Value, end: &Value) -> (usize, usize) {
     let clamp = |v: f64| -> usize {
-        if v.is_nan() {
-            0
-        } else if v < 0.0 {
+        let v = if v.is_nan() { 0.0 } else { v.trunc() };
+        if v < 0.0 {
             (len as f64 + v).max(0.0) as usize
         } else {
             (v as usize).min(len)
         }
     };
-    let s = if start.is_nullish() {
-        0
-    } else {
-        clamp(to_num(start))
-    };
-    let e = if end.is_nullish() {
-        len
-    } else {
-        clamp(to_num(end))
+    let s = clamp(to_num(start));
+    let e = match end {
+        Value::Undef => len,
+        _ => clamp(to_num(end)),
     };
     (s, e.max(s))
 }
@@ -203,19 +206,43 @@ fn join(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
         Value::Undef => ",".to_string(),
         v => to_str(&v),
     };
-    let text = a
-        .borrow()
-        .iter()
-        .map(|x| {
-            if x.is_nullish() {
-                String::new()
-            } else {
-                to_str(x)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(&sep);
-    Ok(Value::str(&text))
+    Ok(Value::str(&join_items(&a, &sep, &mut Vec::new())))
+}
+
+fn last_index_of(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
+    let a = array_of(vm, &this)?;
+    let items = a.borrow();
+    let target = arg(args, 0);
+    let len = items.len() as f64;
+    // Without a position the search starts at the last item. A position that is given counts as a number,
+    // so `undefined` there means 0.
+    let from = if args.len() < 2 {
+        len - 1.0
+    } else {
+        let n = to_num(&args[1]);
+        if n.is_nan() {
+            0.0
+        } else {
+            n.trunc()
+        }
+    };
+    let start = if from >= 0.0 {
+        from.min(len - 1.0)
+    } else {
+        len + from
+    };
+    if start < 0.0 {
+        return Ok(Value::Num(-1.0));
+    }
+    let found = (0..=start as usize)
+        .rev()
+        .find(|&i| strict_eq(&items[i], &target));
+    Ok(Value::Num(found.map_or(-1.0, |i| i as f64)))
+}
+
+/// `Array.prototype.toString`: the items joined with commas, as `String(array)` gives.
+fn to_string_method(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(Value::str(&to_str(&this)))
 }
 
 fn concat(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
