@@ -88,12 +88,12 @@ A coluna **fly (JIT)** usa o binário com PGO (`scripts/pgo-build.sh`), com cód
 | 1M objetos literais | **14 ms** | 89 ms | 73 ms | 449 ms |
 | 200k concatenações de string | **9 ms** | 15 ms | 71 ms | 57 ms |
 
-Outras medidas, com o binário com PGO (a inicialização é a mediana de 15 execuções):
+Outras medidas, com o binário com PGO (a inicialização é a mediana de 400 execuções intercaladas com Node e Python, numa mesma medição; entre medições a variação chega a 0,3 ms):
 
 | | fly | Node 22 | Python 3 |
 | --- | ---: | ---: | ---: |
-| tamanho do executável | **916 KB** (PGO); 864 KB sem PGO | 123 MB | — |
-| inicialização (`-e 'console.log(1)'`) | **3,3 ms** | 54 ms | 26 ms |
+| tamanho do executável | **900 KB** (PGO); 846 KB sem PGO | 123 MB | — |
+| inicialização (`-e 'console.log(1)'`) | **3,5 ms** | 48 ms | 24 ms |
 | memória de pico, 1M inteiros em array | **18 MB** | 77 MB | 47 MB |
 
 **Leitura honesta**: nesta sessão o fly ficou em 97 ms no `fib`, contra 91 do Node, e em 161 ms no laço, contra 139 do Node. Nos dois é mais rápido que o CPython. Em `push` seguido de `map`/`filter`/`reduce`, em objetos e em strings ele fica na frente. Essas diferenças com o Node são pequenas, e a sessão anterior mostrou que o Node pode variar bem mais que isso, então elas não bastam para uma conclusão. A medida mais estável do próprio fly é a **contagem de instruções** (`callgrind`), que não depende da máquina. Em relação ao commit anterior (mesmo build, sem PGO): `fib` caiu de 917 para 822 milhões de instruções (−10%), e o `array` de 1213 para 1076 milhões (−11%). Laço, objetos e strings ficaram iguais. Dentro do `array`, um `push` caiu de cerca de 383 para cerca de 258 instruções, e um elemento de `map` ainda custa cerca de 320.
@@ -114,7 +114,7 @@ Outras medidas, com o binário com PGO (a inicialização é a mediana de 15 exe
 - **Chamadas sem alocação**: os argumentos vão para um buffer reaproveitado, e os callbacks de array recebem os valores por movimento. Chamadas diretas de funções compiladas montam o quadro sem passar pelo caminho geral.
 - **Chamadas diretas entre funções compiladas**: o código nativo chama o código do callee sem passar pelo despacho geral. Os quadros ficam num buffer de layout fixo (`FrameStack`), e a volta informa onde o quadro do chamador ficou, porque a pilha pode ter sido realocada.
 - **`push` no lugar**: `arr.push(v)` com um argumento move o valor para o array e troca o `this` pelo resultado, sem montar a lista de argumentos. Só vale quando o método é o `push` embutido.
-- **Inicialização**: `--version` e `--help` não criam a thread do interpretador (cerca de meio milissegundo a menos), e o `Vm` não é liberado ao sair. A linkagem estática (`RUSTFLAGS="-C target-feature=+crt-static"`) reduziria a inicialização em cerca de um quarto, mas o binário passaria de 864 KB para 1,9 MB, então não é o padrão.
+- **Inicialização**: o binário não tem `main` do Rust. O `main` do C (`#![no_main]`) pula a inicialização padrão do runtime, que custa cerca de 0,2 ms, e mantém o que o runtime fazia: `SIGPIPE` ignorado e a saída descarregada no fim. `--version` e `--help` não criam a thread do interpretador. A thread de 256 MB custa cerca de 0,5 ms, mas é ela que sustenta a liberação recursiva de estruturas longas (uma lista de 300 mil nós estoura uma pilha de 8 MB). A linkagem estática pouparia cerca de 0,7 ms, mas o binário passaria de 900 KB para 1,9 MB, então não é o padrão.
 - **Escalares sem `drop`**: sobrescrever ou descartar um número não chama o destrutor do valor.
 - **Testado e descartado**: divisão por constante com multiplicação mágica (Hacker's Delight, figura 10-1). Estava correta e foi testada contra `%`, mas nesta CPU o `idiv` de 32 bits continuou mais rápido, e o código saiu.
 
