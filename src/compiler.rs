@@ -11,7 +11,7 @@ use std::rc::Rc;
 use crate::ast::*;
 use crate::bytecode::{Op, Proto, UpvalDesc};
 use crate::parser::parse_program;
-use crate::value::Value;
+use crate::value::{PropHint, Value};
 
 /// Compiles one source file into the prototype of its module wrapper function.
 pub fn compile_module(file: &str, src: &str) -> Result<Proto, String> {
@@ -771,7 +771,7 @@ impl Compiler {
             code: fs.code,
             lines: fs.lines,
             consts: fs.consts,
-            hints: vec![Cell::new(0); fs.names.len()],
+            hints: vec![PropHint::default(); fs.names.len()],
             global_hints: vec![Cell::new(0); fs.names.len()],
             call_entry: Cell::new(0),
             call_frame_len: Cell::new(0),

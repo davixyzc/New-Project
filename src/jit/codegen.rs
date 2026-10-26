@@ -19,7 +19,9 @@ use super::rt::{self, STATUS_JUMP};
 use super::types::{number_slots, Numbers};
 use super::x64::*;
 use crate::bytecode::{Op, Proto};
-use crate::value::{arr_layout, prop_layout, ArrLayout, PropLayout, Value};
+use crate::value::{
+    arr_layout, entry_layout, prop_layout, ArrLayout, EntryLayout, PropHint, PropLayout, Value,
+};
 use crate::vm::{globals_slots_offset, MAX_ARRAY_GROW};
 
 /// Tags of `Value`, the discriminants `#[repr(u8)]` gives its variants.
@@ -35,11 +37,10 @@ const TAG_NATIVE: u8 = 8;
 /// Bit `n` is set when tag `n` owns a reference (see `Value::owns_ref`).
 const OWNING: u32 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 9);
 
-/// A property access in the code: the name, the cell of the position hint for it, and the layout of the properties (see
-/// `prop_layout`). Native code reads and writes the property in place when the hint finds it.
+/// A property access in the code: the hint that names the shape and the position of the property, and the layout of
+/// the properties (see `prop_layout`). Native code reads and writes the property in place when the hint finds it.
 #[derive(Clone, Copy)]
 struct PropSite {
-    name: usize,
     hint: usize,
     layout: PropLayout,
 }
@@ -1094,54 +1095,57 @@ impl<'a> Gen<'a> {
         self.a.mov_store(Mem { base: ptr, disp: 0 }, R8);
     }
 
-    /// Leaves in RDX the entry of the property `name` of the object at `obj`, when the object is a plain one and the
-    /// property is at the position that `hint` holds, as `Props::position_hinted` finds it. The key is compared by both
-    /// words of its `Rc<str>`, which are equal exactly when the keys share an allocation. Any other object jumps to
-    /// `miss`, before anything has changed.
+    /// Leaves in RDX the address of the value of the property that the hint of `site` names, when the object at `obj` is
+    /// a plain one with the shape that the hint holds (see `PropHint`). Any other object jumps to `miss`, before anything
+    /// has changed.
     fn prop_entry(&mut self, obj: Mem, site: PropSite, miss: Label) {
-        let PropSite { name, hint, layout } = site;
+        let PropSite { hint, layout } = site;
         self.check_tag(obj, TAG_OBJ, miss);
         self.a.mov_load(RCX, obj.at(8));
-        self.a.add64_imm32(RCX, layout.items);
+        // The shape of the object must be the one that the hint holds.
+        self.a.mov_load(
+            RAX,
+            Mem {
+                base: RCX,
+                disp: layout.shape,
+            },
+        );
+        self.a.mov_imm64(R8, hint as u64);
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: R8,
+                disp: std::mem::offset_of!(PropHint, shape) as i32,
+            },
+        );
+        self.a.cmp_rr64(RAX, RSI);
+        self.a.jcc(CC_NE, miss);
+        // The position that the hint holds must be inside the values.
+        self.a.mov32_load(
+            RAX,
+            Mem {
+                base: R8,
+                disp: std::mem::offset_of!(PropHint, index) as i32,
+            },
+        );
         self.a.mov_load(
             RSI,
             Mem {
                 base: RCX,
-                disp: layout.len,
+                disp: layout.values + layout.len,
             },
         );
+        self.a.cmp_rr64(RAX, RSI);
+        self.a.jcc(CC_AE, miss);
         self.a.mov_load(
             RDX,
             Mem {
                 base: RCX,
-                disp: layout.buf,
+                disp: layout.values + layout.buf,
             },
         );
-        self.a.mov_imm64(RAX, hint as u64);
-        self.a.mov32_load(RAX, Mem { base: RAX, disp: 0 });
-        self.a.cmp_rr64(RAX, RSI);
-        self.a.jcc(CC_AE, miss);
-        self.a.imul64_imm(RAX, RAX, layout.entry);
+        self.a.shl64_imm(RAX, 4);
         self.a.add64(RDX, RAX);
-        self.a.mov_imm64(RAX, name as u64);
-        for word in [0, 8] {
-            self.a.mov_load(
-                RSI,
-                Mem {
-                    base: RAX,
-                    disp: word,
-                },
-            );
-            self.a.mov_load(
-                RDI,
-                Mem {
-                    base: RDX,
-                    disp: layout.key + word,
-                },
-            );
-            self.a.cmp_rr64(RSI, RDI);
-            self.a.jcc(CC_NE, miss);
-        }
     }
 
     /// `a % b` on whole numbers, which `value::js_mod` gives by the same integer division. The dividend must be a whole
@@ -1281,7 +1285,7 @@ impl<'a> Gen<'a> {
         dst: Mem,
         name: usize,
         hint: usize,
-        layout: PropLayout,
+        layout: EntryLayout,
         miss: Label,
         done: Label,
     ) {
@@ -1341,6 +1345,107 @@ impl<'a> Gen<'a> {
         self.a.jmp(done);
     }
 
+    /// Moves the value at `val` into the object at `obj` as the property that the transition in `hint` adds, when the
+    /// object has the shape that the transition starts from and room for one more value (see `Props::push_hinted`). The
+    /// object takes the transition's shape and gives up the shape it had. The shape tree keeps every shape alive, so no
+    /// shape's count reaches zero here. Anything else jumps to `miss`, before anything has changed.
+    fn init_prop_native(
+        &mut self,
+        obj: Mem,
+        val: Mem,
+        hint: usize,
+        layout: PropLayout,
+        miss: Label,
+        done: Label,
+    ) {
+        self.check_tag(obj, TAG_OBJ, miss);
+        self.a.mov_load(RCX, obj.at(8));
+        // The object's shape is the one the transition starts from. A shape's id is its address, which the object's id
+        // field holds too (see `Props::id`), so that is the shape the object gives up.
+        self.a.mov_load(
+            RAX,
+            Mem {
+                base: RCX,
+                disp: layout.shape,
+            },
+        );
+        self.a.mov_imm64(R8, hint as u64);
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: R8,
+                disp: std::mem::offset_of!(PropHint, from) as i32,
+            },
+        );
+        self.a.cmp_rr64(RAX, RSI);
+        self.a.jcc(CC_NE, miss);
+        // The value goes to the next slot, which must be inside the capacity.
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: RCX,
+                disp: layout.values + layout.len,
+            },
+        );
+        self.a.mov_load(
+            RDI,
+            Mem {
+                base: RCX,
+                disp: layout.values + layout.cap,
+            },
+        );
+        self.a.cmp_rr64(RSI, RDI);
+        self.a.jcc(CC_AE, miss);
+        // The object takes the new shape, which gains a count, and gives up the old one.
+        self.a.mov_load(
+            R9,
+            Mem {
+                base: R8,
+                disp: std::mem::offset_of!(PropHint, to) as i32,
+            },
+        );
+        self.add_count(R9, 1);
+        self.add_count(RAX, -1);
+        self.a.mov_store(
+            Mem {
+                base: RCX,
+                disp: layout.shape_rc,
+            },
+            R9,
+        );
+        self.a.mov_store(
+            Mem {
+                base: RCX,
+                disp: layout.shape,
+            },
+            R9,
+        );
+        // The value moves into the slot after the last one.
+        self.a.mov_rr(R10, RSI);
+        self.a.shl64_imm(R10, 4);
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: RCX,
+                disp: layout.values + layout.buf,
+            },
+        );
+        self.a.add64(RDX, R10);
+        self.a.mov_load(RAX, val);
+        self.a.mov_load(R10, val.at(8));
+        self.a.mov_store(Mem { base: RDX, disp: 0 }, RAX);
+        self.a.mov_store(Mem { base: RDX, disp: 8 }, R10);
+        self.a.add64_imm8(RSI, 1);
+        self.a.mov_store(
+            Mem {
+                base: RCX,
+                disp: layout.values + layout.len,
+            },
+            RSI,
+        );
+        self.a.jmp(done);
+    }
+
     /// Copies the value of the property that `prop_entry` finds into `dst`, and jumps to `done`. A `consumed` object is
     /// the one that the instruction replaces, so its reference is released here, and it must not be the last one (the
     /// helper frees an object that the last reference leaves).
@@ -1354,7 +1459,6 @@ impl<'a> Gen<'a> {
         done: Label,
     ) {
         self.prop_entry(obj, site, miss);
-        let layout = site.layout;
         if consumed {
             self.a.mov_load(RCX, obj.at(8));
             self.a.mov_load(R8, Mem { base: RCX, disp: 0 });
@@ -1363,39 +1467,15 @@ impl<'a> Gen<'a> {
         }
         // The copy holds a reference of its own, if the value owns one.
         let plain = self.a.label();
-        self.a.movzx_load8(
-            R9,
-            Mem {
-                base: RDX,
-                disp: layout.value,
-            },
-        );
+        self.a.movzx_load8(R9, Mem { base: RDX, disp: 0 });
         self.a.mov_imm32(R10, OWNING);
         self.a.bt(R10, R9);
         self.a.jcc(CC_AE, plain);
-        self.a.mov_load(
-            R11,
-            Mem {
-                base: RDX,
-                disp: layout.value + 8,
-            },
-        );
+        self.a.mov_load(R11, Mem { base: RDX, disp: 8 });
         self.add_count(R11, 1);
         self.a.bind(plain);
-        self.a.mov_load(
-            RAX,
-            Mem {
-                base: RDX,
-                disp: layout.value,
-            },
-        );
-        self.a.mov_load(
-            RCX,
-            Mem {
-                base: RDX,
-                disp: layout.value + 8,
-            },
-        );
+        self.a.mov_load(RAX, Mem { base: RDX, disp: 0 });
+        self.a.mov_load(RCX, Mem { base: RDX, disp: 8 });
         if consumed {
             self.a.mov_load(R11, obj.at(8));
             self.add_count(R11, -1);
@@ -1411,29 +1491,16 @@ impl<'a> Gen<'a> {
     /// any other case jumps to `miss` before anything has changed.
     fn set_prop_native(&mut self, obj: Mem, val: Mem, site: PropSite, miss: Label, done: Label) {
         self.prop_entry(obj, site, miss);
-        let layout = site.layout;
         self.a.mov_imm32(R10, OWNING);
         self.a.mov_load(RCX, obj.at(8));
         self.a.mov_load(R8, Mem { base: RCX, disp: 0 });
         self.a.cmp64_imm8(R8, 1);
         self.a.jcc(CC_BE, miss);
         let old_plain = self.a.label();
-        self.a.movzx_load8(
-            R9,
-            Mem {
-                base: RDX,
-                disp: layout.value,
-            },
-        );
+        self.a.movzx_load8(R9, Mem { base: RDX, disp: 0 });
         self.a.bt(R10, R9);
         self.a.jcc(CC_AE, old_plain);
-        self.a.mov_load(
-            R11,
-            Mem {
-                base: RDX,
-                disp: layout.value + 8,
-            },
-        );
+        self.a.mov_load(R11, Mem { base: RDX, disp: 8 });
         self.a.mov_load(R8, Mem { base: R11, disp: 0 });
         self.a.cmp64_imm8(R8, 1);
         self.a.jcc(CC_BE, miss);
@@ -1450,38 +1517,14 @@ impl<'a> Gen<'a> {
         self.a.bind(new_plain);
         // The old value is released, which counts one reference down.
         let released = self.a.label();
-        self.a.movzx_load8(
-            R9,
-            Mem {
-                base: RDX,
-                disp: layout.value,
-            },
-        );
+        self.a.movzx_load8(R9, Mem { base: RDX, disp: 0 });
         self.a.bt(R10, R9);
         self.a.jcc(CC_AE, released);
-        self.a.mov_load(
-            R11,
-            Mem {
-                base: RDX,
-                disp: layout.value + 8,
-            },
-        );
+        self.a.mov_load(R11, Mem { base: RDX, disp: 8 });
         self.add_count(R11, -1);
         self.a.bind(released);
-        self.a.mov_store(
-            Mem {
-                base: RDX,
-                disp: layout.value,
-            },
-            RAX,
-        );
-        self.a.mov_store(
-            Mem {
-                base: RDX,
-                disp: layout.value + 8,
-            },
-            RCX,
-        );
+        self.a.mov_store(Mem { base: RDX, disp: 0 }, RAX);
+        self.a.mov_store(Mem { base: RDX, disp: 8 }, RCX);
         // The object's reference is released, and the object's slot takes the value that `val` gave up.
         self.a.mov_load(R11, obj.at(8));
         self.add_count(R11, -1);
@@ -1844,7 +1887,7 @@ impl<'a> Gen<'a> {
             Op::GetProp(i) => {
                 // Replaces an object or array by one of its properties. Other values take the slow path.
                 let name = &self.proto.names[i as usize] as *const Rc<str> as usize;
-                let hint = &self.proto.hints[i as usize] as *const Cell<u32> as usize;
+                let hint = &self.proto.hints[i as usize] as *const PropHint as usize;
                 let top = self.temp(d - 1);
                 let get = rt::get_prop_top as *const () as usize;
                 let args = [Arg::Addr(top), Arg::Imm(name as u64), Arg::Imm(hint as u64)];
@@ -1852,7 +1895,7 @@ impl<'a> Gen<'a> {
                 if let Some(layout) = prop_layout() {
                     // A property of a plain object is read in place, when the hint finds it (see `get_prop_native`).
                     let native_miss = self.a.label();
-                    let site = PropSite { name, hint, layout };
+                    let site = PropSite { hint, layout };
                     self.get_prop_native(top, top, site, true, native_miss, done);
                     self.a.bind(native_miss);
                 }
@@ -1891,13 +1934,26 @@ impl<'a> Gen<'a> {
                 Fast::Pure
             }
             Op::InitProp(i) => {
+                // Adds the property with its value, which moves into the object. The shape transition that a literal
+                // makes is the same each time, which the hint remembers (see `init_prop_native`).
                 let name = &self.proto.names[i as usize] as *const Rc<str> as usize;
+                let hint = &self.proto.hints[i as usize] as *const PropHint as usize;
                 let (obj, val) = (self.temp(d - 2), self.temp(d - 1));
                 let init = rt::init_prop as *const () as usize;
-                self.direct_call(
-                    init,
-                    &[Arg::Addr(obj), Arg::Imm(name as u64), Arg::Addr(val)],
-                );
+                let done = self.a.label();
+                if let Some(layout) = prop_layout() {
+                    let native_miss = self.a.label();
+                    self.init_prop_native(obj, val, hint, layout, native_miss, done);
+                    self.a.bind(native_miss);
+                }
+                let args = [
+                    Arg::Addr(obj),
+                    Arg::Imm(name as u64),
+                    Arg::Addr(val),
+                    Arg::Imm(hint as u64),
+                ];
+                self.direct_call(init, &args);
+                self.a.bind(done);
                 Fast::Pure
             }
             Op::GetLocalProp(s, n) => {
@@ -1905,7 +1961,7 @@ impl<'a> Gen<'a> {
                 let name = &self.proto.names[n as usize] as *const Rc<str> as usize;
                 let (src, dst) = (self.local(s), self.temp(d));
                 let get = rt::get_prop_into as *const () as usize;
-                let hint = &self.proto.hints[n as usize] as *const Cell<u32> as usize;
+                let hint = &self.proto.hints[n as usize] as *const PropHint as usize;
                 let args = [
                     Arg::Addr(src),
                     Arg::Imm(name as u64),
@@ -1916,7 +1972,7 @@ impl<'a> Gen<'a> {
                 if let Some(layout) = prop_layout() {
                     // A property of a plain object is read in place, when the hint finds it (see `get_prop_native`).
                     let native_miss = self.a.label();
-                    let site = PropSite { name, hint, layout };
+                    let site = PropSite { hint, layout };
                     self.get_prop_native(src, dst, site, false, native_miss, done);
                     self.a.bind(native_miss);
                 }
@@ -2124,7 +2180,7 @@ impl<'a> Gen<'a> {
                     Arg::Imm(hint as u64),
                 ];
                 let done = self.a.label();
-                if let Some(layout) = prop_layout() {
+                if let Some(layout) = entry_layout() {
                     // A global is read in place, when its hinted slot has the name (see `get_global_native`).
                     let native_miss = self.a.label();
                     self.get_global_native(dst, name, hint, layout, native_miss, done);
@@ -2140,14 +2196,14 @@ impl<'a> Gen<'a> {
                 // Replaces an object and a value by the value, which the property keeps a copy of. Other operands
                 // take the slow path.
                 let name = &self.proto.names[i as usize] as *const Rc<str> as usize;
-                let hint = &self.proto.hints[i as usize] as *const Cell<u32> as usize;
+                let hint = &self.proto.hints[i as usize] as *const PropHint as usize;
                 let (obj, val) = (self.temp(d - 2), self.temp(d - 1));
                 let set = rt::set_prop_top as *const () as usize;
                 let done = self.a.label();
                 if let Some(layout) = prop_layout() {
                     // A property of a plain object is stored in place, when the hint finds it (see `set_prop_native`).
                     let native_miss = self.a.label();
-                    let site = PropSite { name, hint, layout };
+                    let site = PropSite { hint, layout };
                     self.set_prop_native(obj, val, site, native_miss, done);
                     self.a.bind(native_miss);
                 }

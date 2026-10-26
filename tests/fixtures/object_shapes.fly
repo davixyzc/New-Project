@@ -1,0 +1,54 @@
+// Objects with the same keys in the same order share a shape. Other orders, deletes, more than sixteen keys, accessors,
+// prototypes and enumeration must each still see their own properties.
+function mk(a, b) { return { a: a, b: b }; }
+const o1 = mk(1, 2), o2 = mk(3, 4), o3 = { b: 5, a: 6 };
+let s = 0;
+for (let i = 0; i < 300; i++) {
+  const o = i % 3 === 0 ? o1 : (i % 3 === 1 ? o2 : o3);
+  s += o.a * 10 + o.b;
+}
+console.log("shapes", s, o3.a, o3.b);
+
+const objs = [];
+for (let i = 0; i < 4; i++) {
+  const o = {};
+  if (i % 2) { o.x = i; o.y = i * 2; } else { o.y = i * 2; o.x = i; }
+  objs.push(o);
+}
+console.log("orders", objs.map((o) => o.x + o.y).join(","), Object.keys(objs[0]).join(","), Object.keys(objs[1]).join(","));
+
+const d = { a: 1, b: 2, c: 3, d: 4 };
+delete d.b;
+d.e = 5;
+console.log("delete", Object.keys(d).join(","), d.a, d.c, d.d, d.e, d.b);
+let ds = 0;
+for (let i = 0; i < 100; i++) ds += d.a + d.c + d.e;
+console.log("deleted-sum", ds);
+
+const big = {};
+for (let i = 0; i < 40; i++) big["p" + i] = i;
+let bs = 0;
+for (let i = 0; i < 40; i++) bs += big["p" + i];
+console.log("big", bs, big.p0, big.p39, Object.keys(big).length, Object.keys(big)[16]);
+delete big.p5;
+console.log("bigdel", big.p5, big.p6, Object.keys(big).length);
+
+const src = { x: 1, y: 2, z: 3 };
+const copy = Object.assign({}, src, { w: 4 });
+console.log("assign", Object.keys(copy).join(","), copy.w, copy.z);
+
+class P { constructor(v) { this.v = v; this.w = v * 2; } get1() { return this.v; } }
+class Q extends P { constructor(v) { super(v); this.q = 1; } }
+const ps = [new P(1), new Q(2), new P(3)];
+let pt = 0;
+for (let i = 0; i < 99; i++) pt += ps[i % 3].get1() + ps[i % 3].w;
+console.log("classes", pt, ps[1].q, ps[1].get1());
+const shadow = new P(5);
+shadow.get1 = () => 42;
+console.log("shadow", shadow.get1(), new P(5).get1());
+
+
+const n1 = { 1: "a", 2: "b" };
+const e = {};
+console.log("numeric", n1[1], n1["2"], Object.keys(e).length, e.nothing);
+console.log(JSON.stringify([o1, o3, big.p1, d]));

@@ -388,7 +388,7 @@ fn object_rest(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value
     let props = source.borrow();
     let pairs: Vec<(&str, Value)> = props
         .iter()
-        .filter(|(k, _)| !taken.iter().any(|t| t.as_str() == &**k))
+        .filter(|&(k, _)| !taken.iter().any(|t| t.as_str() == &**k))
         .map(|(k, v)| (&**k, v.clone()))
         .collect();
     Ok(crate::value::make_obj(pairs))
@@ -401,7 +401,11 @@ fn object_assign(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Val
     };
     for source in args.iter().skip(1) {
         if let Value::Obj(s) = source {
-            let props: Vec<(Rc<str>, Value)> = s.borrow().iter().cloned().collect();
+            let props: Vec<(Rc<str>, Value)> = s
+                .borrow()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
             for (key, v) in props {
                 crate::value::obj_put(t, &key, v);
             }
@@ -762,7 +766,10 @@ fn keys_of(v: &Value) -> Vec<String> {
         Value::Obj(o) => {
             let props = o.borrow();
             let order = key_order(&props);
-            order.into_iter().map(|i| props[i].0.to_string()).collect()
+            order
+                .into_iter()
+                .map(|i| props.key(i).to_string())
+                .collect()
         }
         Value::Arr(a) => (0..a.borrow().len()).map(|i| i.to_string()).collect(),
         Value::Str(s) => (0..s.chars().count()).map(|i| i.to_string()).collect(),

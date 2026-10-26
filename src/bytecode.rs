@@ -9,7 +9,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use crate::value::Value;
+use crate::value::{PropHint, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Op {
@@ -182,7 +182,7 @@ pub struct Proto {
     pub names: Vec<Rc<str>>,
     /// Where each name was last found in an object, one per name. Native code tries that position first. It
     /// is only a guess: a position that does not hold the same key is skipped.
-    pub hints: Vec<Cell<u32>>,
+    pub hints: Vec<PropHint>,
     /// Where each global name was last found, one per name. As with `hints`, it is a guess, checked before use.
     pub global_hints: Vec<Cell<u32>>,
     /// The entry of the compiled code, which native calls jump to. Zero until the function is compiled, and zero

@@ -2252,7 +2252,10 @@ impl Vm {
                     Value::Obj(o) => {
                         let props = o.borrow();
                         let order = key_order(&props);
-                        order.into_iter().map(|i| Value::str(&props[i].0)).collect()
+                        order
+                            .into_iter()
+                            .map(|i| Value::str(props.key(i)))
+                            .collect()
                     }
                     Value::Arr(a) => (0..a.borrow().len())
                         .map(|i| Value::str(&i.to_string()))

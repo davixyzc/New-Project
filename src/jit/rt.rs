@@ -8,8 +8,8 @@ use std::rc::Rc;
 use crate::builtins;
 use crate::bytecode::Proto;
 use crate::value::{
-    concat_owned, find_setter, joins_too_long, lookup_hinted, obj_put, obj_put_hinted, ArrRef,
-    JsStr, Lookup, Value,
+    concat_owned, find_setter, joins_too_long, lookup_hinted, obj_init_hinted, obj_put_hinted,
+    ArrRef, JsStr, Lookup, PropHint, Value,
 };
 use crate::vm::Vm;
 
@@ -371,7 +371,7 @@ pub unsafe extern "C" fn get_prop_into(
     src: *const Value,
     name: *const Rc<str>,
     dst: *mut Value,
-    hint: *const Cell<u32>,
+    hint: *const PropHint,
 ) -> bool {
     match &*src {
         Value::Obj(o) => match lookup_hinted(o, &*name, &*hint) {
@@ -387,11 +387,11 @@ pub unsafe extern "C" fn get_prop_into(
             Lookup::Getter(_) => false,
         },
         Value::Arr(a) => {
-            ptr::write(dst, array_prop(a, &*name, &*hint));
+            ptr::write(dst, array_prop(a, &*name, &(*hint).index));
             true
         }
         Value::Str(s) => {
-            ptr::write(dst, string_prop(s, &*name, &*hint));
+            ptr::write(dst, string_prop(s, &*name, &(*hint).index));
             true
         }
         _ => false,
@@ -406,7 +406,7 @@ pub unsafe extern "C" fn get_prop_into(
 pub unsafe extern "C" fn get_prop_top(
     slot: *mut Value,
     name: *const Rc<str>,
-    hint: *const Cell<u32>,
+    hint: *const PropHint,
 ) -> bool {
     let v = match &*slot {
         Value::Obj(o) => match lookup_hinted(o, &*name, &*hint) {
@@ -414,8 +414,8 @@ pub unsafe extern "C" fn get_prop_top(
             Lookup::Missing => Value::Undef,
             Lookup::Getter(_) => return false,
         },
-        Value::Arr(a) => array_prop(a, &*name, &*hint),
-        Value::Str(s) => string_prop(s, &*name, &*hint),
+        Value::Arr(a) => array_prop(a, &*name, &(*hint).index),
+        Value::Str(s) => string_prop(s, &*name, &(*hint).index),
         _ => return false,
     };
     *slot = v;
@@ -465,7 +465,7 @@ pub unsafe extern "C" fn set_prop_top(
     obj: *mut Value,
     name: *const Rc<str>,
     val: *mut Value,
-    hint: *const Cell<u32>,
+    hint: *const PropHint,
 ) -> bool {
     let Value::Obj(o) = &*obj else {
         return false;
@@ -712,11 +712,16 @@ fn array_prop(a: &ArrRef, name: &str, hint: &Cell<u32>) -> Value {
 /// is not an object is dropped, as the interpreter does.
 ///
 /// # Safety
-/// `obj` and `val` must point at valid values, and `val` is dead afterwards. `name` is as above.
-pub unsafe extern "C" fn init_prop(obj: *const Value, name: *const Rc<str>, val: *mut Value) {
+/// `obj` and `val` must point at valid values, and `val` is dead afterwards. `name` and `hint` are as above.
+pub unsafe extern "C" fn init_prop(
+    obj: *const Value,
+    name: *const Rc<str>,
+    val: *mut Value,
+    hint: *const PropHint,
+) {
     let v = ptr::read(val);
     if let Value::Obj(o) = &*obj {
-        obj_put(o, &*name, v);
+        obj_init_hinted(o, &*name, v, &*hint);
     }
 }
 

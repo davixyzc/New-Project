@@ -77,7 +77,7 @@ fn write_value(
             let props = o.borrow();
             let shown: Vec<usize> = key_order(&props)
                 .into_iter()
-                .filter(|&i| shows(&props[i].1))
+                .filter(|&i| shows(props.value(i)))
                 .collect();
             if shown.is_empty() {
                 out.push_str("{}");
@@ -89,7 +89,7 @@ fn write_value(
                 if n > 0 {
                     out.push(',');
                 }
-                let (k, val) = &props[i];
+                let (k, val) = (props.key(i), props.value(i));
                 newline(indent, depth + 1, out);
                 quote(k, out);
                 out.push_str(sep);

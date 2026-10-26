@@ -1,0 +1,11 @@
+shapes 11100 6 5
+orders 0,3,6,9 y,x x,y
+delete a,c,d,e 1 3 4 5 undefined
+deleted-sum 900
+big 780 0 39 40 p16
+bigdel undefined 6 39
+assign x,y,z,w 4 3
+classes 594 1 2
+shadow 42 5
+numeric a b 0 undefined
+[{"a":1,"b":2},{"b":5,"a":6},1,{"a":1,"c":3,"d":4,"e":5}]

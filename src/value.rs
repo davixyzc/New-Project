@@ -10,18 +10,54 @@ use crate::bytecode::Proto;
 use crate::collection::Collection;
 use crate::vm::Vm;
 
-/// The own properties of an object, in the order they were added. An object with many properties also keeps an
-/// index from name to position, so that a lookup does not scan them.
-#[derive(Clone, Default)]
+/// The own properties of an object, in the order they were added. Objects that add the same keys in the same order share
+/// a `Shape`, which holds those keys, so a site that reads a property checks the shape of the object instead of the key
+/// (see `PropHint`), and an object keeps only its values. An object with more keys than a shape holds, or one that loses
+/// a property, keeps its own keys and an index by name instead (see `Dict`).
 pub struct Props {
-    items: Vec<(Rc<str>, Value)>,
-    index: Option<NameMap<usize>>,
+    /// The shape of an object in shape mode. In dictionary mode it is `dict_shape()`, which no cache holds.
+    shape: Rc<Shape>,
+    /// What a cache compares: the address of the shape in shape mode, and in dictionary mode an odd number that no other
+    /// object gets. It changes when the position of a key does (see `remove`), so a cache that holds it is never wrong.
+    id: usize,
+    /// The values, in the order of the keys.
+    values: Vec<Value>,
+    /// The keys and the index of an object in dictionary mode.
+    dict: Option<Box<Dict>>,
     /// The entries of a Map or a Set, for an object that is one (see `builtins::collections`).
     pub collection: Option<Box<Collection>>,
     /// The object that a lookup continues with when this one does not have the name: the prototype of an instance.
     pub proto: Option<ObjRef>,
     /// The accessor properties, which a lookup finds after the data properties of the object.
     pub accessors: Option<Box<Vec<Accessor>>>,
+}
+
+/// The keys of the objects that have them in this order. A shape is never freed: every shape hangs off a root through
+/// the `next` lists, so a cache that holds the address of a shape never holds the address of a freed one.
+pub struct Shape {
+    keys: Vec<Rc<str>>,
+    /// The shapes with one key more, each made of this shape's keys and one more.
+    next: RefCell<Vec<Rc<Shape>>>,
+}
+
+/// The keys of an object in dictionary mode, each with its position.
+#[derive(Clone, Default)]
+struct Dict {
+    keys: Vec<Rc<str>>,
+    index: NameMap<usize>,
+}
+
+/// What a site remembers about a property that it reads or writes: the shape of the object where it last found the
+/// property, and the position it found there. Another object with that shape has the property at that position too.
+/// `index` is also the position of a built-in method of an array or a string, which a lookup finds the same way.
+#[derive(Clone, Default)]
+#[repr(C)]
+pub struct PropHint {
+    pub index: Cell<u32>,
+    pub shape: Cell<usize>,
+    /// The shape that a site which adds this key last added it to, and the shape that it made (see `Props::push_hinted`).
+    pub from: Cell<usize>,
+    pub to: Cell<usize>,
 }
 
 /// A getter and a setter under one name. Either of them may be missing.
@@ -32,66 +68,168 @@ pub struct Accessor {
     pub set: Option<Value>,
 }
 
-/// From this many properties on, an object gets an index by name.
-const INDEX_FROM: usize = 16;
+/// An object in shape mode has at most this many keys. One more key turns it into a dictionary.
+const SHAPE_KEYS: usize = 16;
+
+thread_local! {
+    /// The number of the next dictionary identity (see `Props::id`), which is odd and never given out twice.
+    static NEXT_DICT_ID: Cell<usize> = const { Cell::new(1) };
+    /// The shape of an object with no keys, which every new object starts from.
+    static ROOT: Rc<Shape> = Rc::new(Shape { keys: Vec::new(), next: RefCell::new(Vec::new()) });
+    /// The shape of an object in dictionary mode. No cache holds it, since such an object has its own keys.
+    static DICT_SHAPE: Rc<Shape> = Rc::new(Shape { keys: Vec::new(), next: RefCell::new(Vec::new()) });
+}
+
+fn root_shape() -> Rc<Shape> {
+    ROOT.with(Rc::clone)
+}
+
+fn dict_shape() -> Rc<Shape> {
+    DICT_SHAPE.with(Rc::clone)
+}
+
+/// A new identity for a dictionary-mode object.
+fn next_dict_id() -> usize {
+    NEXT_DICT_ID.with(|next| {
+        let id = next.get();
+        next.set(id + 2);
+        id
+    })
+}
+
+impl Shape {
+    /// The shape with `key` added after the keys of this one. It is found among the shapes that follow this one, or it
+    /// is made and added to them.
+    fn with_key(self: &Rc<Self>, key: &Rc<str>) -> Rc<Shape> {
+        // Interned keys share their allocation, so the pointer finds almost every child; the text is compared only when
+        // the pointer finds none.
+        let next = self.next.borrow();
+        let last = |s: &&Rc<Shape>| s.keys.last().cloned();
+        let found = next
+            .iter()
+            .find(|s| last(s).is_some_and(|k| Rc::ptr_eq(&k, key)))
+            .or_else(|| next.iter().find(|s| last(s).is_some_and(|k| *k == **key)))
+            .cloned();
+        drop(next);
+        if let Some(shape) = found {
+            return shape;
+        }
+        let mut keys = self.keys.clone();
+        keys.push(key.clone());
+        let shape = Rc::new(Shape {
+            keys,
+            next: RefCell::new(Vec::new()),
+        });
+        self.next.borrow_mut().push(shape.clone());
+        shape
+    }
+}
+
+/// The address that an `Rc` holds, which is the address of its allocation. Native code compares these addresses.
+fn rc_bits<T>(rc: &Rc<T>) -> usize {
+    // SAFETY: an `Rc` of a sized type is one pointer to its allocation, which `rc_layout_ok` checks.
+    unsafe { std::mem::transmute_copy(rc) }
+}
+
+impl Clone for Props {
+    /// A copy has its own dictionary, which may change apart from this one, so it gets an identity of its own.
+    fn clone(&self) -> Props {
+        Props {
+            shape: self.shape.clone(),
+            id: if self.dict.is_some() {
+                next_dict_id()
+            } else {
+                self.id
+            },
+            values: self.values.clone(),
+            dict: self.dict.clone(),
+            collection: self.collection.clone(),
+            proto: self.proto.clone(),
+            accessors: self.accessors.clone(),
+        }
+    }
+}
+
+impl Default for Props {
+    fn default() -> Props {
+        Props::with_capacity(0)
+    }
+}
 
 impl Props {
     pub fn with_capacity(capacity: usize) -> Props {
+        let shape = root_shape();
         Props {
-            items: Vec::with_capacity(capacity),
-            index: None,
+            id: rc_bits(&shape),
+            shape,
+            values: Vec::with_capacity(capacity),
+            dict: None,
             collection: None,
             proto: None,
             accessors: None,
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+    /// The keys, in the order the properties were added.
+    fn keys(&self) -> &[Rc<str>] {
+        match &self.dict {
+            Some(dict) => &dict.keys,
+            None => &self.shape.keys,
+        }
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, (Rc<str>, Value)> {
-        self.items.iter()
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Each own property, with its key, in the order the properties were added.
+    pub fn iter(&self) -> impl Iterator<Item = (&Rc<str>, &Value)> {
+        self.keys().iter().zip(&self.values)
+    }
+
+    pub fn key(&self, i: usize) -> &Rc<str> {
+        &self.keys()[i]
     }
 
     pub fn value(&self, i: usize) -> &Value {
-        &self.items[i].1
+        &self.values[i]
     }
 
     pub fn set_value(&mut self, i: usize, v: Value) {
-        self.items[i].1 = v;
+        self.values[i] = v;
     }
 
     /// The position of the property called `name`.
     pub fn position(&self, name: &str) -> Option<usize> {
-        match &self.index {
-            Some(index) => index.get(name).copied(),
-            None => self.items.iter().position(|(k, _)| &**k == name),
+        match &self.dict {
+            Some(dict) => dict.index.get(name).copied(),
+            None => self.shape.keys.iter().position(|k| &**k == name),
         }
     }
 
-    /// The position of the property with the shared key `key`. The pointer is compared first, which finds almost
-    /// every key, and the text only when the pointer finds nothing.
+    /// The position of the property with the shared key `key`. The pointer is compared first, which finds almost every
+    /// key, and the text only when the pointer finds nothing.
     pub fn position_of_key(&self, key: &Rc<str>) -> Option<usize> {
-        match &self.index {
-            Some(index) => index.get(&**key).copied(),
+        match &self.dict {
+            Some(dict) => dict.index.get(&**key).copied(),
             None => self
-                .items
+                .shape
+                .keys
                 .iter()
-                .position(|(k, _)| Rc::ptr_eq(k, key))
-                .or_else(|| self.items.iter().position(|(k, _)| **k == **key)),
+                .position(|k| Rc::ptr_eq(k, key))
+                .or_else(|| self.shape.keys.iter().position(|k| **k == **key)),
         }
     }
 
-    /// The position of `key`, looked up at `hint` first. The hint is set to the position that the lookup finds, so
-    /// a site that keeps seeing objects of one shape finds the key without a scan.
-    pub fn position_hinted(&self, key: &Rc<str>, hint: &Cell<u32>) -> Option<usize> {
-        let at = hint.get() as usize;
-        if self.items.get(at).is_some_and(|(k, _)| Rc::ptr_eq(k, key)) {
-            return Some(at);
+    /// The position of `key`, looked up through `hint` first. An object in shape mode with the shape that the hint holds
+    /// has the key at the position that the hint holds. Any other lookup of such an object sets the hint to what it finds.
+    pub fn position_hinted(&self, key: &Rc<str>, hint: &PropHint) -> Option<usize> {
+        if hint.shape.get() == self.id {
+            return Some(hint.index.get() as usize);
         }
         let i = self.position_of_key(key)?;
-        hint.set(i as u32);
+        hint.shape.set(self.id);
+        hint.index.set(i as u32);
         Some(i)
     }
 
@@ -122,47 +260,65 @@ impl Props {
         }
     }
 
-    /// Removes the own property `name`, and tells whether there was one.
+    /// Removes the own property `name`, and tells whether there was one. The object turns to dictionary mode.
     pub fn remove(&mut self, name: &str) -> bool {
         let Some(i) = self.position(name) else {
             return false;
         };
-        self.items.remove(i);
-        if self.index.is_some() {
-            self.index = Some(
-                self.items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (k, _))| (k.clone(), i))
-                    .collect(),
-            );
+        self.make_dict();
+        self.id = next_dict_id();
+        self.values.remove(i);
+        if let Some(dict) = &mut self.dict {
+            dict.keys.remove(i);
+            dict.index = dict
+                .keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), i))
+                .collect();
         }
         true
     }
 
     /// Adds a property, which the caller has checked is not there yet.
     pub fn push(&mut self, key: Rc<str>, v: Value) {
-        if let Some(index) = &mut self.index {
-            index.insert(key.clone(), self.items.len());
-        }
-        self.items.push((key, v));
-        if self.index.is_none() && self.items.len() > INDEX_FROM {
-            self.index = Some(
-                self.items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (k, _))| (k.clone(), i))
-                    .collect(),
-            );
-        }
+        self.push_hinted(key, v, None);
     }
-}
 
-impl std::ops::Index<usize> for Props {
-    type Output = (Rc<str>, Value);
+    /// `push`, which records in `hint` the shape transition that it makes, so that a site which adds the same key to
+    /// objects of the same shape can make the same transition without looking it up.
+    fn push_hinted(&mut self, key: Rc<str>, v: Value, hint: Option<&PropHint>) {
+        if self.dict.is_none() && self.shape.keys.len() < SHAPE_KEYS {
+            let from = self.id;
+            self.shape = self.shape.with_key(&key);
+            self.id = rc_bits(&self.shape);
+            if let Some(hint) = hint {
+                hint.from.set(from);
+                hint.to.set(self.id);
+            }
+        } else {
+            self.make_dict();
+            if let Some(dict) = &mut self.dict {
+                dict.index.insert(key.clone(), dict.keys.len());
+                dict.keys.push(key);
+            }
+        }
+        self.values.push(v);
+    }
 
-    fn index(&self, i: usize) -> &(Rc<str>, Value) {
-        &self.items[i]
+    /// Turns the object into dictionary mode, which keeps its own keys and their index.
+    fn make_dict(&mut self) {
+        if self.dict.is_none() {
+            let keys = self.shape.keys.clone();
+            let index = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), i))
+                .collect();
+            self.dict = Some(Box::new(Dict { keys, index }));
+            self.shape = dict_shape();
+            self.id = next_dict_id();
+        }
     }
 }
 
@@ -449,7 +605,7 @@ fn end_of_chain(name: &str) -> Lookup {
 /// `lookup` for a property read by native code, which tries the position in `hint` first on `obj` itself (see
 /// `Props::position_hinted`). Names from the same source share one allocation (see `intern_name`), so the pointer
 /// decides almost every lookup.
-pub fn lookup_hinted(obj: &ObjRef, key: &Rc<str>, hint: &Cell<u32>) -> Lookup {
+pub fn lookup_hinted(obj: &ObjRef, key: &Rc<str>, hint: &PropHint) -> Lookup {
     let next = {
         let props = obj.borrow();
         if let Some(i) = props.position_hinted(key, hint) {
@@ -526,7 +682,7 @@ pub fn class_name(props: &Props) -> Option<String> {
 }
 
 /// `obj_put`, which tries the position in `hint` first (see `Props::position_hinted`).
-pub fn obj_put_hinted(obj: &ObjRef, key: &Rc<str>, v: Value, hint: &Cell<u32>) {
+pub fn obj_put_hinted(obj: &ObjRef, key: &Rc<str>, v: Value, hint: &PropHint) {
     let mut props = obj.borrow_mut();
     match props.position_hinted(key, hint) {
         Some(i) => props.set_value(i, v),
@@ -535,22 +691,21 @@ pub fn obj_put_hinted(obj: &ObjRef, key: &Rc<str>, v: Value, hint: &Cell<u32>) {
 }
 
 /// Where the properties of an object sit in memory, for native code that reads and writes one in place (see
-/// `jit::codegen`). `items` is from the allocation of the object to the `Vec` of its properties, `buf` and `len` are the
-/// pointer and the length within that `Vec`, and `entry`, `key` and `value` are the size of a property and the offsets of
-/// its key and its value.
+/// `jit::codegen`). `shape` is from the allocation of the object to the address of its shape. `values` is from there to
+/// the `Vec` of its values, whose `buf` and `len` are the pointer and the length within that `Vec`.
 #[derive(Clone, Copy)]
 pub(crate) struct PropLayout {
-    pub items: i32,
+    pub shape: i32,
+    pub shape_rc: i32,
+    pub values: i32,
     pub buf: i32,
     pub len: i32,
-    pub entry: i32,
-    pub key: i32,
-    pub value: i32,
+    pub cap: i32,
 }
 
-/// The layout of the properties, when native code can rely on it. It is found once, by probing the layout that Rust
-/// gives these types. None when a probe does not find what native code expects, and then the helpers read the
-/// properties alone.
+/// The layout of the properties of an object, when native code can rely on it. It is found once, by probing the layout
+/// that Rust gives these types. None when a probe does not find what native code expects, and then the helpers do the
+/// work alone.
 pub(crate) fn prop_layout() -> Option<PropLayout> {
     static LAYOUT: std::sync::OnceLock<Option<PropLayout>> = std::sync::OnceLock::new();
     *LAYOUT.get_or_init(probe_prop_layout)
@@ -558,33 +713,49 @@ pub(crate) fn prop_layout() -> Option<PropLayout> {
 
 fn probe_prop_layout() -> Option<PropLayout> {
     use std::mem::{offset_of, size_of};
-    if !crate::jit::rc_layout_ok() || size_of::<Vec<(Rc<str>, Value)>>() != 3 * size_of::<usize>() {
+    let arr = arr_layout()?;
+    if size_of::<usize>() != size_of::<Rc<Shape>>() {
         return None;
     }
     // The properties of an object sit in a `RefCell`, whose value Rust does not place at a fixed offset.
     let cell = RefCell::new(Props::default());
     let cell_value = cell.as_ptr() as usize - &cell as *const _ as usize;
-    // A `Vec` of three properties with room for five. Of its three words, the buffer pointer and the length are
-    // found by their values.
-    let mut items: Vec<(Rc<str>, Value)> = Vec::with_capacity(5);
-    for _ in 0..3 {
-        items.push((Rc::from(""), Value::Undef));
-    }
-    // SAFETY: a `Vec` is the three words that the size check above confirms, so each of them is read as a `usize`.
-    let words: [usize; 3] = unsafe { std::mem::transmute_copy(&items) };
-    let word_of = |want: usize| {
-        words
-            .iter()
-            .position(|&w| w == want)
-            .map(|i| (i * size_of::<usize>()) as i32)
-    };
+    let base = crate::jit::RC_VALUE + cell_value as i32;
     Some(PropLayout {
-        items: crate::jit::RC_VALUE + cell_value as i32 + offset_of!(Props, items) as i32,
-        buf: word_of(items.as_ptr() as usize)?,
-        len: word_of(3)?,
-        entry: size_of::<(Rc<str>, Value)>() as i32,
-        key: offset_of!((Rc<str>, Value), 0) as i32,
-        value: offset_of!((Rc<str>, Value), 1) as i32,
+        shape: base + offset_of!(Props, id) as i32,
+        shape_rc: base + offset_of!(Props, shape) as i32,
+        values: base + offset_of!(Props, values) as i32,
+        buf: arr.buf,
+        len: arr.len,
+        cap: arr.cap,
+    })
+}
+
+/// Where the entries of a `Vec` of names and values sit in memory, for native code that reads the globals (see
+/// `jit::codegen`). `buf` and `len` are the pointer and the length within the `Vec`, and each entry is `entry` bytes long,
+/// with its name at `key` and its value at `value`.
+#[derive(Clone, Copy)]
+pub(crate) struct EntryLayout {
+    pub buf: i32,
+    pub len: i32,
+    pub entry: i32,
+    pub key: i32,
+    pub value: i32,
+}
+
+/// The layout of the entries of the globals, which `prop_layout` relies on for its `Vec` as well.
+pub(crate) fn entry_layout() -> Option<EntryLayout> {
+    static LAYOUT: std::sync::OnceLock<Option<EntryLayout>> = std::sync::OnceLock::new();
+    *LAYOUT.get_or_init(|| {
+        use std::mem::{offset_of, size_of};
+        let arr = arr_layout()?;
+        Some(EntryLayout {
+            buf: arr.buf,
+            len: arr.len,
+            entry: size_of::<(Rc<str>, Value)>() as i32,
+            key: offset_of!((Rc<str>, Value), 0) as i32,
+            value: offset_of!((Rc<str>, Value), 1) as i32,
+        })
     })
 }
 
@@ -595,6 +766,7 @@ pub(crate) struct ArrLayout {
     pub vec: i32,
     pub buf: i32,
     pub len: i32,
+    pub cap: i32,
 }
 
 /// The layout of the elements of an array, when native code can rely on it. It is found once, as `prop_layout` is.
@@ -616,9 +788,9 @@ fn probe_arr_layout() -> Option<ArrLayout> {
     cell.borrow_mut()
         .extend([Value::Undef, Value::Undef, Value::Undef]);
     let cell_value = cell.as_ptr() as usize - &cell as *const _ as usize;
-    let (ptr, len) = {
+    let (ptr, len, cap) = {
         let items = cell.borrow();
-        (items.as_ptr() as usize, items.len())
+        (items.as_ptr() as usize, items.len(), items.capacity())
     };
     // SAFETY: the `Vec` is the three words that the size check above confirms, and each is read as a `usize`.
     let words: [usize; 3] = unsafe { std::mem::transmute_copy(&*cell.as_ptr()) };
@@ -632,7 +804,18 @@ fn probe_arr_layout() -> Option<ArrLayout> {
         vec: crate::jit::RC_VALUE + cell_value as i32,
         buf: word_of(ptr)?,
         len: word_of(len)?,
+        cap: word_of(cap)?,
     })
+}
+
+/// `obj_put` for a property that an object literal adds, which records the shape transition in `hint` (see
+/// `Props::push_hinted`).
+pub fn obj_init_hinted(obj: &ObjRef, key: &Rc<str>, v: Value, hint: &PropHint) {
+    let mut props = obj.borrow_mut();
+    match props.position_of_key(key) {
+        Some(i) => props.set_value(i, v),
+        None => props.push_hinted(key.clone(), v, Some(hint)),
+    }
 }
 
 /// A hasher for names, which are short: a rotate and a multiply per byte. The default hasher is built for long keys
@@ -932,7 +1115,7 @@ fn text_to_num(text: &str) -> f64 {
 /// prints as `[object Object]`.
 fn error_text(o: &ObjRef) -> Option<String> {
     let props = o.borrow();
-    let get = |key: &str| props.iter().find(|(k, _)| &**k == key).map(|(_, v)| v);
+    let get = |key: &str| props.iter().find(|&(k, _)| &**k == key).map(|(_, v)| v);
     get("stack")?;
     let name = to_str(get("name")?);
     let message = to_str(get("message")?);
