@@ -659,14 +659,12 @@ fn step(proto: &Proto, op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
     let number = |m: &Mark| *m == Mark::Num;
     // A side exit resumes the generic code with the operands of the instruction on the stack, so none of them may be a
     // receiver, which has no register to write back.
-    if matches!(
+    let side_exit = matches!(
         op,
         Op::GetIndexLocal(_) | Op::GetIndex2Local(_) | Op::SetIndexLocal(_) | Op::SetIndex2Local(_)
-    ) || push_base(proto, op).is_some()
-    {
-        if state.iter().any(is_receiver) {
-            return false;
-        }
+    ) || push_base(proto, op).is_some();
+    if side_exit && state.iter().any(is_receiver) {
+        return false;
     }
     match op {
         Op::Const(_) => state.push(Mark::Num),
