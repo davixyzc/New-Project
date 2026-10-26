@@ -189,6 +189,15 @@ pub(crate) struct Numeric<'a> {
 }
 
 impl Numeric<'_> {
+    /// Runs the function on `args`, its parameters as numbers, and returns its result. `None` when `args` are not
+    /// its parameters, or the native stack ran out, and the call must run in the interpreter.
+    pub(crate) fn call(&self, args: &[f64]) -> Option<Value> {
+        if args.len() != self.spec.nparams as usize {
+            return None;
+        }
+        self.spec.call(args).map(Number::value)
+    }
+
     /// Maps the elements of `items` from `start` on through the function, appending the results to `out`.
     /// Returns how many elements ran. A batch stops at the first element that is not a number, and the
     /// interpreter runs the rest, starting with that element.

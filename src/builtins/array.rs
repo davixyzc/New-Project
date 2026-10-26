@@ -628,7 +628,21 @@ fn sort(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
         })?
     } else {
         let mut cb = Callback::new(vm, &compare_fn, Value::Undef);
+        // A comparator that runs on numbers compares numbers without a call through the interpreter. When it
+        // declines, the call runs in the interpreter as usual.
+        let comparator = match &compare_fn {
+            Value::Func(f) => Some(std::rc::Rc::clone(f)),
+            _ => None,
+        };
+        let numbers = comparator
+            .as_ref()
+            .and_then(|f| crate::jit::numeric_entry(f));
         let sorted = merge_sort(items, &mut |x: &Value, y: &Value| {
+            if let (Some(entry), Value::Num(p), Value::Num(q)) = (&numbers, x, y) {
+                if let Some(r) = entry.call(&[*p, *q]) {
+                    return Ok(to_num(&r));
+                }
+            }
             let r = cb.call(vm, [x.clone(), y.clone()])?;
             Ok(to_num(&r))
         });
