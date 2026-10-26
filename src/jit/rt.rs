@@ -141,12 +141,13 @@ fn call_plain_numbers(vm: &mut Vm, argc: usize) -> bool {
         return false;
     }
     let idx = vm.stack.len() - argc - 2;
-    let closure = match &vm.stack[idx] {
-        Value::Func(c) => Rc::clone(c),
+    // The callee is borrowed rather than cloned: most calls are not numeric, and they pay no reference count.
+    let (closure, n) = match &vm.stack[idx] {
+        Value::Func(c) => match numbers_arity(c) {
+            Some(n) => (c, n),
+            None => return false,
+        },
         _ => return false,
-    };
-    let Some(n) = numbers_arity(&closure) else {
-        return false;
     };
     if argc < n || n > MAX_NUMBER_ARGS {
         return false;
@@ -158,7 +159,7 @@ fn call_plain_numbers(vm: &mut Vm, argc: usize) -> bool {
             _ => return false,
         }
     }
-    let Some(out) = call_numbers(&closure, &args[..n]) else {
+    let Some(out) = call_numbers(closure, &args[..n]) else {
         // The native stack ran out, so the interpreter makes this call. The calls it makes from there run in the
         // interpreter too, until this call returns, instead of recursing natively to the limit each time.
         vm.suspend_native();

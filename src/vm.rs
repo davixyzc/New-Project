@@ -1175,6 +1175,13 @@ impl Vm {
         let proto: *const Proto = unsafe { Rc::as_ptr(&(*closure).proto) };
         let code = unsafe { (*proto).native() }?;
         let base = idx + 2;
+        let target = base + unsafe { (*proto).nlocals as usize };
+        // The stack gets room for the whole frame at once, so the locals that the arguments do not
+        // fill are written in place, without a capacity check per slot.
+        let need = (base + code.frame_len()).max(target);
+        if need > self.stack.capacity() {
+            self.stack.reserve(need - self.stack.len());
+        }
         self.frames.push(Frame {
             closure,
             ip: 0,
@@ -1183,13 +1190,16 @@ impl Vm {
             ctor: false,
             session: false,
         });
-        let target = base + unsafe { (*proto).nlocals as usize };
-        while self.stack.len() < target {
-            self.stack.push(Value::Undef);
-        }
-        let need = base + code.frame_len();
-        if need > self.stack.capacity() {
-            self.stack.reserve(need - self.stack.len());
+        let len = self.stack.len();
+        debug_assert!(len <= target);
+        // SAFETY: the capacity holds `need` slots, which covers `target`. Each slot from `len` up to
+        // `target` is written before the length grows over it.
+        unsafe {
+            let p = self.stack.as_mut_ptr();
+            for i in len..target {
+                p.add(i).write(Value::Undef);
+            }
+            self.stack.set_len(target);
         }
         Some(code as *const Native)
     }
