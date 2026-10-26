@@ -2342,6 +2342,10 @@ impl Vm {
                 Ok(chain_has(o, &proto))
             }
             Value::Native(d) => {
+                // Every array is an instance of the built-in `Array`.
+                if d.name == "Array" {
+                    return Ok(matches!(v, Value::Arr(_)));
+                }
                 let Value::Obj(o) = v else {
                     return Ok(false);
                 };
@@ -2351,19 +2355,14 @@ impl Vm {
                 }
                 Ok(builtins::collections::is_instance(&o.borrow(), d))
             }
-            // The built-in tables stand for `Object` and `Array`, which every object and every array is an instance of.
+            // The built-in table `Object` stands for the constructor of every object, arrays included.
             Value::Obj(table) => {
-                let is_global = |name: &str, vm: &Vm| matches!(vm.globals.get(name), Some(Value::Obj(t)) if Rc::ptr_eq(t, table));
-                Ok(if is_global("Object", self) {
-                    matches!(
+                let is_object = matches!(self.globals.get("Object"), Some(Value::Obj(t)) if Rc::ptr_eq(t, table));
+                Ok(is_object
+                    && matches!(
                         v,
                         Value::Obj(_) | Value::Arr(_) | Value::Func(_) | Value::Native(_)
-                    )
-                } else if is_global("Array", self) {
-                    matches!(v, Value::Arr(_))
-                } else {
-                    false
-                })
+                    ))
             }
             Value::Undef | Value::Null | Value::Bool(_) | Value::Num(_) | Value::Str(_) => {
                 Err(self.make_error(

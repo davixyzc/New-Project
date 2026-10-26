@@ -1,0 +1,16 @@
+// `new Array` and `Array(...)` with a length or with items, `fill`, `Array.isArray`, `instanceof Array`, and the RangeError for a length that is not a whole number.
+console.log(new Array(3).length, Array(2).length, new Array(1, 2, 3), Array("3"), new Array());
+const filled = new Array(4).fill(7);
+console.log(filled, Array.isArray(filled), Array.isArray(3), filled instanceof Array, [] instanceof Array, 5 instanceof Array);
+const grid = [];
+for (let r = 0; r < 3; r++) grid.push(new Array(2).fill(r));
+console.log(grid);
+try { new Array(-1); } catch (e) { console.log(e.name, e.message); }
+try { Array(1.5); } catch (e) { console.log(e.name, e.message); }
+try { new Array(NaN); } catch (e) { console.log(e.message); }
+console.log(new Array(0).length, new Array(-0).length, new Array(2.0).length);
+const v = new Array(3);
+v[1] = "x";
+console.log(v[1], v.length, v.indexOf("x"), v[0] === undefined);
+console.log(Array.from("abc"), Array.from([1, 2], (x) => x * 3));
+console.log(typeof Array, Array === Array, new Array(2) instanceof Array);

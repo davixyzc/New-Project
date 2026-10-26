@@ -1,0 +1,10 @@
+3 2 [ 1, 2, 3 ] [ '3' ] []
+[ 7, 7, 7, 7 ] true false true true false
+[ [ 0, 0 ], [ 1, 1 ], [ 2, 2 ] ]
+RangeError Invalid array length
+RangeError Invalid array length
+Invalid array length
+0 0 2
+x 3 1 true
+[ 'a', 'b', 'c' ] [ 3, 6 ]
+function true true

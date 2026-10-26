@@ -18,7 +18,7 @@ pub fn install(vm: &mut Vm) {
     vm.set_global("process", global::process_object(vm.argv.clone()));
     vm.set_global("Math", global::math_object());
     vm.set_global("Object", table_object(global::OBJECT));
-    vm.set_global("Array", table_object(global::ARRAY));
+    vm.set_global("Array", Value::Native(&global::ARRAY_CTOR));
     vm.set_global("Map", Value::Native(&collections::MAP));
     vm.set_global("Set", Value::Native(&collections::SET));
     vm.set_global("%items", Value::Native(&collections::ITEMS));

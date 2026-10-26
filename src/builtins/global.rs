@@ -505,6 +505,7 @@ pub fn native_static(owner: &str, name: &str) -> Option<Value> {
     let table = match owner {
         "Number" => NUMBER_STATICS,
         "String" => STRING_STATICS,
+        "Array" => ARRAY,
         _ => return None,
     };
     if let Some(def) = table.iter().find(|d| d.name == name) {
@@ -814,6 +815,30 @@ fn object_entries(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, V
 
 fn is_array(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Bool(matches!(arg(args, 0), Value::Arr(_))))
+}
+
+/// The global `Array`, which makes arrays when it is called or constructed. Its static methods are in `ARRAY`, which
+/// `native_static` finds.
+pub static ARRAY_CTOR: NativeDef = NativeDef {
+    name: "Array",
+    func: array_new,
+};
+
+/// `Array(...)` and `new Array(...)`. One number is the length, and the array holds that many `undefined` values, as
+/// `arr.length = n` leaves them (holes are not modelled). Any other arguments are the items. A length that is not a
+/// whole number from zero up to `MAX_ARRAY_GROW` throws a RangeError.
+fn array_new(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    match args {
+        [Value::Num(n)] => {
+            let n = *n;
+            // NaN fails both comparisons, so it is refused too.
+            if !(n >= 0.0 && n <= crate::vm::MAX_ARRAY_GROW as f64 && n.trunc() == n) {
+                return Err(vm.make_error("RangeError", "Invalid array length"));
+            }
+            Ok(Value::arr(vec![Value::Undef; n as usize]))
+        }
+        _ => Ok(Value::arr(args.to_vec())),
+    }
 }
 
 /// `Array.from(source, mapFn)`: the items of an array or string, or the first `length` properties of an
