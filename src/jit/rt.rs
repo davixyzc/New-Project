@@ -8,8 +8,8 @@ use std::rc::Rc;
 use crate::builtins;
 use crate::bytecode::Proto;
 use crate::value::{
-    concat_owned, find_setter, joins_too_long, lookup_hinted, obj_put, obj_put_hinted, ArrRef, JsStr, Lookup,
-    Value,
+    concat_owned, find_setter, joins_too_long, lookup_hinted, obj_put, obj_put_hinted, ArrRef,
+    JsStr, Lookup, Value,
 };
 use crate::vm::Vm;
 
