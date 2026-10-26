@@ -1,0 +1,51 @@
+// Numeric functions called from ordinary code: the call goes to their entry for numbers when it can, and every
+// other call of them must still give the same result.
+function add2(a, b) { return a + b; }
+function gt(a, b) { return a > b; }
+function twice(x) { return x * 2; }
+function sumTo(n) { return n === 0 ? 0 : n + sumTo(n - 1); }
+
+let total = 0;
+let trues = 0;
+for (let i = 0; i < 300; i++) {
+  total += add2(i, 1);
+  if (gt(i, 150)) trues += 1;
+}
+console.log(total, trues);
+
+// Arguments that are not numbers, and the wrong number of them.
+console.log(add2("a", "b"), add2(1), add2(1, 2, 3));
+console.log(twice("4"), twice(true), twice(null));
+let bad = 0;
+for (let i = 0; i < 50; i++) {
+  bad += twice(i) + twice("1");
+}
+console.log(bad);
+
+// A boolean result keeps its kind.
+const flags = [];
+for (let i = 0; i < 4; i++) flags.push(gt(i, 1));
+console.log(flags.join(","), typeof gt(2, 1), gt(2, 1) === true, gt(1, 2) === false);
+
+// A callee that is a temporary, and methods on objects that are or are not temporary.
+let made = 0;
+for (let i = 0; i < 20; i++) {
+  made += (function (x) { return x + 1; })(i);
+}
+console.log(made);
+const box = { k: 3, scale: function (x) { return x * this.k; }, plus: twice };
+let scaled = 0;
+for (let i = 0; i < 20; i++) {
+  scaled += box.plus(i) + box.plus(i);
+}
+console.log(scaled, box.scale(2), ({ plus: twice }).plus(3));
+
+// Deep recursion through the entry, and values that are not finite.
+console.log(sumTo(2000), sumTo(100));
+console.log(twice(NaN), twice(Infinity), gt(NaN, 1), gt(Infinity, 1));
+
+// A function with no parameters, called from a loop.
+function one() { return 1; }
+let ones = 0;
+for (let i = 0; i < 30; i++) ones += one();
+console.log(ones, one() + one());

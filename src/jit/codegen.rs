@@ -918,11 +918,11 @@ impl<'a> Gen<'a> {
     /// A call of a compiled closure, which native code makes itself. The callee is a closure whose code is compiled,
     /// it takes exactly the arguments of this call and no rest parameter, and the frame stack and the value stack
     /// have room for its frame. The arguments are already in place, at the top of this frame, and they become the
-    /// callee's parameters. Any other call jumps to `generic`, which calls the helper.
+    /// callee's parameters. Any other call jumps to `generic`, which calls the helper. The callee must already be
+    /// checked to be a closure, and RCX and RDX must hold it and its prototype (see `load_proto`).
     fn closure_call(&mut self, ip: usize, d: i32, argc: u32, generic: Label, ran: Label) {
         let argc = argc as i32;
         let nlocals = self.proto.nlocals as i32;
-        let callee = self.temp(d - argc - 2);
         // The callee's frame starts at its first argument, which is `base` bytes above this frame's base.
         let base = 16 * (nlocals + d - argc);
         let proto_field = |field: usize| Mem {
@@ -935,20 +935,6 @@ impl<'a> Gen<'a> {
         let (frame_size, f_closure, f_ip, f_base) = (l.frame_size, l.f_closure, l.f_ip, l.f_base);
         let (f_handlers, f_ctor, f_session) = (l.f_handlers, l.f_ctor, l.f_session);
 
-        // The callee is a closure. Its allocation holds the closure after the counts, and the closure holds its
-        // prototype the same way (see `RC_VALUE`).
-        self.check_tag(callee, TAG_FUNC, generic);
-        self.a.mov_load(RCX, callee.at(8));
-        self.a.add64_imm32(RCX, super::RC_VALUE);
-        let proto_of_closure = std::mem::offset_of!(crate::value::Closure, proto) as i32;
-        self.a.mov_load(
-            RDX,
-            Mem {
-                base: RCX,
-                disp: proto_of_closure,
-            },
-        );
-        self.a.add64_imm32(RDX, super::RC_VALUE);
         // The code must be compiled, and the function must take the arguments of this call and no rest parameter. The
         // count in `call_argc` says both: it is set together with `call_entry`, and is `u32::MAX` otherwise.
         self.a
@@ -1117,6 +1103,97 @@ impl<'a> Gen<'a> {
         self.a.jmp(ran);
     }
 
+    /// Leaves the closure in `callee` in RCX, and its prototype in RDX, as `closure_call` and `numeric_call` read them.
+    /// The callee must hold a closure, which the caller checks.
+    fn load_proto(&mut self, callee: Mem) {
+        self.a.mov_load(RCX, callee.at(8));
+        self.a.add64_imm32(RCX, super::RC_VALUE);
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: RCX,
+                disp: std::mem::offset_of!(crate::value::Closure, proto) as i32,
+            },
+        );
+        self.a.add64_imm32(RDX, super::RC_VALUE);
+    }
+
+    /// A call of a function that runs on numbers, which native code makes through the function's numeric entry (see
+    /// `Native::direct_numbers`). The entry takes the arguments as doubles, which are copied to the native stack. RCX
+    /// and RDX hold the callee and its prototype (see `load_proto`). Every check comes before anything changes, and a
+    /// call that fails one jumps to `not_numeric`, the closure call. A call that the entry declines, when the native
+    /// stack ran out, goes to `generic`, where the helper makes it. The entry cannot throw, and no helper runs between
+    /// the call and the release of the callee and `this`, so the result replaces the callee at once.
+    fn numeric_call(&mut self, d: i32, argc: u32, not_numeric: Label, generic: Label, done: Label) {
+        let argc = argc as i32;
+        let callee = self.temp(d - argc - 2);
+        let this = self.temp(d - argc - 1);
+        let boolean = self.a.label();
+        let proto_field = |field: usize| Mem {
+            base: RDX,
+            disp: field as i32,
+        };
+        // The entry takes exactly the arguments of the call, and each of them is a number.
+        self.a
+            .mov32_load(R9, proto_field(std::mem::offset_of!(Proto, numeric_argc)));
+        self.a.cmp64_imm32(R9, argc);
+        self.a.jcc(CC_NE, not_numeric);
+        for j in 0..argc {
+            let arg = self.temp(d - argc + j);
+            self.check_tag(arg, TAG_NUM, not_numeric);
+        }
+        // Releasing the callee and `this` after the call frees nothing only if each has a reference to spare, and they
+        // are different objects, so that each reference to spare is its own.
+        self.check_release(callee, not_numeric);
+        self.check_release(this, not_numeric);
+        self.a.mov_load(RAX, callee.at(8));
+        self.a.mov_load(R8, this.at(8));
+        self.a.cmp_rr64(RAX, R8);
+        self.a.jcc(CC_E, not_numeric);
+        // The arguments go to the native stack as doubles, where the entry reads them. The room is a multiple of 16, so
+        // the call keeps the stack aligned.
+        let room = 16 * ((argc + 1) / 2);
+        self.a.sub_rsp32(room);
+        for j in 0..argc {
+            let arg = self.temp(d - argc + j);
+            self.a.movsd_load(0, arg.at(8));
+            self.a.movsd_store(
+                Mem {
+                    base: RSP,
+                    disp: 8 * j,
+                },
+                0,
+            );
+        }
+        self.a.mov_rr(RDI, RSP);
+        self.a
+            .mov_load(RAX, proto_field(std::mem::offset_of!(Proto, numeric_entry)));
+        self.a.call_reg(RAX);
+        // The entry returns 1 when the native stack ran out. Then nothing has changed, and the helper makes the call.
+        self.a.add_rsp32(room);
+        self.a.test64(RAX, RAX);
+        self.a.jcc(CC_NE, generic);
+        // The result is in xmm0, which the releases leave alone. The call clobbered RDX, so the prototype is loaded
+        // again through the callee, which holds the closure until it is released. Its flag gives the kind of result.
+        self.load_proto(callee);
+        self.a
+            .movzx_load8(RSI, proto_field(std::mem::offset_of!(Proto, numeric_bool)));
+        self.release_owned(this);
+        self.a.mov8_imm(this, TAG_UNDEF);
+        self.release_owned(callee);
+        self.a.test64(RSI, RSI);
+        self.a.jcc(CC_NE, boolean);
+        self.a.mov8_imm(callee, TAG_NUM);
+        self.a.movsd_store(callee.at(8), 0);
+        self.a.jmp(done);
+        // An entry that returns a boolean gives 0.0 or 1.0.
+        self.a.bind(boolean);
+        self.a.cvttsd2si(RAX, 0);
+        self.a.mov8_imm(callee, TAG_BOOL);
+        self.a.mov_store8(callee.at(1), RAX);
+        self.a.jmp(done);
+    }
+
     /// A plain call. `rt::call_plain` pushes the callee's frame when it can, and then native code
     /// runs the callee's code itself. Otherwise the call has already run when the helper returns.
     fn plain_call(&mut self, ip: usize, d: i32, argc: u32) {
@@ -1180,6 +1257,14 @@ impl<'a> Gen<'a> {
         }
         self.a.bind(closure_path);
         if super::rc_layout_ok() {
+            // Both native calls below take the closure in RCX and its prototype in RDX, so the check and loads come
+            // first.
+            let callee = self.temp(d - argc as i32 - 2);
+            self.check_tag(callee, TAG_FUNC, generic);
+            self.load_proto(callee);
+            let not_numeric = self.a.label();
+            self.numeric_call(d, argc, not_numeric, generic, done);
+            self.a.bind(not_numeric);
             self.closure_call(ip, d, argc, generic, ran);
         }
         self.a.bind(generic);
@@ -2851,6 +2936,9 @@ mod tests {
             call_entry: Default::default(),
             call_frame_len: Default::default(),
             call_argc: std::cell::Cell::new(u32::MAX),
+            numeric_entry: Default::default(),
+            numeric_argc: std::cell::Cell::new(u32::MAX),
+            numeric_bool: Default::default(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,
@@ -2887,6 +2975,9 @@ mod tests {
             call_entry: Default::default(),
             call_frame_len: Default::default(),
             call_argc: std::cell::Cell::new(u32::MAX),
+            numeric_entry: Default::default(),
+            numeric_argc: std::cell::Cell::new(u32::MAX),
+            numeric_bool: Default::default(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,

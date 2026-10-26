@@ -176,6 +176,18 @@ impl Native {
         self.spec.is_some()
     }
 
+    /// The numeric entry as native code calls it: its wrapper's address, its number of parameters and whether it
+    /// returns a boolean. `None` when the function has no such entry, or calls itself through an upvalue, whose check
+    /// the helpers make (see `call_numbers`).
+    pub(crate) fn direct_numbers(&self) -> Option<(usize, u32, bool)> {
+        let spec = self.spec.as_ref()?;
+        spec.self_upval.is_none().then_some((
+            spec.wrapper as usize,
+            spec.nparams,
+            spec.returns_bool,
+        ))
+    }
+
     /// The address of the function's code. Native code calls it with `rdx` set to 0, which starts
     /// at the first instruction.
     pub fn entry(&self) -> *const u8 {

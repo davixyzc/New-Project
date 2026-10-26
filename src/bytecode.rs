@@ -201,6 +201,14 @@ pub struct Proto {
     /// `call_entry`: its number of parameters. It is `u32::MAX` when the function has a rest parameter or is not compiled,
     /// since no call has that many arguments.
     pub call_argc: Cell<u32>,
+    /// The entry of the function for numbers, which native code calls directly (see `Native::direct_numbers`). Zero
+    /// until the function is compiled, and zero for a function without such an entry.
+    pub numeric_entry: Cell<usize>,
+    /// The number of arguments that `numeric_entry` takes, which native code passes it directly. It is `u32::MAX`
+    /// when there is no such entry, so no call has that many arguments.
+    pub numeric_argc: Cell<u32>,
+    /// Whether `numeric_entry` returns a boolean, so that native code gives its result as one.
+    pub numeric_bool: Cell<bool>,
     pub protos: Vec<Rc<Proto>>,
     pub upvals: Vec<UpvalDesc>,
     pub nparams: u32,
@@ -218,7 +226,8 @@ impl Proto {
             .get_or_init(|| {
                 let compiled = crate::jit::compile(self);
                 if let Some(code) = &compiled {
-                    // A function with a numeric entry keeps its calls on the helpers, which try that entry first.
+                    // A function with a numeric entry has no `call_entry`: native code tries `numeric_entry` first,
+                    // and the helpers try it too.
                     if !code.has_numeric_entry() {
                         self.call_entry.set(code.entry() as usize);
                         self.call_frame_len.set(code.frame_len());
@@ -227,6 +236,12 @@ impl Proto {
                         } else {
                             self.nparams
                         });
+                    }
+                    if let Some((entry, nparams, returns_bool)) = code.direct_numbers() {
+                        self.numeric_entry.set(entry);
+                        self.numeric_argc
+                            .set(if self.has_rest { u32::MAX } else { nparams });
+                        self.numeric_bool.set(returns_bool);
                     }
                 }
                 compiled
