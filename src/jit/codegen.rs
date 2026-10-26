@@ -574,6 +574,10 @@ impl<'a> Gen<'a> {
 
     /// Jumps to `slow` if the value at `m` owns a reference, which a plain overwrite would leak.
     fn check_plain(&mut self, m: Mem, slow: Label) {
+        // A slot that the analysis proves holds a number owns nothing.
+        if self.known_number(m) {
+            return;
+        }
         self.a.movzx_load8(RAX, m);
         self.a.mov_imm32(RCX, OWNING);
         self.a.bt(RCX, RAX);
