@@ -773,6 +773,8 @@ impl Compiler {
             consts: fs.consts,
             hints: vec![Cell::new(0); fs.names.len()],
             global_hints: vec![Cell::new(0); fs.names.len()],
+            call_entry: Cell::new(0),
+            call_frame_len: Cell::new(0),
             names: fs.names,
             protos: fs.protos,
             upvals: fs.upvals.iter().map(|(_, d, _)| *d).collect(),

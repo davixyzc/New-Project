@@ -1,0 +1,73 @@
+// Calls of compiled closures made from compiled code: arity, rest parameters, upvalues, recursion,
+// exceptions that cross native frames, and call sites that mix closures with built-ins.
+function add(a, b) { return a + b; }
+let total = 0;
+for (let i = 0; i < 2000; i++) total = add(total, i);
+console.log("add", total);
+
+function two(a, b) { return (a === undefined ? "u" : a) + ":" + (b === undefined ? "u" : b); }
+let s = "";
+for (let i = 0; i < 300; i++) { s = two(i); s = two(i, 1, 2); s = two(); }
+console.log("arity", s);
+
+function rest(a, ...xs) { return a + xs.length; }
+let r = 0;
+for (let i = 0; i < 300; i++) r += rest(i, 1, 2, 3);
+console.log("rest", r);
+
+function makeCounter() {
+  let n = 0;
+  return function (k) { n += k; return n; };
+}
+const counter = makeCounter();
+let last = 0;
+for (let i = 0; i < 1000; i++) last = counter(2);
+console.log("upvalue", last);
+
+function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+console.log("fib", fib(20));
+
+const obj = {
+  k: 3,
+  scale: function (x) { return x * this.k; },
+};
+let m = 0;
+for (let i = 0; i < 500; i++) m += obj.scale(i);
+console.log("method", m);
+
+function deep(n) {
+  if (n === 0) throw new Error("bottom");
+  return deep(n - 1) + 1;
+}
+let caught = "";
+for (let i = 0; i < 50; i++) {
+  try { deep(40); } catch (e) { caught = e.message; }
+}
+console.log("throw", caught);
+
+function safe(x) {
+  try { if (x % 2 === 0) throw new Error("e" + x); return x; } catch (e) { return -1; }
+}
+let sum2 = 0;
+for (let i = 0; i < 200; i++) sum2 += safe(i);
+console.log("handler", sum2);
+
+function down(n) { return n === 0 ? 0 : 1 + down(n - 1); }
+console.log("down", down(5000));
+try { down(50000); console.log("down-big", "no error"); } catch (e) { console.log("down-big", e instanceof RangeError); }
+
+let bad = 5;
+try { bad(1); } catch (e) { console.log("notfn", e instanceof TypeError); }
+
+const fns = [Math.abs, function (x) { return x + 1; }, Math.floor];
+let acc = 0;
+for (let i = 0; i < 300; i++) acc += fns[i % 3](-i + 0.5);
+console.log("mixed", acc);
+
+function adder(k) { return function (x) { return x + k; }; }
+let z = 0;
+for (let i = 0; i < 400; i++) { const f = adder(i); z = f(z) % 100000; }
+console.log("adder", z);
+
+const mapped = [1, 2, 3].map(function (x) { return add(x, 1); });
+console.log("map", mapped.join(","));

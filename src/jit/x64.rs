@@ -14,6 +14,7 @@ pub const RDI: u8 = 7;
 pub const R8: u8 = 8;
 pub const R9: u8 = 9;
 pub const R10: u8 = 10;
+pub const R11: u8 = 11;
 pub const R12: u8 = 12;
 pub const R13: u8 = 13;
 pub const R14: u8 = 14;
@@ -136,6 +137,11 @@ impl Asm {
     /// `mov dst, [m]` (64-bit).
     pub fn mov_load(&mut self, dst: u8, m: Mem) {
         self.op(None, true, &[0x8B], dst, Rm::Mem(m));
+    }
+
+    /// `mov dst32, [m]`: a 32-bit load, which zero-extends into the 64-bit register.
+    pub fn mov32_load(&mut self, dst: u8, m: Mem) {
+        self.op(None, false, &[0x8B], dst, Rm::Mem(m));
     }
 
     /// `mov [m], src` (64-bit).
@@ -277,6 +283,17 @@ impl Asm {
     /// `sub dst, src` (64-bit).
     pub fn sub64(&mut self, dst: u8, src: u8) {
         self.op(None, true, &[0x29], src, Rm::Reg(dst));
+    }
+
+    /// `add dst, src` (64-bit).
+    pub fn add64(&mut self, dst: u8, src: u8) {
+        self.op(None, true, &[0x01], src, Rm::Reg(dst));
+    }
+
+    /// `add r, imm32` (64-bit).
+    pub fn add64_imm32(&mut self, r: u8, imm: i32) {
+        self.op(None, true, &[0x81], 0, Rm::Reg(r));
+        self.code.extend_from_slice(&imm.to_le_bytes());
     }
 
     /// `imul dst, src` (64-bit): the low 64 bits of the product.

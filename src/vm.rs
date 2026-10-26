@@ -16,17 +16,175 @@ use crate::jit::{self, Native};
 use crate::value::*;
 
 /// Maximum nesting of JavaScript-level calls before a RangeError is thrown.
-const MAX_FRAMES: usize = 10_000;
+pub(crate) const MAX_FRAMES: usize = 10_000;
 /// Largest array index that `arr[i] = v` will grow the array to.
 pub(crate) const MAX_ARRAY_GROW: usize = 50_000_000;
 /// JavaScript calls made from Rust (e.g. a `map` callback) recurse on the Rust stack,
 /// so they are capped separately from `MAX_FRAMES`.
 const MAX_NESTED_CALLS: usize = 2_000;
 
+/// The value stack. Its buffer, length and capacity sit in a fixed order (`repr(C)`), so native code can read and
+/// write the length and push frames (see `jit::codegen`). Otherwise it is a `Vec<Value>`: it owns its values, and
+/// it drops them and frees the buffer when it goes away.
+#[repr(C)]
+pub struct ValueStack {
+    pub(crate) buf: *mut Value,
+    pub(crate) len: usize,
+    pub(crate) cap: usize,
+}
+
+impl ValueStack {
+    pub fn with_capacity(cap: usize) -> ValueStack {
+        let mut vec: Vec<Value> = Vec::with_capacity(cap);
+        let stack = ValueStack {
+            buf: vec.as_mut_ptr(),
+            len: 0,
+            cap: vec.capacity(),
+        };
+        std::mem::forget(vec);
+        stack
+    }
+
+    /// The buffer as a `Vec` that owns it, for the operations that only a `Vec` has. `restore` gives it back.
+    fn take_vec(&mut self) -> Vec<Value> {
+        // SAFETY: the three parts describe the buffer this stack owns, which is handed to the `Vec` until `restore`.
+        unsafe { Vec::from_raw_parts(self.buf, self.len, self.cap) }
+    }
+
+    fn restore(&mut self, vec: Vec<Value>) {
+        let mut vec = std::mem::ManuallyDrop::new(vec);
+        self.buf = vec.as_mut_ptr();
+        self.len = vec.len();
+        self.cap = vec.capacity();
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        let mut vec = self.take_vec();
+        vec.reserve(additional);
+        self.restore(vec);
+    }
+
+    pub fn push(&mut self, v: Value) {
+        if self.len == self.cap {
+            self.reserve(1);
+        }
+        // SAFETY: `len < cap`, so the slot is in the buffer, and the length covers it only after it is written.
+        unsafe { self.buf.add(self.len).write(v) };
+        self.len += 1;
+    }
+
+    pub fn pop(&mut self) -> Option<Value> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        // SAFETY: the slot was below the length, which no longer covers it, so the value moves out once.
+        Some(unsafe { self.buf.add(self.len).read() })
+    }
+
+    /// # Safety
+    /// As for `Vec::set_len`: `len` must not exceed the capacity, and the slots below it must hold values.
+    pub unsafe fn set_len(&mut self, len: usize) {
+        self.len = len;
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len {
+            return;
+        }
+        let old = self.len;
+        self.len = len;
+        for i in len..old {
+            // SAFETY: the slot was below the old length and no longer is, so its value is dropped once.
+            unsafe { std::ptr::drop_in_place(self.buf.add(i)) };
+        }
+    }
+
+    pub fn extend_from_slice(&mut self, items: &[Value])
+    where
+        Value: Clone,
+    {
+        for v in items {
+            self.push(v.clone());
+        }
+    }
+
+    /// Removes the values in `range` and returns them, as `Vec::drain` does.
+    pub fn drain<R: std::ops::RangeBounds<usize>>(
+        &mut self,
+        range: R,
+    ) -> std::vec::IntoIter<Value> {
+        use std::ops::Bound;
+        let start = match range.start_bound() {
+            Bound::Included(&s) => s,
+            Bound::Excluded(&s) => s + 1,
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(&e) => e + 1,
+            Bound::Excluded(&e) => e,
+            Bound::Unbounded => self.len,
+        };
+        assert!(
+            start <= end && end <= self.len,
+            "drain range is outside the stack"
+        );
+        let mut out = Vec::with_capacity(end - start);
+        // SAFETY: each drained slot is below the length and moves out once, and then the tail moves down over them.
+        unsafe {
+            for i in start..end {
+                out.push(self.buf.add(i).read());
+            }
+            std::ptr::copy(self.buf.add(end), self.buf.add(start), self.len - end);
+        }
+        self.len -= end - start;
+        out.into_iter()
+    }
+}
+
+impl Extend<Value> for ValueStack {
+    fn extend<I: IntoIterator<Item = Value>>(&mut self, items: I) {
+        for v in items {
+            self.push(v);
+        }
+    }
+}
+
+impl Drop for ValueStack {
+    fn drop(&mut self) {
+        // SAFETY: the parts describe the buffer this stack owns. Dropping the `Vec` drops the values and frees it.
+        drop(unsafe { Vec::from_raw_parts(self.buf, self.len, self.cap) });
+    }
+}
+
+impl std::ops::Deref for ValueStack {
+    type Target = [Value];
+
+    fn deref(&self) -> &[Value] {
+        // SAFETY: the first `len` slots hold values.
+        unsafe { std::slice::from_raw_parts(self.buf, self.len) }
+    }
+}
+
+impl std::ops::DerefMut for ValueStack {
+    fn deref_mut(&mut self) -> &mut [Value] {
+        // SAFETY: as for `deref`.
+        unsafe { std::slice::from_raw_parts_mut(self.buf, self.len) }
+    }
+}
+
 #[repr(C)]
 pub struct Frame {
     /// The running closure. The callee slot (`base - 2`) holds the `Value::Func` that owns it.
-    closure: *const Closure,
+    pub(crate) closure: *const Closure,
     /// Next instruction to run. Only kept up to date when the frame is not running.
     pub ip: usize,
     /// Index of the first argument (slot 0) on the value stack. `this` sits at `base - 1`.
@@ -46,9 +204,9 @@ pub struct Frame {
 /// frame by writing it at `len` (see `jit::codegen`).
 #[repr(C)]
 pub struct FrameStack {
-    buf: *mut Frame,
-    len: usize,
-    cap: usize,
+    pub(crate) buf: *mut Frame,
+    pub(crate) len: usize,
+    pub(crate) cap: usize,
 }
 
 impl FrameStack {
@@ -469,7 +627,7 @@ impl Globals {
 }
 
 pub struct Vm {
-    pub stack: Vec<Value>,
+    pub stack: ValueStack,
     pub frames: FrameStack,
     pub globals: Globals,
     /// The prototype of each kind of error, by its name. The prototype of `Error` is the one that the others inherit.
@@ -599,7 +757,7 @@ impl Vm {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(1);
         let mut vm = Vm {
-            stack: Vec::with_capacity(1024),
+            stack: ValueStack::with_capacity(1024),
             frames: FrameStack::new(),
             globals: Globals::default(),
             error_protos: error_protos(),

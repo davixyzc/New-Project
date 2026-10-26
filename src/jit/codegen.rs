@@ -28,9 +28,51 @@ pub(super) const TAG_BOOL: u8 = 2;
 pub(super) const TAG_NUM: u8 = 3;
 const TAG_STR: u8 = 4;
 const TAG_ARR: u8 = 5;
+const TAG_FUNC: u8 = 7;
 const TAG_NATIVE: u8 = 8;
 /// Bit `n` is set when tag `n` owns a reference (see `Value::owns_ref`).
 const OWNING: u32 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 9);
+
+/// Where native code finds the parts of the VM it reads and writes: the frame stack and the value stack, both
+/// `repr(C)` (see `vm`), and the fields of a frame. Each offset is from the start of the VM, or of the frame.
+struct VmLayout {
+    frames_buf: i32,
+    frames_len: i32,
+    frames_cap: i32,
+    stack_buf: i32,
+    stack_len: i32,
+    stack_cap: i32,
+    frame_size: i32,
+    f_closure: i32,
+    f_ip: i32,
+    f_base: i32,
+    f_handlers: i32,
+    f_ctor: i32,
+    f_session: i32,
+}
+
+fn vm_layout() -> VmLayout {
+    use crate::vm::{Frame, FrameStack, ValueStack, Vm};
+    let (frames, stack) = (
+        std::mem::offset_of!(Vm, frames),
+        std::mem::offset_of!(Vm, stack),
+    );
+    VmLayout {
+        frames_buf: (frames + std::mem::offset_of!(FrameStack, buf)) as i32,
+        frames_len: (frames + std::mem::offset_of!(FrameStack, len)) as i32,
+        frames_cap: (frames + std::mem::offset_of!(FrameStack, cap)) as i32,
+        stack_buf: (stack + std::mem::offset_of!(ValueStack, buf)) as i32,
+        stack_len: (stack + std::mem::offset_of!(ValueStack, len)) as i32,
+        stack_cap: (stack + std::mem::offset_of!(ValueStack, cap)) as i32,
+        frame_size: std::mem::size_of::<Frame>() as i32,
+        f_closure: std::mem::offset_of!(Frame, closure) as i32,
+        f_ip: std::mem::offset_of!(Frame, ip) as i32,
+        f_base: std::mem::offset_of!(Frame, base) as i32,
+        f_handlers: std::mem::offset_of!(Frame, handlers) as i32,
+        f_ctor: std::mem::offset_of!(Frame, ctor) as i32,
+        f_session: std::mem::offset_of!(Frame, session) as i32,
+    }
+}
 
 /// The machine code of a function, and what the VM needs to run it.
 pub(super) struct Compiled {
@@ -700,10 +742,243 @@ impl<'a> Gen<'a> {
         self.a.jmp(generic);
     }
 
+    /// A call of a compiled closure, which native code makes itself. The callee is a closure whose code is compiled,
+    /// it takes exactly the arguments of this call and no rest parameter, and the frame stack and the value stack
+    /// have room for its frame. The arguments are already in place, at the top of this frame, and they become the
+    /// callee's parameters. Any other call jumps to `generic`, which calls the helper.
+    fn closure_call(&mut self, ip: usize, d: i32, argc: u32, generic: Label, ran: Label) {
+        let argc = argc as i32;
+        let nlocals = self.proto.nlocals as i32;
+        let callee = self.temp(d - argc - 2);
+        // The callee's frame starts at its first argument, which is `base` bytes above this frame's base.
+        let base = 16 * (nlocals + d - argc);
+        let proto_field = |field: usize| Mem {
+            base: RDX,
+            disp: field as i32,
+        };
+        let l = vm_layout();
+        let (frames_buf, frames_len, frames_cap) = (l.frames_buf, l.frames_len, l.frames_cap);
+        let (stack_buf, stack_cap) = (l.stack_buf, l.stack_cap);
+        let (frame_size, f_closure, f_ip, f_base) = (l.frame_size, l.f_closure, l.f_ip, l.f_base);
+        let (f_handlers, f_ctor, f_session) = (l.f_handlers, l.f_ctor, l.f_session);
+
+        // The callee is a closure. Its allocation holds the closure after the counts, and the closure holds its
+        // prototype the same way (see `RC_VALUE`).
+        self.check_tag(callee, TAG_FUNC, generic);
+        self.a.mov_load(RCX, callee.at(8));
+        self.a.add64_imm32(RCX, super::RC_VALUE);
+        let proto_of_closure = std::mem::offset_of!(crate::value::Closure, proto) as i32;
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: RCX,
+                disp: proto_of_closure,
+            },
+        );
+        self.a.add64_imm32(RDX, super::RC_VALUE);
+        // The code must be compiled, and the function must take the arguments of this call and no rest parameter.
+        self.a
+            .mov_load(R8, proto_field(std::mem::offset_of!(Proto, call_entry)));
+        self.a.test64(R8, R8);
+        self.a.jcc(CC_E, generic);
+        self.a
+            .mov32_load(R9, proto_field(std::mem::offset_of!(Proto, nparams)));
+        self.a.cmp64_imm32(R9, argc);
+        self.a.jcc(CC_NE, generic);
+        self.a
+            .movzx_load8(R9, proto_field(std::mem::offset_of!(Proto, has_rest)));
+        self.a.test32(R9, R9);
+        self.a.jcc(CC_NE, generic);
+        // The frame stack has room for one more frame.
+        self.a.mov_load(
+            R10,
+            Mem {
+                base: RBX,
+                disp: frames_len,
+            },
+        );
+        self.a.cmp64_imm32(R10, crate::vm::MAX_FRAMES as i32);
+        self.a.jcc(CC_AE, generic);
+        self.a.mov_load(
+            R11,
+            Mem {
+                base: RBX,
+                disp: frames_cap,
+            },
+        );
+        self.a.cmp_rr64(R10, R11);
+        self.a.jcc(CC_AE, generic);
+        // The value stack has room for the callee's whole frame, from its first argument on.
+        self.a.lea(
+            R9,
+            Mem {
+                base: R12,
+                disp: base,
+            },
+        );
+        self.a.mov_load(
+            R11,
+            proto_field(std::mem::offset_of!(Proto, call_frame_len)),
+        );
+        self.a.shl64_imm(R11, 4);
+        self.a.add64(R11, R9);
+        self.a.mov_load(
+            RDI,
+            Mem {
+                base: RBX,
+                disp: stack_buf,
+            },
+        );
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: RBX,
+                disp: stack_cap,
+            },
+        );
+        self.a.shl64_imm(RSI, 4);
+        self.a.add64(RSI, RDI);
+        self.a.cmp_rr64(R11, RSI);
+        self.a.jcc(CC_A, generic);
+        // The locals that the arguments do not fill start as undefined: their tags are written here.
+        self.a.lea(
+            RSI,
+            Mem {
+                base: R12,
+                disp: 16 * (nlocals + d),
+            },
+        );
+        self.a
+            .mov32_load(RDI, proto_field(std::mem::offset_of!(Proto, nlocals)));
+        self.a.shl64_imm(RDI, 4);
+        self.a.add64(RDI, R9);
+        let (fill, filled) = (self.a.label(), self.a.label());
+        self.a.bind(fill);
+        self.a.cmp_rr64(RSI, RDI);
+        self.a.jcc(CC_AE, filled);
+        self.a.mov8_imm(Mem { base: RSI, disp: 0 }, TAG_UNDEF);
+        self.a.add64_imm32(RSI, 16);
+        self.a.jmp(fill);
+        self.a.bind(filled);
+        // The caller's ip is saved, and the frame goes after the last one. Every field of it is written.
+        self.a.mov_load(
+            R10,
+            Mem {
+                base: RBX,
+                disp: frames_len,
+            },
+        );
+        self.a.imul64_imm(R10, R10, frame_size);
+        self.a.mov_load(
+            R11,
+            Mem {
+                base: RBX,
+                disp: frames_buf,
+            },
+        );
+        self.a.add64(R11, R10);
+        self.a.mov_imm64(RSI, (ip + 1) as u64);
+        self.a.mov_store(
+            Mem {
+                base: R11,
+                disp: f_ip - frame_size,
+            },
+            RSI,
+        );
+        self.a.mov_store(
+            Mem {
+                base: R11,
+                disp: f_closure,
+            },
+            RCX,
+        );
+        self.a.mov_imm64(RSI, 0);
+        self.a.mov_store(
+            Mem {
+                base: R11,
+                disp: f_ip,
+            },
+            RSI,
+        );
+        self.a.mov_store(
+            Mem {
+                base: R11,
+                disp: f_handlers,
+            },
+            RSI,
+        );
+        self.a.mov_imm64(R10, 0);
+        self.a.mov_store8(
+            Mem {
+                base: R11,
+                disp: f_ctor,
+            },
+            R10,
+        );
+        self.a.mov_store8(
+            Mem {
+                base: R11,
+                disp: f_session,
+            },
+            R10,
+        );
+        self.a.mov_rr(R10, R12);
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: RBX,
+                disp: stack_buf,
+            },
+        );
+        self.a.sub64(R10, RSI);
+        self.a.shr64_imm(R10, 4);
+        self.a.add64_imm32(R10, nlocals + d - argc);
+        self.a.mov_store(
+            Mem {
+                base: R11,
+                disp: f_base,
+            },
+            R10,
+        );
+        self.a.mov_load(
+            R10,
+            Mem {
+                base: RBX,
+                disp: frames_len,
+            },
+        );
+        self.a.add64_imm8(R10, 1);
+        self.a.mov_store(
+            Mem {
+                base: RBX,
+                disp: frames_len,
+            },
+            R10,
+        );
+        // The callee runs from its first instruction, with its frame at its first argument.
+        self.a.lea(
+            RSI,
+            Mem {
+                base: R12,
+                disp: base,
+            },
+        );
+        self.a.mov_rr(RDI, RBX);
+        self.a.mov_imm32(RDX, 0);
+        self.a.mov_rr(RAX, R8);
+        self.a.call_reg(RAX);
+        self.a.jmp(ran);
+    }
+
     /// A plain call. `rt::call_plain` pushes the callee's frame when it can, and then native code
     /// runs the callee's code itself. Otherwise the call has already run when the helper returns.
     fn plain_call(&mut self, ip: usize, d: i32, argc: u32) {
-        let (generic, done) = (self.a.label(), self.a.label());
+        let (generic, done, ran, closure_path) = (
+            self.a.label(),
+            self.a.label(),
+            self.a.label(),
+            self.a.label(),
+        );
         if argc == 1 {
             // Some built-ins run in place when called with one argument: `push` on an array (`rt::push_call`),
             // `charCodeAt` on a string (`rt::char_code_call`) and `String` on a number (`rt::string_call`). Any
@@ -713,7 +988,7 @@ impl<'a> Gen<'a> {
             let push = crate::builtins::array::push_def() as *const _ as usize as u64;
             let char_code = crate::builtins::string::char_code_at_def() as *const _ as usize as u64;
             let string = crate::builtins::global::string_def() as *const _ as usize as u64;
-            self.check_tag(callee, TAG_NATIVE, generic);
+            self.check_tag(callee, TAG_NATIVE, closure_path);
             let push_helper = rt::push_call as *const () as usize;
             let char_code_helper = rt::char_code_call as *const () as usize;
             let string_helper = rt::string_call as *const () as usize;
@@ -728,7 +1003,11 @@ impl<'a> Gen<'a> {
                 done,
             );
             self.a.bind(not_char_code);
-            self.builtin_call1(callee, string, string_helper, generic, generic, done);
+            self.builtin_call1(callee, string, string_helper, closure_path, generic, done);
+        }
+        self.a.bind(closure_path);
+        if super::rc_layout_ok() {
+            self.closure_call(ip, d, argc, generic, ran);
         }
         self.a.bind(generic);
         self.a.mov_rr(RDI, RBX);
@@ -740,7 +1019,6 @@ impl<'a> Gen<'a> {
         self.a.call_reg(RAX);
         // rax is the callee's code, or the status of a call that has run already (0 or 1). rdx is
         // this frame, which may have moved.
-        let ran = self.a.label();
         self.a.cmp64_imm8(RAX, 1);
         self.a.jcc(CC_BE, ran);
         // The callee's frame starts above this frame's locals and the operands below its arguments.
@@ -779,7 +1057,169 @@ impl<'a> Gen<'a> {
     }
 
     /// Returns from the function, through its helper, which pops the frame.
+    /// Returns from the function without `rt::ret` when that helper would only pop the frame and move the result
+    /// down. The frame must be a plain one (not a constructor, not a callback's, with no `try`), and another frame
+    /// must lie below it. The slots the frame drops give up their references first: a reference that is not the last
+    /// one is released in place, and the last one is dropped by `rt::drop_slot`. Any other return jumps to `slow`
+    /// before anything has changed.
+    fn native_return(&mut self, d: i32, slow: Label) {
+        let l = vm_layout();
+        let (frames_buf, frames_len, stack_buf, stack_len) =
+            (l.frames_buf, l.frames_len, l.stack_buf, l.stack_len);
+        let (frame_size, f_base) = (l.frame_size, l.f_base);
+        let nlocals = self.proto.nlocals as i32;
+        let done = self.done;
+        // The result is the operand on top. The slots below it are the callee (slot -2), `this` (slot -1), the
+        // locals and the other operands, and the frame drops all of them.
+        let released = -2..nlocals + d - 1;
+        let result = Mem {
+            base: R12,
+            disp: 16 * (nlocals + d - 1),
+        };
+
+        // The frame on top is `frames[len - 1]`, and the call returns to the one below it.
+        self.a.mov_load(
+            R10,
+            Mem {
+                base: RBX,
+                disp: frames_len,
+            },
+        );
+        self.a.cmp64_imm8(R10, 2);
+        self.a.jcc(CC_B, slow);
+        self.a.imul64_imm(R11, R10, frame_size);
+        self.a.mov_load(
+            RCX,
+            Mem {
+                base: RBX,
+                disp: frames_buf,
+            },
+        );
+        self.a.add64(R11, RCX);
+        // `R11` is one past the top frame, so `top` addresses a field of that frame.
+        let top = |field: i32| Mem {
+            base: R11,
+            disp: field - frame_size,
+        };
+        self.a.cmp8_imm(top(l.f_ctor), 0);
+        self.a.jcc(CC_NE, slow);
+        self.a.cmp8_imm(top(l.f_session), 0);
+        self.a.jcc(CC_NE, slow);
+        self.a.mov_load(RCX, top(l.f_handlers));
+        self.a.test64(RCX, RCX);
+        self.a.jcc(CC_NE, slow);
+
+        // Each dropped slot releases its reference. The count is the first word of the `Rc` allocation (see
+        // `rc_layout_ok`). The last reference goes to `rt::drop_slot`, which frees the value.
+        for s in released {
+            let (skip, dead) = (self.a.label(), self.a.label());
+            let m = Mem {
+                base: R12,
+                disp: 16 * s,
+            };
+            self.a.movzx_load8(RAX, m);
+            self.a.mov_imm32(RCX, OWNING);
+            self.a.bt(RCX, RAX);
+            self.a.jcc(CC_AE, skip);
+            self.a.mov_load(RCX, m.at(8));
+            self.a.mov_load(RAX, Mem { base: RCX, disp: 0 });
+            self.a.cmp64_imm8(RAX, 1);
+            self.a.jcc(CC_BE, dead);
+            self.a.add64_imm8(RAX, -1);
+            self.a.mov_store(Mem { base: RCX, disp: 0 }, RAX);
+            self.a.jmp(skip);
+            self.a.bind(dead);
+            self.a.lea(RDI, m);
+            self.a
+                .mov_imm64(RAX, rt::drop_slot as *const () as usize as u64);
+            self.a.call_reg(RAX);
+            self.a.bind(skip);
+        }
+
+        // The frame is popped. The value stack ends below the callee slot, and the result takes that slot. The call
+        // returns to the frame below, whose base is the caller's frame pointer (as `rt::ret` returns it).
+        self.a.mov_load(
+            R10,
+            Mem {
+                base: RBX,
+                disp: frames_len,
+            },
+        );
+        self.a.imul64_imm(R11, R10, frame_size);
+        self.a.mov_load(
+            RCX,
+            Mem {
+                base: RBX,
+                disp: frames_buf,
+            },
+        );
+        self.a.add64(R11, RCX);
+        self.a.mov_load(RSI, top(f_base));
+        self.a.lea(
+            RCX,
+            Mem {
+                base: RSI,
+                disp: -1,
+            },
+        );
+        self.a.mov_store(
+            Mem {
+                base: RBX,
+                disp: stack_len,
+            },
+            RCX,
+        );
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: R11,
+                disp: f_base - 2 * frame_size,
+            },
+        );
+        self.a.shl64_imm(RDX, 4);
+        self.a.mov_load(
+            RAX,
+            Mem {
+                base: RBX,
+                disp: stack_buf,
+            },
+        );
+        self.a.add64(RDX, RAX);
+        self.a.add64_imm8(R10, -1);
+        self.a.mov_store(
+            Mem {
+                base: RBX,
+                disp: frames_len,
+            },
+            R10,
+        );
+        self.a.mov_load(RAX, result);
+        self.a.mov_load(RCX, result.at(8));
+        self.a.mov_store(
+            Mem {
+                base: R12,
+                disp: -32,
+            },
+            RAX,
+        );
+        self.a.mov_store(
+            Mem {
+                base: R12,
+                disp: -24,
+            },
+            RCX,
+        );
+        self.a.jmp(done);
+    }
+
     fn return_helper(&mut self, ip: usize, d: i32) {
+        let slow = self.a.label();
+        let nlocals = self.proto.nlocals as i32;
+        // A return of a plain frame runs natively when `native_return` covers its slots. The helper runs the rest.
+        if d >= 1 && nlocals + d < 16 && super::rc_layout_ok() {
+            self.native_return(d, slow);
+        }
+        self.a.bind(slow);
         self.a.mov_rr(RDI, RBX);
         self.a.mov_imm32(RSI, ip as u32);
         self.a.mov_imm32(RDX, d as u32);
@@ -1442,6 +1882,8 @@ mod tests {
             names: Vec::new(),
             hints: Vec::new(),
             global_hints: Vec::new(),
+            call_entry: Default::default(),
+            call_frame_len: Default::default(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,
@@ -1475,6 +1917,8 @@ mod tests {
             names: Vec::new(),
             hints: Vec::new(),
             global_hints: Vec::new(),
+            call_entry: Default::default(),
+            call_frame_len: Default::default(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,

@@ -114,6 +114,15 @@ pub unsafe extern "C" fn op(vm: *mut Vm, ip: usize, depth: usize) -> HelperRet {
     finish(vm, result, next)
 }
 
+/// Drops the value at `p`, which native code releases when its reference is the last one to the object (see
+/// `codegen::native_return`). Dropping it frees the object.
+///
+/// # Safety
+/// `p` must point at a live value, which the caller gives up and never reads again.
+pub unsafe extern "C" fn drop_slot(p: *mut Value) {
+    ptr::drop_in_place(p);
+}
+
 /// What `call_plain` returns. `code` is the address of the callee's code, which native code runs
 /// next. Or it is the status of a call that has already run to its end (`STATUS_DONE` or
 /// `STATUS_THREW`), as the other helpers return it. `base` is the caller's frame, which may have

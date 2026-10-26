@@ -185,6 +185,11 @@ pub struct Proto {
     pub hints: Vec<Cell<u32>>,
     /// Where each global name was last found, one per name. As with `hints`, it is a guess, checked before use.
     pub global_hints: Vec<Cell<u32>>,
+    /// The entry of the compiled code, which native calls jump to. Zero until the function is compiled, and zero
+    /// for a function with a numeric entry, whose calls run through the helpers, which try that entry first.
+    pub call_entry: Cell<usize>,
+    /// The stack slots the compiled frame needs, set together with `call_entry`.
+    pub call_frame_len: Cell<usize>,
     pub protos: Vec<Rc<Proto>>,
     pub upvals: Vec<UpvalDesc>,
     pub nparams: u32,
@@ -199,7 +204,17 @@ impl Proto {
     /// The function's native code, if it has any.
     pub fn native(&self) -> Option<&crate::jit::Native> {
         self.native
-            .get_or_init(|| crate::jit::compile(self))
+            .get_or_init(|| {
+                let compiled = crate::jit::compile(self);
+                if let Some(code) = &compiled {
+                    // A function with a numeric entry keeps its calls on the helpers, which try that entry first.
+                    if !code.has_numeric_entry() {
+                        self.call_entry.set(code.entry() as usize);
+                        self.call_frame_len.set(code.frame_len());
+                    }
+                }
+                compiled
+            })
             .as_deref()
     }
 }

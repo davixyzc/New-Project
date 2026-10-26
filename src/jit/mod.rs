@@ -89,6 +89,28 @@ impl Number {
     }
 }
 
+/// Where an `Rc`'s value sits, counted from the pointer the `Rc` holds: after the strong and weak counts. Native code
+/// adds it to that pointer to reach the closure or prototype it holds (see `codegen::closure_call`).
+pub(crate) const RC_VALUE: i32 = 16;
+
+/// Whether `Rc` lays out its allocation the way native code reads it: a bare pointer, the strong count first, and the
+/// value at `RC_VALUE`. Native calls are left to the helpers when this does not hold.
+pub(crate) fn rc_layout_ok() -> bool {
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        if std::mem::size_of::<std::rc::Rc<u64>>() != std::mem::size_of::<usize>() {
+            return false;
+        }
+        let rc = std::rc::Rc::new(7u64);
+        // SAFETY: an `Rc` is a bare pointer of the size checked above, so its bits are that pointer.
+        let bits: usize = unsafe { std::mem::transmute_copy(&rc) };
+        let value = std::rc::Rc::as_ptr(&rc) as usize;
+        // SAFETY: `bits` points at the allocation, which starts with the strong count and lives as long as `rc`.
+        let strong = unsafe { *(bits as *const usize) };
+        value.wrapping_sub(bits) == RC_VALUE as usize && strong == 1
+    })
+}
+
 /// Whether functions are compiled. `FLY_JIT=0` turns it off.
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -147,6 +169,11 @@ impl Native {
     /// The stack slots a frame of this function needs.
     pub fn frame_len(&self) -> usize {
         self.frame_len
+    }
+
+    /// Whether the function has a numeric entry (see `numeric_entry`).
+    pub(crate) fn has_numeric_entry(&self) -> bool {
+        self.spec.is_some()
     }
 
     /// The address of the function's code. Native code calls it with `rdx` set to 0, which starts

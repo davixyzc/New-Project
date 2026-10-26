@@ -1,0 +1,14 @@
+add 1999000
+arity u:u
+rest 45750
+upvalue 2000
+fib 6765
+method 374250
+throw bottom
+handler 9900
+down 5000
+down-big true
+notfn true
+mixed -15049
+adder 79800
+map 2,3,4

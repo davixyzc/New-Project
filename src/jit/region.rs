@@ -1454,6 +1454,8 @@ mod tests {
             names: Vec::new(),
             hints: Vec::new(),
             global_hints: Vec::new(),
+            call_entry: Default::default(),
+            call_frame_len: Default::default(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams,

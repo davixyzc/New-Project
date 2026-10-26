@@ -1,0 +1,20 @@
+// Returns that release the last reference to an object, a closure, or an array, and returns that hand one out.
+// Memory must stay flat over the loops: a reference that is not released leaks its object.
+function keep(n) { let o = { v: n }; let p = o; return p.v + 1; }
+function pass(n) { let o = { v: n }; let p = o; return p; }
+function immediate() { return (function (x) { return x + 1; })(5); }
+function method() { return ({ m() { return 2; } }).m(); }
+function mk(n) { let a = [n, n + 1]; let b = a; return b.length; }
+function take(a, b) { let c = [a, b]; return c; }
+
+let s = 0;
+for (let i = 0; i < 20000; i++) s += keep(i) + immediate() + method() + mk(i);
+console.log("released", s);
+
+let last;
+for (let i = 0; i < 20000; i++) last = pass(i);
+console.log("returned", last.v);
+
+let pairs = 0;
+for (let i = 0; i < 20000; i++) pairs += take(i, i + 1)[1];
+console.log("paired", pairs);
