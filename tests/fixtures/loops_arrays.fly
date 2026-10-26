@@ -1,0 +1,78 @@
+// Loops over arrays of numbers and booleans, read and written in place, and every case that leaves such a loop for the
+// generic code: holes, out-of-range and fractional keys, elements that hold references, and mixed element kinds.
+function sumRows(grid, n) {
+  let s = 0;
+  for (let i = 0; i < n; i++) s += grid[i % 3][i % 4];
+  return s;
+}
+const g = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]];
+console.log(sumRows(g, 40));
+const flags = [];
+for (let i = 0; i < 300; i++) flags.push(true);
+let count = 0;
+for (let i = 2; i < 300; i++) {
+  if (flags[i]) {
+    count++;
+    for (let j = i * 2; j < 300; j += i) flags[j] = false;
+  }
+}
+console.log(count, flags[1], flags[2], flags[97], flags[98], flags[299]);
+// Booleans read as numbers in arithmetic and loose comparisons, and never equal a number strictly.
+let t = 0, strict = 0, loose = 0;
+for (let i = 0; i < 300; i++) {
+  if (flags[i] == 1) loose++;
+  if (flags[i] === true) strict++;
+  t += flags[i] + 1;
+}
+console.log(t, strict, loose);
+// Out of range and fractional keys read undefined.
+const small = [1, 2, 3];
+let u = 0;
+for (let i = 0; i < 6; i++) {
+  const x = small[i];
+  u += x === undefined ? 100 : x;
+}
+console.log(u);
+let frac = 0;
+for (let i = 0; i < 4; i++) frac += small[i / 2] === undefined ? 1 : 0;
+console.log(frac);
+// Elements that hold strings, arrays and objects leave the loop, and so do their replacements.
+const mixed = [1, "two", [3], { four: 4 }, true, null];
+let m = 0;
+for (let r = 0; r < 50; r++) {
+  for (let i = 0; i < 6; i++) m += typeof mixed[i] === "number" ? 1 : 0;
+}
+console.log(m);
+const objs = [1, 2, 3];
+for (let i = 0; i < 3; i++) objs[i] = { v: i };
+console.log(objs[2].v);
+const refs = [{ a: 1 }, { a: 2 }];
+let sum = 0;
+for (let r = 0; r < 100; r++) {
+  for (let i = 0; i < 2; i++) {
+    refs[i] = 1;
+    sum += refs[i];
+  }
+}
+console.log(sum, refs[0], refs[1]);
+// Negative keys, NaN and string keys go to the generic code.
+const neg = [10, 20];
+let ns = 0;
+for (let i = -2; i < 2; i++) ns += neg[i] === undefined ? 1 : neg[i];
+console.log(ns, neg[NaN] === undefined);
+// Two-level arrays, where a row may not be an array.
+const rows = [[1, 2], 5, [3, 4]];
+let rs = 0;
+for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++) rs += rows[i] && rows[i][j] !== undefined ? rows[i][j] : 0;
+console.log(rs);
+const table = [[0, 0], [0, 0]];
+for (let r = 0; r < 300; r++) for (let i = 0; i < 2; i++) for (let j = 0; j < 2; j++) table[i][j] += i + j + r % 3;
+console.log(table[0][0], table[0][1], table[1][0], table[1][1]);
+// A loop that reassigns its array does not keep reading the old one.
+let arr = [1, 2, 3];
+let lastSum = 0;
+for (let i = 0; i < 6; i++) {
+  lastSum += arr[i % 3];
+  if (i === 2) arr = [10, 20, 30];
+}
+console.log(lastSum, arr[0]);

@@ -14,14 +14,15 @@
 //! returns at once when it is not a number, so the generic code runs the loop instead.
 
 use super::codegen::{
-    emit_mod_const, int_divisor, local_uses, magic, successors, TAG_BOOL, TAG_NUM,
+    emit_mod_const, int_divisor, local_uses, magic, successors, TAG_ARR, TAG_BOOL, TAG_NUM,
 };
 use super::rt;
 use super::types::Numbers;
 use super::x64::*;
 use super::Batch;
 use crate::bytecode::{Op, Proto};
-use crate::value::Value;
+use crate::value::{arr_layout, Value};
+use crate::vm::MAX_ARRAY_GROW;
 use std::mem::offset_of;
 
 /// The xmm registers that hold locals of a loop, from xmm2 up. xmm0 and xmm1 are scratch.
@@ -39,7 +40,9 @@ const FN_MAX_DEPTH: i32 = 13;
 pub(super) const MAX_ARGS: usize = 6;
 /// The bytes of a loop region's frame, below the saved `r13`: room to save the xmm registers a call
 /// clobbers, and a size that keeps rsp 16-byte aligned at those calls.
-const FRAME: i32 = 136;
+const FRAME: i32 = 152;
+/// Where the tag of an element operand is kept, one byte per depth. `call_mod` saves its registers below this.
+const TAG_CELLS: i32 = 136;
 /// The largest magnitude an integer copy of a local may have. It stays exact, and fits an imm32.
 const INT_LIMIT: i32 = i32::MAX;
 /// The stack that a function region may use, below the stack its wrapper was called on.
@@ -89,6 +92,14 @@ pub(super) struct Region {
     /// The divisor of the remainder that native code keeps in r15 for the integer copy, which steps
     /// up by one, and is taken by this one divisor (see `step_counter`).
     rem: Option<u32>,
+    /// The locals that hold arrays. A loop reads and writes their elements in place, so they have no register,
+    /// and the loop checks on entry that they hold an array.
+    arrays: Vec<u32>,
+    /// The kind of each operand before each instruction of a loop, from `header` on (see `operand_marks`).
+    marks: Vec<Vec<Mark>>,
+    /// The instructions of a loop that read or write an element. A side exit resumes the generic code at one of
+    /// them, with its operands written back, so the generic code dispatches them as exits.
+    pub(super) resumes: Vec<usize>,
     /// Set for a function region.
     pub(super) function: Option<Function>,
 }
@@ -104,6 +115,9 @@ enum Mark {
     Callee,
     /// The `this` of a plain call, which is `undefined`. Only a call takes it, and it has no register.
     This,
+    /// An element of an array, which is a number or a boolean. Its register holds the number, or 0.0 or 1.0 for a
+    /// boolean, and its tag is kept in the operand's tag cell, which a side exit writes back.
+    Elem,
 }
 
 /// Plans a loop region for the loop whose back jumps go to `header`. `None` if the loop has an
@@ -118,6 +132,16 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
                 .any(|&(next, _)| next == header)
     })?;
     let inside = |ip: usize| (header..=last).contains(&ip);
+    // A local that an index operation names is an array. The loop reads its elements in place.
+    let mut arrays = vec![false; proto.nlocals as usize];
+    for ip in header..=last {
+        if depth[ip] >= 0 {
+            if let Some(a) = index_base(code[ip]) {
+                arrays[a as usize] = true;
+            }
+        }
+    }
+    let mut resumes = Vec::new();
     let mut entries = vec![header];
     let mut exits = Vec::new();
     let mut uses = vec![0u32; proto.nlocals as usize];
@@ -148,6 +172,9 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         }
         if !allowed(proto, op) {
             return None;
+        }
+        if index_base(op).is_some() {
+            resumes.push(ip);
         }
         if is_test(op) && !consumed(code, ip) {
             return None;
@@ -222,7 +249,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         }
     }
     let mut order: Vec<u32> = (0..proto.nlocals)
-        .filter(|&i| uses[i as usize] > 0)
+        .filter(|&i| uses[i as usize] > 0 && !arrays[i as usize])
         .collect();
     if order.len() > LOCAL_REGS.len() {
         return None;
@@ -263,6 +290,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
             guards.push(i);
         }
     }
+    let marks = operand_marks(proto, depth, header, last, &entries, &arrays)?;
     Some(Region {
         header,
         last,
@@ -273,6 +301,9 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         guards,
         int_local,
         rem,
+        arrays: (0..proto.nlocals).filter(|&i| arrays[i as usize]).collect(),
+        marks,
+        resumes,
         function: None,
     })
 }
@@ -336,6 +367,9 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
         guards: Vec::new(),
         int_local: None,
         rem: None,
+        arrays: Vec::new(),
+        marks: Vec::new(),
+        resumes: Vec::new(),
         function: Some(Function {
             nparams,
             self_upval,
@@ -547,14 +581,215 @@ fn allowed(proto: &Proto, op: Op) -> bool {
         Op::Jump(_) | Op::JumpIfFalse(_) | Op::JumpIfTrue(_) => true,
         Op::JumpIfNotLt(_) | Op::JumpIfNotLe(_) | Op::JumpIfNotGt(_) | Op::JumpIfNotGe(_) => true,
         Op::JumpIfLtLL(..) | Op::JumpIfNotLtLL(..) => true,
+        Op::True | Op::False => true,
+        // The element code needs the layout of arrays, which the generic code needs too (see `arr_layout`).
+        Op::GetIndexLocal(_)
+        | Op::GetIndex2Local(_)
+        | Op::SetIndexLocal(_)
+        | Op::SetIndex2Local(_) => arr_layout().is_some(),
         _ => false,
     }
+}
+
+/// The array local that an index operation reads or writes, if `op` is one.
+fn index_base(op: Op) -> Option<u32> {
+    match op {
+        Op::GetIndexLocal(a)
+        | Op::GetIndex2Local(a)
+        | Op::SetIndexLocal(a)
+        | Op::SetIndex2Local(a) => Some(a),
+        _ => None,
+    }
+}
+
+/// Pops `n` operand kinds from the stack of kinds, and returns them from the top down.
+fn pop_kinds(state: &mut Vec<Mark>, n: usize) -> Option<Vec<Mark>> {
+    let at = state.len().checked_sub(n)?;
+    Some(state.split_off(at).into_iter().rev().collect())
+}
+
+/// Steps the kinds of the operands through `op`. `false` when an operand has a kind that `op` cannot take, or a local
+/// is used in a way that an array does not allow. A boolean and an element read as the number 0 or 1, so arithmetic
+/// and the ordering comparisons take them. Strict equality, a local and an index take numbers only.
+fn step(op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
+    let plain = |i: u32| !arrays[i as usize];
+    let number = |m: &Mark| *m == Mark::Num;
+    match op {
+        Op::Const(_) => state.push(Mark::Num),
+        Op::True | Op::False => state.push(Mark::Bool),
+        Op::Pop => {
+            if pop_kinds(state, 1).is_none() {
+                return false;
+            }
+        }
+        Op::Dup => match state.last().copied() {
+            Some(top) => state.push(top),
+            None => return false,
+        },
+        Op::Swap => {
+            let n = state.len();
+            if n < 2 {
+                return false;
+            }
+            state.swap(n - 1, n - 2);
+        }
+        Op::GetLocal(i) => {
+            if !plain(i) {
+                return false;
+            }
+            state.push(Mark::Num);
+        }
+        Op::SetLocal(i) | Op::PopToLocal(i) => match pop_kinds(state, 1) {
+            Some(v) if plain(i) && number(&v[0]) => {}
+            _ => return false,
+        },
+        Op::AddToLocal(i) => match pop_kinds(state, 1) {
+            Some(_) if plain(i) => {}
+            _ => return false,
+        },
+        Op::IncLocal(i)
+        | Op::DecLocal(i)
+        | Op::JumpIfLtLK(i, _, _)
+        | Op::JumpIfNotLtLK(i, _, _) => {
+            if !plain(i) {
+                return false;
+            }
+        }
+        Op::AddLK(i, _) | Op::SubLK(i, _) | Op::MulLK(i, _) | Op::ModLK(i, _) => {
+            if !plain(i) {
+                return false;
+            }
+            state.push(Mark::Num);
+        }
+        Op::JumpIfLtLL(p, q, _) | Op::JumpIfNotLtLL(p, q, _) => {
+            if !plain(p) || !plain(q) {
+                return false;
+            }
+        }
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => {
+            if pop_kinds(state, 2).is_none() {
+                return false;
+            }
+            state.push(Mark::Num);
+        }
+        Op::Neg => {
+            if pop_kinds(state, 1).is_none() {
+                return false;
+            }
+            state.push(Mark::Num);
+        }
+        Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Ne | Op::Not => {
+            let pops = if matches!(op, Op::Not) { 1 } else { 2 };
+            if pop_kinds(state, pops).is_none() {
+                return false;
+            }
+            state.push(Mark::Bool);
+        }
+        Op::StrictEq | Op::StrictNe => match pop_kinds(state, 2) {
+            Some(kinds) if kinds.iter().all(number) => state.push(Mark::Bool),
+            _ => return false,
+        },
+        Op::Jump(_) => {}
+        Op::JumpIfFalse(_) | Op::JumpIfTrue(_) => {
+            if pop_kinds(state, 1).is_none() {
+                return false;
+            }
+        }
+        Op::JumpIfNotLt(_) | Op::JumpIfNotLe(_) | Op::JumpIfNotGt(_) | Op::JumpIfNotGe(_) => {
+            if pop_kinds(state, 2).is_none() {
+                return false;
+            }
+        }
+        Op::GetIndexLocal(a) | Op::GetIndex2Local(a) => {
+            let keys = if matches!(op, Op::GetIndex2Local(_)) {
+                2
+            } else {
+                1
+            };
+            match pop_kinds(state, keys) {
+                Some(index) if !plain(a) && index.iter().all(number) => state.push(Mark::Elem),
+                _ => return false,
+            }
+        }
+        Op::SetIndexLocal(a) | Op::SetIndex2Local(a) => {
+            let keys = if matches!(op, Op::SetIndex2Local(_)) {
+                2
+            } else {
+                1
+            };
+            match pop_kinds(state, keys + 1) {
+                // The value is on top, and the operation leaves it on the stack.
+                Some(popped)
+                    if !plain(a)
+                        && popped[1..].iter().all(number)
+                        && matches!(popped[0], Mark::Num | Mark::Bool) =>
+                {
+                    state.push(popped[0]);
+                }
+                _ => return false,
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// The kinds of the operands before each instruction of a loop, indexed from `header`, found by following every path
+/// from the entries. `None` when an instruction uses an operand in a way its kind does not allow, or when two paths
+/// reach an instruction with different kinds.
+fn operand_marks(
+    proto: &Proto,
+    depth: &[i32],
+    header: usize,
+    last: usize,
+    entries: &[usize],
+    arrays: &[bool],
+) -> Option<Vec<Vec<Mark>>> {
+    let code = &proto.code;
+    let inside = |ip: usize| (header..=last).contains(&ip);
+    let mut before: Vec<Option<Vec<Mark>>> = vec![None; last - header + 1];
+    let mut work = Vec::new();
+    for &e in entries {
+        before[e - header] = Some(Vec::new());
+        work.push(e);
+    }
+    while let Some(ip) = work.pop() {
+        let mut state = before[ip - header].clone()?;
+        if !step(code[ip], &mut state, arrays) {
+            return None;
+        }
+        for (next, _) in successors(code[ip], ip, depth[ip]) {
+            if !inside(next) {
+                continue;
+            }
+            match &before[next - header] {
+                None => {
+                    before[next - header] = Some(state.clone());
+                    work.push(next);
+                }
+                Some(known) if *known != state => return None,
+                Some(_) => {}
+            }
+        }
+    }
+    // An instruction that no path reaches never runs, so its kinds are only a placeholder.
+    Some(
+        before
+            .into_iter()
+            .enumerate()
+            .map(|(k, kinds)| {
+                kinds.unwrap_or_else(|| vec![Mark::Num; depth[header + k].max(0) as usize])
+            })
+            .collect(),
+    )
 }
 
 /// The number an instruction uses as an operand, when it has one that is kept in a register.
 fn constant_of(proto: &Proto, op: Op) -> Option<u64> {
     let k = match op {
         Op::IncLocal(_) | Op::DecLocal(_) => return Some(1f64.to_bits()),
+        Op::True => return Some(1f64.to_bits()),
+        Op::False => return Some(0f64.to_bits()),
         Op::Const(k) | Op::AddLK(_, k) | Op::SubLK(_, k) | Op::MulLK(_, k) => k,
         Op::JumpIfLtLK(_, k, _) | Op::JumpIfNotLtLK(_, k, _) => k,
         _ => return None,
@@ -632,6 +867,7 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
         slow: Vec::new(),
         body: None,
         nlocals: 0,
+        sides: Vec::new(),
     };
     e.a.bind(entry);
     e.a.push_reg(R13);
@@ -639,6 +875,10 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
     e.a.sub_rsp32(FRAME);
     for &i in &lp.guards {
         e.a.cmp8_imm(local_mem(i), TAG_NUM);
+        e.a.jcc(CC_NE, not_entered);
+    }
+    for &a in &lp.arrays {
+        e.a.cmp8_imm(local_mem(a), TAG_ARR);
         e.a.jcc(CC_NE, not_entered);
     }
     for &(i, home) in &lp.locals {
@@ -918,6 +1158,7 @@ pub(super) fn emit_function(
         slow: Vec::new(),
         body: Some(body),
         nlocals,
+        sides: Vec::new(),
     };
     e.body_ops();
     let a = e.a;
@@ -963,6 +1204,8 @@ struct Emitter<'a, 'b> {
     body: Option<Label>,
     /// The locals of a function region, whose operand spill slots sit below them.
     nlocals: i32,
+    /// The side exits of the element operations: the stub, the instruction, and the operand depth before it.
+    sides: Vec<(Label, usize, i32)>,
 }
 
 impl Emitter<'_, '_> {
@@ -1001,6 +1244,16 @@ impl Emitter<'_, '_> {
             self.call_mod(dst);
             self.a.jmp(join);
         }
+        for (stub, ip, d) in std::mem::take(&mut self.sides) {
+            self.a.bind(stub);
+            self.spill(ip, d);
+            self.writeback();
+            self.a.add_rsp32(FRAME);
+            self.a.pop_reg(R15);
+            self.a.pop_reg(R13);
+            self.a.mov_imm32(RAX, ip as u32);
+            self.a.ret();
+        }
     }
 
     /// Emits the stubs that leave a loop, and the return for a guard that failed.
@@ -1029,20 +1282,28 @@ impl Emitter<'_, '_> {
     fn op(&mut self, op: Op, d: i32, ip: usize) {
         let (x, y) = (self.reg(d - 1), self.reg(d - 2));
         match op {
-            Op::Const(k) => {
-                let c = self.constant(number(self.proto, k).to_bits(), self.reg(d));
-                if c != self.reg(d) {
-                    self.a.movapd_rr(self.reg(d), c);
-                }
-            }
+            Op::Const(k) => self.load_number(number(self.proto, k), d),
+            Op::True => self.load_number(1.0, d),
+            Op::False => self.load_number(0.0, d),
             // A function's `this` and callee have no register, and the code of a function starts
             // from nothing, so these take no code.
             Op::Pop | Op::Undef | Op::GetUpval(_) => {}
-            Op::Dup => self.a.movapd_rr(self.reg(d), x),
+            Op::Dup => {
+                self.a.movapd_rr(self.reg(d), x);
+                let (from, to) = (self.tag_cell(d - 1), self.tag_cell(d));
+                self.a.movzx_load8(RAX, from);
+                self.a.mov_store8(to, RAX);
+            }
             Op::Swap => {
                 self.a.movapd_rr(0, x);
                 self.a.movapd_rr(x, y);
                 self.a.movapd_rr(y, 0);
+                // The tags of the two operands trade places too.
+                let (top, under) = (self.tag_cell(d - 1), self.tag_cell(d - 2));
+                self.a.movzx_load8(RAX, top);
+                self.a.movzx_load8(RCX, under);
+                self.a.mov_store8(top, RCX);
+                self.a.mov_store8(under, RAX);
             }
             Op::GetLocal(i) => self.read_local(i, self.reg(d)),
             Op::SetLocal(i) | Op::PopToLocal(i) => self.write_local(i, x),
@@ -1154,6 +1415,36 @@ impl Emitter<'_, '_> {
                 self.a.pop_reg(RBP);
                 self.a.ret();
             }
+            Op::GetIndexLocal(a) => {
+                let exit = self.side_exit(ip, d);
+                let (key, tag) = (self.reg(d - 1), self.tag_cell(d - 1));
+                self.a.mov_load(R8, local_mem(a).at(8));
+                self.elem_read(key, key, tag, exit);
+            }
+            Op::GetIndex2Local(a) => {
+                let exit = self.side_exit(ip, d);
+                let (row, key, tag) = (self.reg(d - 2), self.reg(d - 1), self.tag_cell(d - 2));
+                self.a.mov_load(R8, local_mem(a).at(8));
+                self.elem_row(row, exit);
+                self.elem_read(key, row, tag, exit);
+            }
+            Op::SetIndexLocal(a) => {
+                let exit = self.side_exit(ip, d);
+                let boolean = self.mark(ip, d - 1) == Mark::Bool;
+                let (key, value) = (self.reg(d - 2), self.reg(d - 1));
+                self.a.mov_load(R8, local_mem(a).at(8));
+                self.elem_write(key, value, boolean, exit);
+                self.a.movapd_rr(key, value);
+            }
+            Op::SetIndex2Local(a) => {
+                let exit = self.side_exit(ip, d);
+                let boolean = self.mark(ip, d - 1) == Mark::Bool;
+                let (row, key, value) = (self.reg(d - 3), self.reg(d - 2), self.reg(d - 1));
+                self.a.mov_load(R8, local_mem(a).at(8));
+                self.elem_row(row, exit);
+                self.elem_write(key, value, boolean, exit);
+                self.a.movapd_rr(row, value);
+            }
             Op::Call(argc) => self.call(d, argc as i32),
             _ => unreachable!("the planners admit only the operations above"),
         }
@@ -1244,6 +1535,152 @@ impl Emitter<'_, '_> {
                 self.a.movsd_store(m, 0);
             }
         }
+    }
+
+    /// Loads the number `n` as the operand at depth `d`.
+    fn load_number(&mut self, n: f64, d: i32) {
+        let c = self.constant(n.to_bits(), self.reg(d));
+        if c != self.reg(d) {
+            self.a.movapd_rr(self.reg(d), c);
+        }
+    }
+
+    /// The byte where the tag of the element operand at depth `k` is kept, which a side exit writes back.
+    fn tag_cell(&self, k: i32) -> Mem {
+        Mem {
+            base: RSP,
+            disp: TAG_CELLS + k,
+        }
+    }
+
+    /// The kind of the operand at depth `k` before instruction `ip`.
+    fn mark(&self, ip: usize, k: i32) -> Mark {
+        self.lp.marks[ip - self.lp.header][k as usize]
+    }
+
+    /// A stub that leaves the loop so that the generic code runs the element operation at `ip`, which has `d` operands.
+    fn side_exit(&mut self, ip: usize, d: i32) -> Label {
+        let stub = self.a.label();
+        self.sides.push((stub, ip, d));
+        stub
+    }
+
+    /// Writes the `d` operands back to the stack, each with the tag its kind has.
+    fn spill(&mut self, ip: usize, d: i32) {
+        for k in 0..d {
+            let slot = local_mem((self.proto.nlocals as i32 + k) as u32);
+            let x = self.reg(k);
+            match self.mark(ip, k) {
+                Mark::Bool => {
+                    self.a.mov8_imm(slot, TAG_BOOL);
+                    self.a.cvttsd2si(RAX, x);
+                    self.a.mov_store8(slot.at(1), RAX);
+                }
+                Mark::Elem => {
+                    let (num, done) = (self.a.label(), self.a.label());
+                    let tag = self.tag_cell(k);
+                    self.a.movzx_load8(RAX, tag);
+                    self.a.mov_store8(slot, RAX);
+                    self.a.cmp64_imm8(RAX, TAG_BOOL);
+                    self.a.jcc(CC_NE, num);
+                    self.a.cvttsd2si(RAX, x);
+                    self.a.mov_store8(slot.at(1), RAX);
+                    self.a.jmp(done);
+                    self.a.bind(num);
+                    self.a.movsd_store(slot.at(8), x);
+                    self.a.bind(done);
+                }
+                _ => {
+                    self.a.mov8_imm(slot, TAG_NUM);
+                    self.a.movsd_store(slot.at(8), x);
+                }
+            }
+        }
+    }
+
+    /// Leaves the address of element `key` of the array in r8 in rdx, with the index in rax. A key that is not a whole
+    /// index inside the array jumps to `exit`.
+    fn elem_addr(&mut self, key: u8, exit: Label) {
+        // `allowed` admits element operations only when the layout is known.
+        let layout =
+            arr_layout().expect("the planner admits array elements only with a known layout");
+        // The number is a whole index when truncating it and converting it back give the same number. NaN fails the
+        // comparison, which sets the parity flag when the operands are unordered.
+        self.a.cvttsd2si(RAX, key);
+        self.a.cvtsi2sd(1, RAX);
+        self.a.ucomisd(key, 1);
+        self.a.jcc(CC_NE, exit);
+        self.a.jcc(CC_P, exit);
+        self.a.movsxd(RAX, RAX);
+        // A negative index is huge as an unsigned number, so the bounds below refuse it too.
+        self.a.cmp64_imm32(RAX, MAX_ARRAY_GROW as i32);
+        self.a.jcc(CC_AE, exit);
+        self.a.mov_rr(RCX, R8);
+        self.a.add64_imm32(RCX, layout.vec);
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: RCX,
+                disp: layout.len,
+            },
+        );
+        self.a.cmp_rr64(RAX, RSI);
+        self.a.jcc(CC_AE, exit);
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: RCX,
+                disp: layout.buf,
+            },
+        );
+        self.a.shl64_imm(RAX, 4);
+        self.a.add64(RDX, RAX);
+    }
+
+    /// Loads element `key` of the array in r8 into `dst`, as a number or as 0.0 or 1.0 for a boolean, and its tag into
+    /// `tag`. Any other element jumps to `exit`.
+    fn elem_read(&mut self, key: u8, dst: u8, tag: Mem, exit: Label) {
+        self.elem_addr(key, exit);
+        let (num, done) = (self.a.label(), self.a.label());
+        self.a.movzx_load8(RAX, Mem { base: RDX, disp: 0 });
+        self.a.cmp64_imm8(RAX, TAG_NUM);
+        self.a.jcc(CC_E, num);
+        self.a.cmp64_imm8(RAX, TAG_BOOL);
+        self.a.jcc(CC_NE, exit);
+        self.a.movzx_load8(RCX, Mem { base: RDX, disp: 1 });
+        self.a.cvtsi2sd(dst, RCX);
+        self.a.jmp(done);
+        self.a.bind(num);
+        self.a.movsd_load(dst, Mem { base: RDX, disp: 8 });
+        self.a.bind(done);
+        self.a.mov_store8(tag, RAX);
+    }
+
+    /// Stores the number or boolean in `src` as element `key` of the array in r8. An element that holds a reference
+    /// jumps to `exit`, before anything is written.
+    fn elem_write(&mut self, key: u8, src: u8, boolean: bool, exit: Label) {
+        self.elem_addr(key, exit);
+        self.a.movzx_load8(RAX, Mem { base: RDX, disp: 0 });
+        // The tags up to number are undefined, null, boolean and number, which hold no reference.
+        self.a.cmp64_imm8(RAX, TAG_NUM);
+        self.a.jcc(CC_A, exit);
+        if boolean {
+            self.a.mov8_imm(Mem { base: RDX, disp: 0 }, TAG_BOOL);
+            self.a.cvttsd2si(RAX, src);
+            self.a.mov_store8(Mem { base: RDX, disp: 1 }, RAX);
+        } else {
+            self.a.mov8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
+            self.a.movsd_store(Mem { base: RDX, disp: 8 }, src);
+        }
+    }
+
+    /// Makes r8 the array that element `key` of the array in r8 holds. An element that is not an array jumps to `exit`.
+    fn elem_row(&mut self, key: u8, exit: Label) {
+        self.elem_addr(key, exit);
+        self.a.movzx_load8(RAX, Mem { base: RDX, disp: 0 });
+        self.a.cmp64_imm8(RAX, TAG_ARR);
+        self.a.jcc(CC_NE, exit);
+        self.a.mov_load(R8, Mem { base: RDX, disp: 8 });
     }
 
     /// The register that holds the number `bits`: its hoisted register, or `scratch`, which is loaded
@@ -1475,6 +1912,73 @@ mod tests {
     fn plan_at(p: &Proto, header: usize) -> Option<Region> {
         let (depth, types) = analysis(p, 0);
         plan(p, &depth, &types, header)
+    }
+
+    /// `for (let j = 0; j < n; j++) a[j] = false`, with `a` in local 0, `n` in local 1 and `j` in local 2. `store` is the
+    /// operation that stores the value, and `after` runs in place of the `Pop` that follows it.
+    fn fill_loop(store: Op, after: Op) -> Proto {
+        proto(
+            vec![
+                Op::Const(0),
+                Op::PopToLocal(2),
+                Op::GetLocal(2),
+                Op::GetLocal(1),
+                Op::JumpIfNotLt(11),
+                Op::GetLocal(2),
+                Op::False,
+                store,
+                after,
+                Op::IncLocal(2),
+                Op::Jump(2),
+                Op::Return,
+            ],
+            vec![Value::Num(0.0)],
+            3,
+            2,
+        )
+    }
+
+    #[test]
+    fn an_array_store_in_a_loop_is_planned_with_the_array_in_its_frame_slot() {
+        let region =
+            plan_at(&fill_loop(Op::SetIndexLocal(0), Op::Pop), 2).expect("the loop is planned");
+        assert_eq!(region.arrays, vec![0]);
+        assert!(
+            region.locals.iter().all(|&(i, _)| i != 0),
+            "the array has no register"
+        );
+    }
+
+    #[test]
+    fn an_array_the_loop_assigns_is_not_planned() {
+        assert!(plan_at(&fill_loop(Op::SetIndexLocal(0), Op::PopToLocal(0)), 2).is_none());
+    }
+
+    #[test]
+    fn an_element_is_not_compared_strictly_with_a_boolean() {
+        // `while (j < n) { if (a[j] === false) ...; j++ }`: the element may be a number, and strict equality
+        // tells the two apart.
+        let p = proto(
+            vec![
+                Op::Const(0),
+                Op::PopToLocal(2),
+                Op::GetLocal(2),
+                Op::GetLocal(1),
+                Op::JumpIfNotLt(12),
+                Op::GetLocal(2),
+                Op::GetIndexLocal(0),
+                Op::False,
+                Op::StrictEq,
+                Op::JumpIfFalse(10),
+                Op::IncLocal(2),
+                Op::Jump(2),
+                Op::Return,
+            ],
+            vec![Value::Num(0.0)],
+            3,
+            2,
+        );
+        assert!(plan_at(&p, 2).is_none());
     }
 
     #[test]

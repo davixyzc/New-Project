@@ -30,7 +30,7 @@ const TAG_NULL: u8 = 1;
 pub(super) const TAG_BOOL: u8 = 2;
 pub(super) const TAG_NUM: u8 = 3;
 const TAG_STR: u8 = 4;
-const TAG_ARR: u8 = 5;
+pub(super) const TAG_ARR: u8 = 5;
 const TAG_OBJ: u8 = 6;
 const TAG_FUNC: u8 = 7;
 const TAG_NATIVE: u8 = 8;
@@ -1755,7 +1755,9 @@ impl<'a> Gen<'a> {
                 continue;
             }
             if let Some(r) = self.entry_at[ip] {
-                let (exits, entry) = (self.regions[r].0.exits.clone(), self.regions[r].1);
+                // A region returns an exit of the loop, or the instruction where a side exit resumes.
+                let (mut exits, entry) = (self.regions[r].0.exits.clone(), self.regions[r].1);
+                exits.extend_from_slice(&self.regions[r].0.resumes);
                 self.enter_region(entry, ip, &exits);
             }
             let op = self.proto.code[ip];
