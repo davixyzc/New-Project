@@ -26,10 +26,15 @@ use std::mem::offset_of;
 
 /// The xmm registers that hold locals of a loop, from xmm2 up. xmm0 and xmm1 are scratch.
 const LOCAL_REGS: std::ops::Range<u8> = 2..8;
-/// The xmm register of the operand at depth 0. Operand `k` is in `TEMP_BASE + k`, up to xmm15.
+/// The xmm register of the operand at depth 0 in a loop. Operand `k` is in `TEMP_BASE + k`, up to xmm15.
 const TEMP_BASE: u8 = 8;
-/// The deepest operand stack a region handles, which leaves the registers above it for constants.
+/// The deepest operand stack a loop handles, which leaves the registers above it for constants.
 const MAX_DEPTH: i32 = 7;
+/// The xmm register of the operand at depth 0 in a function. The locals of a function are in its frame, so
+/// the registers from xmm2 up are free for operands, and xmm0 and xmm1 stay scratch.
+const FN_TEMP_BASE: u8 = 2;
+/// The deepest operand stack a function handles. Operand `k` is in `FN_TEMP_BASE + k`, up to xmm15.
+const FN_MAX_DEPTH: i32 = 13;
 /// Arguments a function region takes, in xmm0 and up.
 pub(super) const MAX_ARGS: usize = 6;
 /// The bytes of a loop region's frame, below the saved `r13`: room to save the xmm registers a call
@@ -289,7 +294,7 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
     let mut ret_kind = None;
     while let Some(ip) = work.pop() {
         let d = depth[ip];
-        if d < 0 || d > MAX_DEPTH {
+        if d < 0 || d > FN_MAX_DEPTH {
             return None;
         }
         let op = code[ip];
@@ -583,11 +588,6 @@ fn number(proto: &Proto, k: u32) -> f64 {
         Some(Value::Num(x)) => *x,
         _ => f64::NAN,
     }
-}
-
-/// The xmm register of the operand at depth `k`.
-fn reg(k: i32) -> u8 {
-    (TEMP_BASE as i32 + k) as u8
 }
 
 /// The payload slot of local `i` in a loop's frame, which `r12` points at.
@@ -1027,32 +1027,32 @@ impl Emitter<'_, '_> {
 
     /// Emits `op` at instruction `ip`, which runs with `d` operands on the stack.
     fn op(&mut self, op: Op, d: i32, ip: usize) {
-        let (x, y) = (reg(d - 1), reg(d - 2));
+        let (x, y) = (self.reg(d - 1), self.reg(d - 2));
         match op {
             Op::Const(k) => {
-                let c = self.constant(number(self.proto, k).to_bits(), reg(d));
-                if c != reg(d) {
-                    self.a.movapd_rr(reg(d), c);
+                let c = self.constant(number(self.proto, k).to_bits(), self.reg(d));
+                if c != self.reg(d) {
+                    self.a.movapd_rr(self.reg(d), c);
                 }
             }
             // A function's `this` and callee have no register, and the code of a function starts
             // from nothing, so these take no code.
             Op::Pop | Op::Undef | Op::GetUpval(_) => {}
-            Op::Dup => self.a.movapd_rr(reg(d), x),
+            Op::Dup => self.a.movapd_rr(self.reg(d), x),
             Op::Swap => {
                 self.a.movapd_rr(0, x);
                 self.a.movapd_rr(x, y);
                 self.a.movapd_rr(y, 0);
             }
-            Op::GetLocal(i) => self.read_local(i, reg(d)),
+            Op::GetLocal(i) => self.read_local(i, self.reg(d)),
             Op::SetLocal(i) | Op::PopToLocal(i) => self.write_local(i, x),
             Op::AddToLocal(i) => self.update_local(i, SSE_ADD, x),
             Op::IncLocal(i) => self.step_counter(i, SSE_ADD, 1, ip),
             Op::DecLocal(i) => self.step_counter(i, SSE_SUB, -1, ip),
-            Op::AddLK(i, k) => self.with_constant(i, k, SSE_ADD, reg(d)),
-            Op::SubLK(i, k) => self.with_constant(i, k, SSE_SUB, reg(d)),
-            Op::MulLK(i, k) => self.with_constant(i, k, SSE_MUL, reg(d)),
-            Op::ModLK(i, k) => self.mod_constant(i, k, reg(d)),
+            Op::AddLK(i, k) => self.with_constant(i, k, SSE_ADD, self.reg(d)),
+            Op::SubLK(i, k) => self.with_constant(i, k, SSE_SUB, self.reg(d)),
+            Op::MulLK(i, k) => self.with_constant(i, k, SSE_MUL, self.reg(d)),
+            Op::ModLK(i, k) => self.mod_constant(i, k, self.reg(d)),
             Op::Add => self.a.sse(SSE_ADD, y, x),
             Op::Sub => self.a.sse(SSE_SUB, y, x),
             Op::Mul => self.a.sse(SSE_MUL, y, x),
@@ -1164,19 +1164,29 @@ impl Emitter<'_, '_> {
     fn call(&mut self, d: i32, argc: i32) {
         let base = d - argc - 2;
         for k in 0..base {
-            self.a.movsd_store(self.operand_slot(k), reg(k));
+            self.a.movsd_store(self.operand_slot(k), self.reg(k));
         }
         for j in 0..argc {
-            self.a.movapd_rr(j as u8, reg(d - argc + j));
+            self.a.movapd_rr(j as u8, self.reg(d - argc + j));
         }
         let body = self
             .body
             .expect("calls are only planned in a function region");
         self.a.call_label(body);
-        self.a.movapd_rr(reg(base), 0);
+        self.a.movapd_rr(self.reg(base), 0);
         for k in 0..base {
-            self.a.movsd_load(reg(k), self.operand_slot(k));
+            self.a.movsd_load(self.reg(k), self.operand_slot(k));
         }
+    }
+
+    /// The xmm register of the operand at depth `k`.
+    fn reg(&self, k: i32) -> u8 {
+        let base = if self.lp.function.is_some() {
+            FN_TEMP_BASE
+        } else {
+            TEMP_BASE
+        };
+        (base as i32 + k) as u8
     }
 
     /// The frame slot where a call saves operand register `k`, below the locals.
@@ -1665,6 +1675,26 @@ mod tests {
             1,
             1,
         );
+        let (depth, types) = analysis(&p, 1);
+        assert!(plan_function(&p, &depth, &types).is_none());
+    }
+
+    /// A function that pushes `pushes` copies of a constant and then adds them up, so its deepest operand
+    /// stack is `pushes` deep, at the first `Add`.
+    fn deep_sum(pushes: usize) -> Proto {
+        let mut code = vec![Op::Const(0); pushes];
+        code.extend(std::iter::repeat_n(Op::Add, pushes - 1));
+        code.push(Op::Return);
+        proto(code, vec![Value::Num(1.0)], 1, 1)
+    }
+
+    #[test]
+    fn a_function_is_planned_up_to_the_deepest_operand_registers() {
+        // Operands sit in xmm2 up to xmm15 in a function, so a depth of 13 is the most it takes.
+        let p = deep_sum(13);
+        let (depth, types) = analysis(&p, 1);
+        assert!(plan_function(&p, &depth, &types).is_some());
+        let p = deep_sum(14);
         let (depth, types) = analysis(&p, 1);
         assert!(plan_function(&p, &depth, &types).is_none());
     }
