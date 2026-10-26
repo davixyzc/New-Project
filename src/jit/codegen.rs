@@ -1422,8 +1422,8 @@ impl<'a> Gen<'a> {
 
     /// Moves the value at `val` into the object at `obj` as the property that the transition in `hint` adds, when the
     /// object has the shape that the transition starts from and room for one more value (see `Props::push_hinted`). The
-    /// object takes the transition's shape and gives up the shape it had. The shape tree keeps every shape alive, so no
-    /// shape's count reaches zero here. Anything else jumps to `miss`, before anything has changed.
+    /// object takes the transition's shape, which is not counted, since shapes are never freed. Anything else jumps to
+    /// `miss`, before anything has changed.
     fn init_prop_native(
         &mut self,
         obj: Mem,
@@ -1471,7 +1471,7 @@ impl<'a> Gen<'a> {
         );
         self.a.cmp_rr64(RSI, RDI);
         self.a.jcc(CC_AE, miss);
-        // The object takes the new shape, which gains a count, and gives up the old one.
+        // The object takes the new shape. Shapes are never freed, so no count changes.
         self.a.mov_load(
             R9,
             Mem {
@@ -1479,8 +1479,6 @@ impl<'a> Gen<'a> {
                 disp: std::mem::offset_of!(PropHint, to) as i32,
             },
         );
-        self.add_count(R9, 1);
-        self.add_count(RAX, -1);
         self.a.mov_store(
             Mem {
                 base: RCX,

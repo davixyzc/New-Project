@@ -16,7 +16,7 @@ use crate::vm::Vm;
 /// a property, keeps its own keys and an index by name instead (see `Dict`).
 pub struct Props {
     /// The shape of an object in shape mode. In dictionary mode it is `dict_shape()`, which no cache holds.
-    shape: Rc<Shape>,
+    shape: &'static Shape,
     /// What a cache compares: the address of the shape in shape mode, and in dictionary mode an odd number that no other
     /// object gets. It changes when the position of a key does (see `remove`), so a cache that holds it is never wrong.
     id: usize,
@@ -37,7 +37,7 @@ pub struct Props {
 pub struct Shape {
     keys: Vec<Rc<str>>,
     /// The shapes with one key more, each made of this shape's keys and one more.
-    next: RefCell<Vec<Rc<Shape>>>,
+    next: RefCell<Vec<&'static Shape>>,
 }
 
 /// The keys of an object in dictionary mode, each with its position.
@@ -75,17 +75,31 @@ thread_local! {
     /// The number of the next dictionary identity (see `Props::id`), which is odd and never given out twice.
     static NEXT_DICT_ID: Cell<usize> = const { Cell::new(1) };
     /// The shape of an object with no keys, which every new object starts from.
-    static ROOT: Rc<Shape> = Rc::new(Shape { keys: Vec::new(), next: RefCell::new(Vec::new()) });
+    static ROOT: &'static Shape = leak_shape(Vec::new());
     /// The shape of an object in dictionary mode. No cache holds it, since such an object has its own keys.
-    static DICT_SHAPE: Rc<Shape> = Rc::new(Shape { keys: Vec::new(), next: RefCell::new(Vec::new()) });
+    static DICT_SHAPE: &'static Shape = leak_shape(Vec::new());
 }
 
-fn root_shape() -> Rc<Shape> {
-    ROOT.with(Rc::clone)
+/// A shape made for good. Shapes are never freed, since each hangs off the root through the `next` lists, so an object
+/// refers to its shape without counting it.
+fn leak_shape(keys: Vec<Rc<str>>) -> &'static Shape {
+    Box::leak(Box::new(Shape {
+        keys,
+        next: RefCell::new(Vec::new()),
+    }))
 }
 
-fn dict_shape() -> Rc<Shape> {
-    DICT_SHAPE.with(Rc::clone)
+fn root_shape() -> &'static Shape {
+    ROOT.with(|shape| *shape)
+}
+
+fn dict_shape() -> &'static Shape {
+    DICT_SHAPE.with(|shape| *shape)
+}
+
+/// The identity of a shape in shape mode: its address, which the id of an object holds (see `Props::id`).
+fn shape_id(shape: &'static Shape) -> usize {
+    shape as *const Shape as usize
 }
 
 /// A new identity for a dictionary-mode object.
@@ -100,42 +114,33 @@ fn next_dict_id() -> usize {
 impl Shape {
     /// The shape with `key` added after the keys of this one. It is found among the shapes that follow this one, or it
     /// is made and added to them.
-    fn with_key(self: &Rc<Self>, key: &Rc<str>) -> Rc<Shape> {
+    fn with_key(&'static self, key: &Rc<str>) -> &'static Shape {
         // Interned keys share their allocation, so the pointer finds almost every child; the text is compared only when
         // the pointer finds none.
         let next = self.next.borrow();
-        let last = |s: &&Rc<Shape>| s.keys.last().cloned();
+        let last = |s: &&'static Shape| s.keys.last().cloned();
         let found = next
             .iter()
             .find(|s| last(s).is_some_and(|k| Rc::ptr_eq(&k, key)))
             .or_else(|| next.iter().find(|s| last(s).is_some_and(|k| *k == **key)))
-            .cloned();
+            .copied();
         drop(next);
         if let Some(shape) = found {
             return shape;
         }
         let mut keys = self.keys.clone();
         keys.push(key.clone());
-        let shape = Rc::new(Shape {
-            keys,
-            next: RefCell::new(Vec::new()),
-        });
-        self.next.borrow_mut().push(shape.clone());
+        let shape = leak_shape(keys);
+        self.next.borrow_mut().push(shape);
         shape
     }
-}
-
-/// The address that an `Rc` holds, which is the address of its allocation. Native code compares these addresses.
-fn rc_bits<T>(rc: &Rc<T>) -> usize {
-    // SAFETY: an `Rc` of a sized type is one pointer to its allocation, which `rc_layout_ok` checks.
-    unsafe { std::mem::transmute_copy(rc) }
 }
 
 impl Clone for Props {
     /// A copy has its own dictionary, which may change apart from this one, so it gets an identity of its own.
     fn clone(&self) -> Props {
         Props {
-            shape: self.shape.clone(),
+            shape: self.shape,
             id: if self.dict.is_some() {
                 next_dict_id()
             } else {
@@ -160,7 +165,7 @@ impl Props {
     pub fn with_capacity(capacity: usize) -> Props {
         let shape = root_shape();
         Props {
-            id: rc_bits(&shape),
+            id: shape_id(shape),
             shape,
             values: Vec::with_capacity(capacity),
             dict: None,
@@ -291,7 +296,7 @@ impl Props {
         if self.dict.is_none() && self.shape.keys.len() < SHAPE_KEYS {
             let from = self.id;
             self.shape = self.shape.with_key(&key);
-            self.id = rc_bits(&self.shape);
+            self.id = shape_id(self.shape);
             if let Some(hint) = hint {
                 hint.from.set(from);
                 hint.to.set(self.id);
@@ -727,7 +732,7 @@ pub(crate) fn prop_layout() -> Option<PropLayout> {
 fn probe_prop_layout() -> Option<PropLayout> {
     use std::mem::{offset_of, size_of};
     let arr = arr_layout()?;
-    if size_of::<usize>() != size_of::<Rc<Shape>>() {
+    if size_of::<usize>() != size_of::<&'static Shape>() {
         return None;
     }
     // The properties of an object sit in a `RefCell`, whose value Rust does not place at a fixed offset.
