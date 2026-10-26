@@ -348,6 +348,31 @@ pub unsafe extern "C" fn upval_into(vm: *mut Vm, idx: usize, dst: *mut Value) {
     ptr::write(dst, v);
 }
 
+/// `*dst = a closure made by `Op::Closure(idx)``, as `op` makes it. It cannot fail, so the frame keeps the instruction
+/// pointer it has.
+///
+/// # Safety
+/// Same as `op`: the frame must be on the stack, and `depth` must fit in the capacity reserved for it. `dst` must be
+/// a dead slot.
+pub unsafe extern "C" fn make_closure(vm: *mut Vm, depth: usize, idx: usize, dst: *mut Value) {
+    let vm = &mut *vm;
+    let next = vm.frames.last().unwrap().ip;
+    enter(vm, next, depth);
+    let v = vm.make_closure(idx);
+    ptr::write(dst, v);
+}
+
+/// Boxes the parameter in slot `idx` of the running frame, as `op` does for `Op::BoxParam`.
+///
+/// # Safety
+/// Same as `make_closure`.
+pub unsafe extern "C" fn box_param(vm: *mut Vm, depth: usize, idx: usize) {
+    let vm = &mut *vm;
+    let next = vm.frames.last().unwrap().ip;
+    enter(vm, next, depth);
+    vm.box_param(idx);
+}
+
 /// `*dst = the value of the local at src`, which may be a boxed (captured) variable.
 ///
 /// # Safety

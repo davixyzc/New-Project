@@ -670,6 +670,19 @@ pub fn init_error(obj: &ObjRef, kind: &str, msg: &str, stack: &str) {
     obj_put(obj, &intern_name("stack"), Value::str(stack));
 }
 
+/// The stack text of an error: its header, then the location it was made at when there is one.
+pub fn stack_text(kind: &str, msg: &str, loc: &str) -> String {
+    let mut stack = String::with_capacity(kind.len() + msg.len() + loc.len() + 16);
+    stack.push_str(kind);
+    stack.push_str(": ");
+    stack.push_str(msg);
+    if !loc.is_empty() {
+        stack.push_str("\n    at ");
+        stack.push_str(loc);
+    }
+    stack
+}
+
 /// The name of the class of an object, which is the name of the `constructor` of its prototype. None when the object
 /// has no prototype with a named constructor.
 pub fn class_name(props: &Props) -> Option<String> {
@@ -839,7 +852,7 @@ impl std::hash::Hasher for NameHasher {
 pub type NameMap<V> = HashMap<Rc<str>, V, std::hash::BuildHasherDefault<NameHasher>>;
 
 thread_local! {
-    static NAMES: RefCell<std::collections::HashMap<Box<str>, Rc<str>>> = RefCell::new(Default::default());
+    static NAMES: RefCell<NameMap<()>> = RefCell::new(Default::default());
 }
 
 /// The shared allocation for a name in the source, so that every use of `name` is the same `Rc`, and a property
@@ -847,11 +860,11 @@ thread_local! {
 pub fn intern_name(name: &str) -> Rc<str> {
     NAMES.with(|names| {
         let mut names = names.borrow_mut();
-        if let Some(shared) = names.get(name) {
+        if let Some((shared, _)) = names.get_key_value(name) {
             return shared.clone();
         }
         let shared: Rc<str> = Rc::from(name);
-        names.insert(Box::from(name), shared.clone());
+        names.insert(shared.clone(), ());
         shared
     })
 }
@@ -1136,6 +1149,10 @@ pub fn key_order(props: &Props) -> Vec<usize> {
             Some(n) => indices.push((n, i)),
             None => names.push(i),
         }
+    }
+    // Without index keys the insertion order is the order, and nothing more needs building.
+    if indices.is_empty() {
+        return names;
     }
     indices.sort_unstable();
     indices.into_iter().map(|(_, i)| i).chain(names).collect()

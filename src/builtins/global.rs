@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::builtins::{arg, fs, table_object};
 use crate::value::{
-    init_error, key_order, obj_set, to_int32, to_num, to_str, truthy, NativeDef, Value,
+    init_error, key_order, obj_set, stack_text, to_int32, to_num, to_str, truthy, NativeDef, Value,
 };
 use crate::vm::Vm;
 
@@ -572,12 +572,7 @@ fn new_error(vm: &mut Vm, this: Value, kind: &str, args: &[Value]) -> Value {
     };
     match this {
         Value::Obj(obj) => {
-            let loc = vm.location();
-            let stack = if loc.is_empty() {
-                format!("{}: {}", kind, msg)
-            } else {
-                format!("{}: {}\n    at {}", kind, msg, loc)
-            };
+            let stack = stack_text(kind, &msg, &vm.location());
             init_error(&obj, kind, &msg, &stack);
             Value::Obj(obj)
         }

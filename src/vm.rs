@@ -1673,11 +1673,7 @@ impl Vm {
                     _ => self.stack[idx] = Value::Cell(Rc::new(RefCell::new(v))),
                 }
             }
-            Op::BoxParam(i) => {
-                let idx = base + i as usize;
-                let v = std::mem::replace(&mut self.stack[idx], Value::Undef);
-                self.stack[idx] = Value::Cell(Rc::new(RefCell::new(v)));
-            }
+            Op::BoxParam(i) => self.box_param(i as usize),
             Op::Rebox(i) => {
                 let idx = base + i as usize;
                 let v = match &self.stack[idx] {
@@ -2189,35 +2185,8 @@ impl Vm {
             }
 
             Op::Closure(i) => {
-                let child = proto.protos[i as usize].clone();
-                let frame = self.frames.last().unwrap();
-                let mut upvals = Vec::with_capacity(child.upvals.len());
-                for d in &child.upvals {
-                    if d.from_local {
-                        let cell = match &self.stack[base + d.index as usize] {
-                            Value::Cell(c) => c.clone(),
-                            other => Rc::new(RefCell::new(other.clone())),
-                        };
-                        upvals.push(cell);
-                    } else {
-                        upvals.push(frame.closure().upvals[d.index as usize].clone());
-                    }
-                }
-                let this = if child.is_arrow {
-                    if proto.is_arrow {
-                        frame.closure().this.clone()
-                    } else {
-                        self.stack[base - 1].clone()
-                    }
-                } else {
-                    Value::Undef
-                };
-                self.stack.push(Value::Func(Rc::new(Closure {
-                    proto: child,
-                    upvals,
-                    this,
-                    class: Default::default(),
-                })));
+                let v = self.make_closure(i as usize);
+                self.stack.push(v);
             }
             Op::NewArray => self.stack.push(Value::arr(Vec::new())),
             Op::ArrayExtend => {
@@ -2631,10 +2600,54 @@ impl Vm {
                     .get(f.ip.saturating_sub(1))
                     .copied()
                     .unwrap_or(0);
-                format!("{}:{}", f.closure().proto.file, line)
+                let mut loc = String::from(&*f.closure().proto.file);
+                loc.push(':');
+                push_number(&mut loc, f64::from(line));
+                loc
             }
             None => String::new(),
         }
+    }
+
+    /// The closure that `Op::Closure(i)` makes in the running function. A captured local becomes a cell shared with the
+    /// frame, and the other captures are upvalues of the running closure.
+    pub fn make_closure(&self, i: usize) -> Value {
+        let frame = self.frames.last().unwrap();
+        let base = frame.base;
+        let closure = frame.closure();
+        let child = closure.proto.protos[i].clone();
+        let mut upvals = Vec::with_capacity(child.upvals.len());
+        for d in &child.upvals {
+            if d.from_local {
+                let cell = match &self.stack[base + d.index as usize] {
+                    Value::Cell(c) => c.clone(),
+                    other => Rc::new(RefCell::new(other.clone())),
+                };
+                upvals.push(cell);
+            } else {
+                upvals.push(closure.upvals[d.index as usize].clone());
+            }
+        }
+        let this = if !child.is_arrow {
+            Value::Undef
+        } else if closure.proto.is_arrow {
+            closure.this.clone()
+        } else {
+            self.stack[base - 1].clone()
+        };
+        Value::Func(Rc::new(Closure {
+            proto: child,
+            upvals,
+            this,
+            class: Default::default(),
+        }))
+    }
+
+    /// Moves the parameter in slot `i` of the running frame into a cell, which is where a captured parameter lives.
+    pub fn box_param(&mut self, i: usize) {
+        let idx = self.frames.last().unwrap().base + i;
+        let v = std::mem::replace(&mut self.stack[idx], Value::Undef);
+        self.stack[idx] = Value::Cell(Rc::new(RefCell::new(v)));
     }
 
     /// The prototype of the errors of `kind`, which is the prototype of `Error` when there is no such kind.
@@ -2649,12 +2662,7 @@ impl Vm {
 
     /// Builds an error object (`name`, `message`, `stack`) for a built-in error kind.
     pub fn make_error(&mut self, kind: &str, msg: &str) -> Value {
-        let loc = self.location();
-        let stack = if loc.is_empty() {
-            format!("{}: {}", kind, msg)
-        } else {
-            format!("{}: {}\n    at {}", kind, msg, loc)
-        };
+        let stack = stack_text(kind, msg, &self.location());
         let obj = new_obj(Some(self.error_proto(kind)));
         init_error(&obj, kind, msg, &stack);
         Value::Obj(obj)

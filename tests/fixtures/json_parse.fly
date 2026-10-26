@@ -1,0 +1,14 @@
+// JSON.parse of valid text: escapes, numbers, nesting, whitespace, duplicate keys and the order of keys.
+const texts = [
+  '{"a":1,"b":[true,false,null],"c":{"d":"e\\"f"}}',
+  ' \t\n[1, 2.5, -3e2, 4E+1, 0.5e-3] ',
+  '"\\u00e9\\u4e2d\\/\\n\\r\\t\\\\"',
+  '{"é":"ü","k\\u0041":[]}',
+  '{"x":1,"y":2,"x":3}',
+  '[{"10":1,"9":2,"z":3}]',
+  '"plain text ✓"',
+];
+for (const t of texts) console.log(JSON.stringify(JSON.parse(t)));
+let n = 0;
+for (let i = 0; i < 200; i++) n += JSON.parse(JSON.stringify({ i, s: "item" + i, a: [i, i / 2] })).a[1];
+console.log(n);

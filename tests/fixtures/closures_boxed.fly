@@ -1,0 +1,20 @@
+// Closures that capture parameters, locals and `this`: each captured variable is shared with the frame that made it.
+function makeCounter() { let n = 0; return { inc: () => ++n, get: () => n }; }
+const c1 = makeCounter(), c2 = makeCounter();
+c1.inc(); c1.inc(); c2.inc();
+console.log(c1.get(), c2.get());
+function outer(a, b) { const f = (x) => { const g = (y) => a + b + x + y; return g; }; return f; }
+console.log(outer(1, 2)(3)(4), outer(10, 20)(30)(40));
+function mk(k) { return function (x) { return x * k + this.base; }; }
+const obj = { base: 5, f: mk(3) };
+console.log(obj.f(2));
+function arrowThis() { return () => this.v; }
+const holder = { v: 42, make: arrowThis };
+console.log(holder.make()());
+let total = 0;
+for (let i = 0; i < 5; i++) { const add = ((k) => (x) => x + k)(i); total += add(i); }
+console.log(total);
+function param(p) { const get = () => p; p = p + 1; return get(); }
+console.log(param(7));
+const fns = []; for (let i = 0; i < 3; i++) fns.push(() => i);
+console.log(fns.map((f) => f()).join(","));

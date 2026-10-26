@@ -703,7 +703,7 @@ impl<'a> Gen<'a> {
 
     /// Calls a value helper, with its arguments in rdi, rsi, rdx and rcx.
     fn direct_call(&mut self, func: usize, args: &[Arg]) {
-        const REGS: [u8; 4] = [RDI, RSI, RDX, RCX];
+        const REGS: [u8; 6] = [RDI, RSI, RDX, RCX, R8, R9];
         for (&reg, arg) in REGS.iter().zip(args) {
             match *arg {
                 Arg::Vm => self.a.mov_rr(reg, RBX),
@@ -1882,6 +1882,28 @@ impl<'a> Gen<'a> {
                 let dst = self.temp(d);
                 let upval = rt::upval_into as *const () as usize;
                 self.direct_call(upval, &[Arg::Vm, Arg::Imm(u64::from(i)), Arg::Addr(dst)]);
+                Fast::Pure
+            }
+            Op::Closure(i) => {
+                let dst = self.temp(d);
+                let make = rt::make_closure as *const () as usize;
+                self.direct_call(
+                    make,
+                    &[
+                        Arg::Vm,
+                        Arg::Imm(d as u64),
+                        Arg::Imm(u64::from(i)),
+                        Arg::Addr(dst),
+                    ],
+                );
+                Fast::Pure
+            }
+            Op::BoxParam(i) => {
+                let boxed = rt::box_param as *const () as usize;
+                self.direct_call(
+                    boxed,
+                    &[Arg::Vm, Arg::Imm(d as u64), Arg::Imm(u64::from(i))],
+                );
                 Fast::Pure
             }
             Op::GetProp(i) => {

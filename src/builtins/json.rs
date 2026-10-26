@@ -1,5 +1,7 @@
 //! The `JSON` object: `JSON.stringify` and `JSON.parse`.
 
+use std::borrow::Cow;
+
 use crate::builtins::{arg, table_object};
 use crate::value::{key_order, obj_set, push_number, to_str, NativeDef, Value};
 use crate::vm::Vm;
@@ -75,27 +77,27 @@ fn write_value(
         }
         Value::Obj(o) => {
             let props = o.borrow();
-            let shown: Vec<usize> = key_order(&props)
-                .into_iter()
-                .filter(|&i| shows(props.value(i)))
-                .collect();
-            if shown.is_empty() {
-                out.push_str("{}");
-                return Ok(true);
-            }
             let sep = if indent.is_empty() { ":" } else { ": " };
             out.push('{');
-            for (n, &i) in shown.iter().enumerate() {
-                if n > 0 {
+            let mut written = false;
+            for i in key_order(&props) {
+                let val = props.value(i);
+                if !shows(val) {
+                    continue;
+                }
+                if written {
                     out.push(',');
                 }
-                let (k, val) = (props.key(i), props.value(i));
+                written = true;
                 newline(indent, depth + 1, out);
-                quote(k, out);
+                quote(props.key(i), out);
                 out.push_str(sep);
                 write_value(val, indent, depth + 1, out)?;
             }
-            newline(indent, depth, out);
+            // An object with nothing to show is written as `{}`, with no line break inside.
+            if written {
+                newline(indent, depth, out);
+            }
             out.push('}');
         }
     }
@@ -121,8 +123,9 @@ fn newline(indent: &str, depth: usize, out: &mut String) {
 
 fn quote(s: &str, out: &mut String) {
     out.push('"');
-    // Most strings need no escape, so they are copied whole.
-    if !s.chars().any(|c| c < ' ' || c == '"' || c == '\\') {
+    // Most strings need no escape, so they are copied whole. Every character that needs one is ASCII, so the bytes
+    // are enough to check.
+    if !s.bytes().any(|b| b < b' ' || b == b'"' || b == b'\\') {
         out.push_str(s);
     } else {
         for c in s.chars() {
@@ -143,12 +146,12 @@ fn quote(s: &str, out: &mut String) {
 fn parse(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let text = to_str(&arg(args, 0));
     let mut p = Parser {
-        chars: text.chars().collect(),
+        text: text.as_str(),
         pos: 0,
     };
     let result = p.value().and_then(|v| {
         p.skip_ws();
-        if p.pos == p.chars.len() {
+        if p.pos == p.text.len() {
             Ok(v)
         } else {
             Err(p.error("Unexpected token"))
@@ -157,46 +160,68 @@ fn parse(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     result.map_err(|msg| vm.make_error("SyntaxError", &msg))
 }
 
-struct Parser {
-    chars: Vec<char>,
+/// Reads JSON text. `pos` is a byte offset, and it always falls on a character boundary, since the parser only moves
+/// over whole characters.
+struct Parser<'a> {
+    text: &'a str,
     pos: usize,
 }
 
-impl Parser {
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+impl<'a> Parser<'a> {
+    /// The byte at the current position. Every token starts with an ASCII byte, so this is enough to choose a token.
+    fn byte(&self) -> Option<u8> {
+        self.text.as_bytes().get(self.pos).copied()
+    }
+
+    fn rest(&self) -> &'a str {
+        let text = self.text;
+        &text[self.pos..]
     }
 
     fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(c) if c.is_whitespace()) {
-            self.pos += 1;
+        loop {
+            match self.byte() {
+                // The whitespace `char::is_whitespace` accepts: the ASCII ones here, and some other characters below.
+                Some(b'\t'..=b'\r' | b' ') => self.pos += 1,
+                Some(b) if !b.is_ascii() => match self.rest().chars().next() {
+                    Some(c) if c.is_whitespace() => self.pos += c.len_utf8(),
+                    _ => return,
+                },
+                _ => return,
+            }
         }
     }
 
+    /// The error for the token at the current position. The position counts characters, as it always has.
     fn error(&self, what: &str) -> String {
-        match self.peek() {
-            Some(c) => format!("{} '{}' in JSON at position {}", what, c, self.pos),
+        match self.rest().chars().next() {
+            Some(c) => format!(
+                "{} '{}' in JSON at position {}",
+                what,
+                c,
+                self.text[..self.pos].chars().count()
+            ),
             None => "Unexpected end of JSON input".to_string(),
         }
     }
 
     fn value(&mut self) -> Result<Value, String> {
         self.skip_ws();
-        match self.peek() {
-            Some('{') => self.object(),
-            Some('[') => self.array(),
-            Some('"') => Ok(Value::from_string(self.string()?)),
-            Some('t') => self.word("true", Value::Bool(true)),
-            Some('f') => self.word("false", Value::Bool(false)),
-            Some('n') => self.word("null", Value::Null),
-            Some(c) if c == '-' || c.is_ascii_digit() => self.number(),
+        match self.byte() {
+            Some(b'{') => self.object(),
+            Some(b'[') => self.array(),
+            Some(b'"') => Ok(Value::str(&self.string()?)),
+            Some(b't') => self.word("true", Value::Bool(true)),
+            Some(b'f') => self.word("false", Value::Bool(false)),
+            Some(b'n') => self.word("null", Value::Null),
+            Some(b'-' | b'0'..=b'9') => self.number(),
             _ => Err(self.error("Unexpected token")),
         }
     }
 
     fn word(&mut self, text: &str, v: Value) -> Result<Value, String> {
-        for expected in text.chars() {
-            if self.peek() != Some(expected) {
+        for &expected in text.as_bytes() {
+            if self.byte() != Some(expected) {
                 return Err(self.error("Unexpected token"));
             }
             self.pos += 1;
@@ -206,53 +231,71 @@ impl Parser {
 
     fn number(&mut self) -> Result<Value, String> {
         let start = self.pos;
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E'))
-        {
+        while matches!(
+            self.byte(),
+            Some(b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+        ) {
             self.pos += 1;
         }
-        let text: String = self.chars[start..self.pos].iter().collect();
-        text.parse::<f64>()
+        self.text[start..self.pos]
+            .parse::<f64>()
             .map(Value::Num)
             .map_err(|_| self.error("Unexpected token"))
     }
 
-    fn string(&mut self) -> Result<String, String> {
+    /// Reads a string. It is borrowed from the text when it has no escape, so most strings and keys are not copied.
+    fn string(&mut self) -> Result<Cow<'a, str>, String> {
+        let text = self.text;
         self.pos += 1; // opening quote
-        let mut out = String::new();
+                       // The text from `run` on has not been copied into `out` yet. `out` is only made once an escape is read.
+        let mut run = self.pos;
+        let mut out: Option<String> = None;
         loop {
-            match self.peek() {
-                None => return Err("Unterminated string in JSON".to_string()),
-                Some('"') => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                Some('\\') => {
-                    self.pos += 1;
-                    let c = self
-                        .peek()
-                        .ok_or_else(|| "Unterminated string in JSON".to_string())?;
-                    self.pos += 1;
-                    match c {
-                        'n' => out.push('\n'),
-                        't' => out.push('\t'),
-                        'r' => out.push('\r'),
-                        'b' => out.push('\u{8}'),
-                        'f' => out.push('\u{c}'),
-                        'u' => {
-                            let hex: String = self.chars.iter().skip(self.pos).take(4).collect();
-                            let code = u32::from_str_radix(&hex, 16)
-                                .map_err(|_| self.error("Bad unicode escape"))?;
-                            out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
-                            self.pos += 4;
-                        }
-                        other => out.push(other),
+            let Some(offset) = text.as_bytes()[self.pos..]
+                .iter()
+                .position(|&b| b == b'"' || b == b'\\')
+            else {
+                return Err("Unterminated string in JSON".to_string());
+            };
+            self.pos += offset;
+            let plain = &text[run..self.pos];
+            if self.byte() == Some(b'"') {
+                self.pos += 1;
+                return Ok(match out {
+                    Some(mut s) => {
+                        s.push_str(plain);
+                        Cow::Owned(s)
                     }
-                }
-                Some(c) => {
-                    out.push(c);
-                    self.pos += 1;
-                }
+                    None => Cow::Borrowed(plain),
+                });
             }
+            let s = out.get_or_insert_with(String::new);
+            s.push_str(plain);
+            self.pos += 1; // backslash
+            let c = self
+                .rest()
+                .chars()
+                .next()
+                .ok_or_else(|| "Unterminated string in JSON".to_string())?;
+            self.pos += c.len_utf8();
+            match c {
+                'n' => s.push('\n'),
+                't' => s.push('\t'),
+                'r' => s.push('\r'),
+                'b' => s.push('\u{8}'),
+                'f' => s.push('\u{c}'),
+                'u' => {
+                    // Four hex digits, or fewer when the text ends first, as the window has always been read.
+                    let rest = self.rest();
+                    let window = &rest[..rest.char_indices().nth(4).map_or(rest.len(), |(i, _)| i)];
+                    let code = u32::from_str_radix(window, 16)
+                        .map_err(|_| self.error("Bad unicode escape"))?;
+                    s.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                    self.pos += window.len();
+                }
+                other => s.push(other),
+            }
+            run = self.pos;
         }
     }
 
@@ -260,16 +303,16 @@ impl Parser {
         self.pos += 1;
         let mut items = Vec::new();
         self.skip_ws();
-        if self.peek() == Some(']') {
+        if self.byte() == Some(b']') {
             self.pos += 1;
             return Ok(Value::arr(items));
         }
         loop {
             items.push(self.value()?);
             self.skip_ws();
-            match self.peek() {
-                Some(',') => self.pos += 1,
-                Some(']') => {
+            match self.byte() {
+                Some(b',') => self.pos += 1,
+                Some(b']') => {
                     self.pos += 1;
                     return Ok(Value::arr(items));
                 }
@@ -282,18 +325,18 @@ impl Parser {
         self.pos += 1;
         let obj = Value::obj();
         self.skip_ws();
-        if self.peek() == Some('}') {
+        if self.byte() == Some(b'}') {
             self.pos += 1;
             return Ok(obj);
         }
         loop {
             self.skip_ws();
-            if self.peek() != Some('"') {
+            if self.byte() != Some(b'"') {
                 return Err(self.error("Expected property name"));
             }
             let key = self.string()?;
             self.skip_ws();
-            if self.peek() != Some(':') {
+            if self.byte() != Some(b':') {
                 return Err(self.error("Expected ':'"));
             }
             self.pos += 1;
@@ -302,9 +345,9 @@ impl Parser {
                 obj_set(o, &key, v);
             }
             self.skip_ws();
-            match self.peek() {
-                Some(',') => self.pos += 1,
-                Some('}') => {
+            match self.byte() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
                     self.pos += 1;
                     return Ok(obj);
                 }
