@@ -1,7 +1,11 @@
 (() => {
   const root = document.documentElement;
+  // Com o script rodando, as seções e a frase de destaque começam escondidas e aparecem ao rolar.
+  root.classList.add('js');
   const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   const wide = window.matchMedia('(min-width: 1024px)');
+  const desk = window.matchMedia('(min-width: 768px)');
+  const split = window.matchMedia('(min-width: 960px)');
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => Array.from(document.querySelectorAll(sel));
   const setCurrent = (links, isCurrent) => {
@@ -34,11 +38,34 @@
   const FIRST = articles.keys().next().value;
   const HOME_ANCHORS = new Set(['resumo', 'desempenho', 'documentacao', 'limites']);
 
-  // A altura real do cabeçalho fixo, que no celular quebra em duas linhas. Âncoras e o índice usam essa margem.
+  // A altura real do cabeçalho flutuante, que no celular quebra em duas linhas. Âncoras e o índice usam essa margem.
   const setHead = () => root.style.setProperty('--head', `${header.offsetHeight}px`);
   setHead();
   if (window.ResizeObserver) new ResizeObserver(setHead).observe(header);
   else window.addEventListener('resize', setHead);
+
+  // Menu do celular: um painel de tela cheia. Escape e um link fecham; enquanto está aberto, o resto da página fica inerte.
+  const menu = $('#menu');
+  const menuToggle = $('.menu-toggle');
+  const app = $('#app');
+  const foot = $('.foot');
+  const setMenu = (open) => {
+    menu.classList.toggle('is-open', open);
+    menuToggle.setAttribute('aria-expanded', String(open));
+    app.inert = open;
+    foot.inert = open;
+    root.style.overflow = open ? 'hidden' : '';
+    if (open) topLinks[0].focus({ preventScroll: true });
+  };
+  menuToggle.addEventListener('click', () => setMenu(!menu.classList.contains('is-open')));
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && menu.classList.contains('is-open')) {
+      setMenu(false);
+      menuToggle.focus();
+    }
+  });
+  desk.addEventListener('change', (ev) => { if (ev.matches) setMenu(false); });
+  window.addEventListener('hashchange', () => setMenu(false));
 
   // Tema: sistema (o padrão, que segue o aparelho), escuro ou claro.
   const THEMES = ['sistema', 'escuro', 'claro'];
@@ -50,7 +77,7 @@
     if (theme === 'escuro') root.dataset.theme = 'dark';
     else if (theme === 'claro') root.dataset.theme = 'light';
     else delete root.dataset.theme;
-    themeBtn.textContent = `tema: ${theme}`;
+    themeBtn.textContent = `Tema: ${theme}`;
     redrawSignal();
   };
   themeBtn.addEventListener('click', () => {
@@ -118,26 +145,75 @@
   }
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
 
+  // Seções que aparecem ao rolar: cada uma sobe e aparece uma vez, quando entra na tela.
+  const reveals = $$('.reveal');
+  if (reduce || !('IntersectionObserver' in window)) {
+    for (const el of reveals) el.classList.add('is-in');
+  } else {
+    const io = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        entry.target.classList.add('is-in');
+        io.unobserve(entry.target);
+      }
+    }, { threshold: 0.12 });
+    for (const el of reveals) io.observe(el);
+  }
+
+  // Frase de destaque: cada palavra sai da cor apagada quando a linha de gatilho, a 70% da altura da tela, passa por ela.
+  // Um só ouvinte de rolagem, com o trabalho agrupado em um quadro por vez.
+  const tagline = $('.tagline-text');
+  if (tagline) {
+    const words = $$('.tl-w', tagline);
+    if (reduce) {
+      for (const w of words) w.classList.add('is-on');
+    } else {
+      let queued = false;
+      const update = () => {
+        queued = false;
+        const line = window.innerHeight * 0.7;
+        for (const w of words) {
+          if (!w.classList.contains('is-on') && w.getBoundingClientRect().top < line) w.classList.add('is-on');
+        }
+      };
+      const schedule = () => {
+        if (queued) return;
+        queued = true;
+        requestAnimationFrame(update);
+      };
+      window.addEventListener('scroll', schedule, { passive: true });
+      window.addEventListener('resize', schedule);
+      schedule();
+    }
+  }
+
+  // As medidas de cada programa começam abertas quando há duas colunas, e recolhidas no celular.
+  const bench = $('.bench-more');
+  if (bench) {
+    bench.open = split.matches;
+    split.addEventListener('change', (ev) => { bench.open = ev.matches; });
+  }
+
   // Copiar. O navegador só aceita a cópia dentro do clique; quando recusa, o código fica selecionado.
   document.addEventListener('click', async (ev) => {
     const btn = ev.target.closest('button.copy');
     if (!btn) return;
     const pane = btn.closest('.pane');
     const block = pane.querySelector('pre');
-    const terminal = pane.querySelector('.pane-name').textContent === 'terminal';
+    const terminal = pane.querySelector('.pane-name').textContent === 'Terminal';
     const text = terminal ? block.textContent.replace(/^\$ /gm, '') : block.textContent;
     try {
       await navigator.clipboard.writeText(text);
-      btn.textContent = 'copiado';
+      btn.textContent = 'Copiado';
     } catch (e) {
       const range = document.createRange();
       range.selectNodeContents(block);
       const selection = window.getSelection();
       selection.removeAllRanges();
       selection.addRange(range);
-      btn.textContent = 'selecionado';
+      btn.textContent = 'Selecionado';
     }
-    setTimeout(() => { btn.textContent = 'copiar'; }, 1600);
+    setTimeout(() => { btn.textContent = 'Copiar'; }, 1600);
   });
 
   // Busca na documentação, sem diferença entre maiúsculas e sem acento. Cada seção do índice guarda o próprio texto.
@@ -161,7 +237,7 @@
     if (!hits.length) {
       const none = document.createElement('p');
       none.className = 'none';
-      none.textContent = 'nenhum resultado';
+      none.textContent = 'Nenhum resultado';
       results.append(none);
       return;
     }
@@ -212,6 +288,11 @@
       token = decodeURIComponent(window.location.hash.slice(1));
     } catch (e) {
       token = '';
+    }
+    // O atalho para o conteúdo aponta para #app: leva o foco ao conteúdo, e a visão atual continua a mesma.
+    if (token === 'app') {
+      app.focus({ preventScroll: true });
+      return;
     }
     if (token === 'docs') token = FIRST;
     const dot = token.indexOf('.');

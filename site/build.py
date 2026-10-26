@@ -189,7 +189,7 @@ def probe_result(code, runtime):
 
 
 def pane(name, code, copy=True):
-    btn = '<button class="copy" type="button">copiar</button>' if copy else ""
+    btn = '<button class="copy" type="button">Copiar</button>' if copy else ""
     return (
         '<div class="pane">'
         f'<div class="pane-head"><span class="pane-name">{esc(name)}</span>{btn}</div>'
@@ -212,20 +212,20 @@ def render_example(ex):
     extra = "".join(pane(name, text) for name, text in ex.get("files", {}).items())
     marks = []
     if fly_rc != 0:
-        marks.append(f'<span class="mark exit">código {fly_rc}</span>')
+        marks.append(f'<span class="mark exit">Código {fly_rc}</span>')
     if same:
-        marks.append('<span class="mark same">igual ao Node</span>')
+        marks.append('<span class="mark same">Igual ao Node</span>')
     text_out = fly_out.rstrip() or "(sem saída)"
     out_cls = "" if fly_out.strip() else ' class="empty"'
     output = (
         '<div class="pane out">'
-        f'<div class="pane-head"><span class="pane-name">saída</span><span class="marks">{"".join(marks)}</span></div>'
+        f'<div class="pane-head"><span class="pane-name">Saída</span><span class="marks">{"".join(marks)}</span></div>'
         f'<pre class="out"{out_cls}>{esc(text_out)}</pre></div>'
     )
     if fly_err.strip() and (ex.get("show_err") or fly_rc != 0):
         output += (
             '<div class="pane err">'
-            '<div class="pane-head"><span class="pane-name">erro padrão</span></div>'
+            '<div class="pane-head"><span class="pane-name">Erro padrão</span></div>'
             f'<pre class="out err">{esc(fly_err.rstrip())}</pre></div>'
         )
     return (
@@ -308,8 +308,8 @@ def page_article(slug):
             parts.append('<ul class="list">' + "".join(f"<li>{inline(t)}</li>" for t in blk[1]) + "</ul>")
             entry["text"] += " " + " ".join(plain(t) for t in blk[1])
         elif kind == "shell":
-            parts.append(f'<div class="frame shell"><div class="pane"><div class="pane-head"><span class="pane-name">terminal</span>'
-                         f'<button class="copy" type="button">copiar</button></div><pre class="code">{shell_block(blk[1])}</pre></div></div>')
+            parts.append(f'<div class="frame shell"><div class="pane"><div class="pane-head"><span class="pane-name">Terminal</span>'
+                         f'<button class="copy" type="button">Copiar</button></div><pre class="code">{shell_block(blk[1])}</pre></div></div>')
             entry["text"] += " " + blk[1]
         elif kind == "ex":
             ex = blk[1]
@@ -331,18 +331,18 @@ def page_article(slug):
     pos = ORDER.index(slug)
     prev_slug = ORDER[pos - 1] if pos > 0 else None
     next_slug = ORDER[pos + 1] if pos + 1 < len(ORDER) else None
-    pager = ['<nav class="pager" aria-label="páginas da documentação">']
+    pager = ['<nav class="pager" aria-label="Páginas da documentação">']
     if prev_slug:
-        pager.append(f'<a href="#{prev_slug}" rel="prev"><span class="dir">anterior</span>{esc(TITLES[prev_slug])}</a>')
+        pager.append(f'<a href="#{prev_slug}" rel="prev"><span class="dir">Anterior</span>{esc(TITLES[prev_slug])}</a>')
     if next_slug:
-        pager.append(f'<a class="next" href="#{next_slug}" rel="next"><span class="dir">próxima</span>{esc(TITLES[next_slug])}</a>')
+        pager.append(f'<a class="next" href="#{next_slug}" rel="next"><span class="dir">Próxima</span>{esc(TITLES[next_slug])}</a>')
     pager.append("</nav>")
 
     group = next(name for name, slugs in content.GROUPS if slug in slugs)
     toc_html = ""
     if toc:
         items = "".join(f'<li><a href="#{sid}">{esc(title)}</a></li>' for sid, title in toc)
-        toc_html = f'<aside class="toc" aria-label="nesta página"><p class="toc-title">nesta página</p><ol>{items}</ol></aside>'
+        toc_html = f'<aside class="toc" aria-label="Nesta página"><p class="toc-title">Nesta página</p><ol>{items}</ol></aside>'
     article = (
         f'<article class="doc" id="{slug}" hidden>'
         '<header class="doc-head">'
@@ -366,10 +366,10 @@ def side_html():
         links = "".join(f'<li><a href="#{s}" data-page="{s}">{esc(TITLES[s])}</a></li>' for s in slugs)
         groups.append(f'<p class="group-label">{esc(name)}</p><ul>{links}</ul>')
     return (
-        '<aside class="side" aria-label="índice da documentação">'
-        '<details class="side-box" open><summary>índice da documentação</summary>'
-        '<label class="search"><span class="sr-only">buscar na documentação</span>'
-        '<input id="q" type="search" placeholder="buscar na documentação" autocomplete="off"></label>'
+        '<aside class="side" aria-label="Índice da documentação">'
+        '<details class="side-box" open><summary>Índice da documentação</summary>'
+        '<label class="search"><span class="sr-only">Buscar na documentação</span>'
+        '<input id="q" type="search" placeholder="Buscar na documentação" autocomplete="off"></label>'
         '<div id="results" class="results" hidden></div>'
         f'<nav id="side-nav" class="side-nav" aria-label="páginas">{"".join(groups)}</nav>'
         "</details></aside>"
@@ -377,6 +377,41 @@ def side_html():
 
 
 # ----------------------------------------------------------------- início
+def wins_count():
+    """Quantos programas o fly é mais rápido que os outros dois: a mesma conta que a leitura da página faz."""
+    count = 0
+    for row in BENCH:
+        values = row[1]
+        rivals = [values[r] for r in ("node", "bun") if r in values]
+        if rivals and values["fly"] < min(rivals):
+            count += 1
+    return count
+
+
+def tagline_html(lines):
+    """Cada linha da frase é um bloco. Cada palavra tem um atraso, para a ativação sair em sequência, uma por vez."""
+    out, step = [], 0
+    for line in lines:
+        words = []
+        for word in line.split():
+            words.append(f'<span class="tl-w" style="--d:{min(step * 40, 240)}ms">{esc(word)}</span>')
+            step += 1
+        out.append(f'<span class="tl-line">{" ".join(words)}</span>')
+    return "".join(out)
+
+
+def kpis_html():
+    startup = f"{OTHER[0][1]['fly']:g}".replace(".", ",") + " ms"
+    size = OTHER[1][3]["fly"]
+    items = [
+        (f"{wins_count()} de {len(BENCH)}", "programas em que o fly é mais rápido que o Node e o Bun"),
+        (startup, "para iniciar o processo, do comando ao primeiro resultado"),
+        (size, "de binário, sem dependências"),
+    ]
+    cells = "".join(f'<div class="kpi"><strong>{esc(num)}</strong><span>{esc(text)}</span></div>' for num, text in items)
+    return f'<div class="kpis">{cells}</div>'
+
+
 def home_html():
     h = content.HOME
     badges = "".join(f'<span class="badge">{esc(b)}</span>' for b in h["badges"])
@@ -400,41 +435,58 @@ def home_html():
     <h1>fly</h1>
     <p class="lede">{esc(h["lede"])}</p>
     <div class="cta">
-      <a class="btn primary" href="#docs-comecar">começar</a>
-      <a class="btn" href="#docs">documentação</a>
-      <a class="btn quiet" href="https://github.com/davixyzc/New-Project" target="_blank" rel="noopener">código no GitHub</a>
+      <a class="btn primary" href="#docs-comecar">Começar</a>
+      <a class="btn" href="#docs">Documentação</a>
+      <a class="btn quiet" href="https://github.com/davixyzc/New-Project" target="_blank" rel="noopener">Código no GitHub</a>
     </div>
   </div>
 </section>
 
-<section class="block" id="resumo">
+<section class="tagline" aria-label="frase de destaque">
+  <p class="tagline-text">{tagline_html(h["tagline"])}</p>
+</section>
+
+<section class="block reveal" id="resumo">
   <h2>Em resumo</h2>
   <div class="resumo">{resumo}</div>
 </section>
 
-<section class="block" id="desempenho">
+<section class="block reveal" id="desempenho">
   <h2>Desempenho</h2>
   <p class="block-lede">{esc(h["desempenho"])}</p>
+  {kpis_html()}
   <div class="bench">
-    <div class="bench-cards">{bench_card("tempo de parede", BENCH)}{bench_card("outras medidas", OTHER)}</div>
+    <details class="bench-more" open>
+      <summary>Medidas de cada programa</summary>
+      <div class="bench-cards">{bench_card("tempo de parede", BENCH)}{bench_card("outras medidas", OTHER)}</div>
+    </details>
     <div class="como-ler">
-      <p class="label">como ler</p>
+      <p class="label">Como ler</p>
       <p>{esc(h["como_ler"])}</p>
       <p><a href="#docs-execucao">Como o fly executa</a> explica de onde vem essa diferença.</p>
     </div>
   </div>
 </section>
 
-<section class="block" id="documentacao">
+<section class="block reveal" id="documentacao">
   <h2>Documentação</h2>
   <p class="block-lede">Cada página explica um assunto, com exemplos que rodam de verdade. As saídas mostradas são as do binário, e os exemplos que também dão o mesmo resultado no Node têm essa marca.</p>
   <div class="topics">{topics}</div>
 </section>
 
-<section class="block" id="limites">
+<section class="block reveal" id="limites">
   <h2>Limites</h2>
   <ul class="limits">{limites}</ul>
   <p><a href="#docs-diferencas">Ver todas as diferenças do JavaScript</a></p>
+</section>
+
+<section class="block final reveal" aria-labelledby="final-titulo">
+  <h2 id="final-titulo">Rode o primeiro programa</h2>
+  <p class="block-lede">{inline(h["final"])}</p>
+  <div class="cta">
+    <a class="btn primary" href="#docs-comecar">Começar</a>
+    <a class="btn" href="#docs">Documentação</a>
+  </div>
 </section>
 </div>"""
 
@@ -476,13 +528,16 @@ def header_html():
     return (
         '<header class="top"><div class="top-in">'
         '<a class="brand" href="#inicio" aria-label="fly, início">fly<small>0.1.0</small></a>'
+        '<button class="menu-toggle" type="button" aria-expanded="false" aria-controls="menu">'
+        '<span class="bars" aria-hidden="true"><i></i><i></i><i></i></span>Menu</button>'
+        '<div class="menu" id="menu">'
         '<nav class="top-nav" aria-label="principal">'
-        '<a href="#inicio" data-top="inicio">início</a>'
-        '<a href="#docs" data-top="docs">documentação</a>'
-        '<a href="#desempenho">desempenho</a>'
+        '<a href="#inicio" data-top="inicio" style="--i:0">Início</a>'
+        '<a href="#docs" data-top="docs" style="--i:1">Documentação</a>'
+        '<a href="#desempenho" style="--i:2">Desempenho</a>'
         "</nav>"
-        '<button class="theme" id="theme" type="button">tema: sistema</button>'
-        "</div></header>"
+        '<button class="theme" id="theme" type="button">Tema: sistema</button>'
+        "</div></div></header>"
     )
 
 
@@ -490,7 +545,8 @@ def footer_html():
     return (
         '<footer class="foot"><div class="foot-in">'
         "<span>fly · linguagem e runtime em Rust</span>"
-        '<a href="https://github.com/davixyzc/New-Project" target="_blank" rel="noopener">código no GitHub</a>'
+        '<span class="foot-links"><a href="#inicio">Voltar ao início</a>'
+        '<a href="https://github.com/davixyzc/New-Project" target="_blank" rel="noopener">Código no GitHub</a></span>'
         "</div></footer>"
     )
 
@@ -526,8 +582,9 @@ def build():
         index.extend(entries)
 
     body = (
-        header_html()
-        + '<main id="app">'
+        '<a class="skip" href="#app">Pular para o conteúdo</a>'
+        + header_html()
+        + '<main id="app" tabindex="-1">'
         + home_html()
         + docs_html(articles, index)
         + "</main>"
@@ -539,8 +596,8 @@ def build():
     fonts = (
         '<link rel="preconnect" href="https://fonts.googleapis.com">\n'
         '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
-        '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600'
-        "&family=IBM+Plex+Sans:wght@400;500;600;700&family=Silkscreen:wght@400;700&display=swap\">\n"
+        '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700'
+        '&family=Geist+Mono:wght@400;500&display=swap">\n'
     )
     artifact = (
         "<title>Linguagem fly</title>\n"
@@ -552,11 +609,27 @@ def build():
     with open(os.path.join(HERE, "artifact.html"), "w", encoding="utf-8") as fh:
         fh.write(artifact)
 
+    desc = "fly: sintaxe de JavaScript e modelo do Node.js, num binário de 1,2 MB, com documentação e exemplos executados."
+    icon = (
+        "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
+        "%3Crect width='32' height='32' rx='8' fill='%235a3fd1'/%3E"
+        "%3Cpath d='M13 26V14h-3v-3h3V9.5C13 6.7 14.6 5 17.6 5H20v3h-1.8c-1.2 0-1.7.5-1.7 1.6V11H20v3h-3.5v12z' fill='white'/%3E"
+        "%3C/svg%3E"
+    )
+    head_meta = (
+        f'<meta name="description" content="{desc}">\n'
+        '<meta property="og:type" content="website">\n'
+        '<meta property="og:title" content="Linguagem fly">\n'
+        f'<meta property="og:description" content="{desc}">\n'
+        '<meta name="theme-color" content="#f5f6fa" media="(prefers-color-scheme: light)">\n'
+        '<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">\n'
+        f'<link rel="icon" href="{icon}">\n'
+    )
     page = (
         '<!doctype html>\n<html lang="pt-BR">\n<head>\n<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n'
         "<title>Linguagem fly</title>\n"
-        '<meta name="description" content="fly: sintaxe de JavaScript e modelo do Node.js, em um binário de 963 KB, com documentação e exemplos executados.">\n'
+        + head_meta
         + fonts
         + f"<style>\n{css}\n</style>\n</head>\n<body>\n"
         + body

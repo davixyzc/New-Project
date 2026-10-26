@@ -15,12 +15,14 @@ Se um exemplo falhar, o build para. Os blocos são tuplas:
 """
 
 HOME = {
+    "tagline": ["A sintaxe do JavaScript.", "O modelo do Node.js.", "Um binário de 1,2 MB."],
+    "final": "O projeto não tem dependências externas. Compile com o cargo e rode um arquivo `.fly`.",
     "lede": "A sintaxe do JavaScript e o modelo de execução do Node.js, num binário de 1,2 MB que abre em 2,7 ms.",
-    "badges": ["versão 0.1.0", "sem dependências", "binário de 1,2 MB"],
+    "badges": ["Versão 0.1.0", "Sem dependências", "Binário de 1,2 MB"],
     "resumo": [
-        ("leve", "Um executável de 1,2 MB, sem dependências e sem node_modules. Cabe em um pendrive."),
-        ("rápido", "Código nativo x86-64 para funções e laços com números, e callbacks de array em lote. Os números estão logo abaixo."),
-        ("familiar", "let, const, arrow functions, template strings, spread, switch, try com finally e require. Quem conhece JavaScript lê o código sem aprender outra sintaxe."),
+        ("Leve", "Um executável de 1,2 MB, sem dependências e sem node_modules. Cabe em um pendrive."),
+        ("Rápido", "Código nativo de x86 de 64 bits para funções e laços com números, e callbacks de array em lote. Os números estão logo abaixo."),
+        ("Familiar", "let, const, arrow functions, template strings, spread, switch, try com finally e require. Quem conhece JavaScript lê o código sem aprender outra sintaxe."),
     ],
     "desempenho": "Os mesmos programas em cada runtime, com a mediana de 5 execuções intercaladas, em 4 vCPU. Barras menores são mais rápidas. Os tempos incluem o início de cada processo.",
     "como_ler": "De 24 programas, o fly é mais rápido que o Bun e o Node em 11. Nos outros 13 ainda perde, em geral nos programas com acessos a propriedades e elementos de arrays e chamadas de função. Diferenças menores que 10% dependem da máquina, e alguns casos perto de 1× trocam de lado de uma medição para outra.",
@@ -49,7 +51,7 @@ def page(slug, title, lede, blocks, resumo):
 # ----------------------------------------------------------------- Começar
 page(
     "docs-comecar", "Começar",
-    "Compile o fly com o cargo, rode um arquivo e confira a saída. O projeto não tem dependências externas, então o único pré-requisito é o Rust.",
+    "Compile o fly com o cargo, rode um arquivo e confira a saída. O projeto não tem dependências externas, então o único requisito é o Rust.",
     [
         ("h2", "Instalar", "instalar"),
         ("p", "Você precisa do Rust instalado, com o cargo. Clone o repositório e compile o binário:"),
