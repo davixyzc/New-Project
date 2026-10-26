@@ -94,47 +94,53 @@ Métodos de **Map**: `get set has delete clear forEach keys values entries`, e a
 
 Medido nesta máquina (Xeon 2,1 GHz, 4 vCPU), em tempo de parede do processo inteiro, inicialização incluída. `benchmarks/bench.py` roda os 24 programas de `benchmarks/` com o fly, o Node 22 e o Bun 1.4, intercalados, e confere que as três saídas são iguais. Cada número é a mediana de 5 execuções. Cada programa existe em duas versões com o mesmo código, `.fly` e `.js`. Os números são do `cargo build --release` comum, sem PGO.
 
-**A máquina varia bastante, até dentro de uma mesma sessão**: o `tak` foi de 98 a 147 ms em medições diferentes, e os casos perto de 1× trocam de lado de uma rodada para outra. Compare as colunas de uma mesma tabela, nunca tabelas de medições diferentes. Acima de 1× o fly ganha; abaixo, perde.
+**A máquina varia bastante, até dentro de uma mesma sessão**: entre duas rodadas, o Node e o Bun chegaram a medir quase 2× mais rápido, e os casos perto de 1× trocam de lado de uma rodada para outra. Compare as colunas de uma mesma tabela, nunca tabelas de medições diferentes. Acima de 1× o fly ganha; abaixo, perde.
 
 | benchmark | fly ms | Node ms | Bun ms | fly em relação ao melhor dos outros | resultado |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `array` | 76,8 | 186,9 | 92,7 | 1,21× | fly ganha |
-| `binary_trees` | 203,1 | 78,6 | 66,0 | 0,32× | perde |
-| `char_codes` | 149,2 | 82,0 | 52,0 | 0,35× | perde |
-| `closures` | 260,8 | 59,1 | 92,1 | 0,23× | perde |
-| `console_lines` | 27,9 | 751,1 | 160,0 | 5,73× | fly ganha |
-| `dict_keys` | 24,4 | 92,3 | 44,8 | 1,84× | fly ganha |
-| `exceptions` | 63,6 | 425,3 | 99,8 | 1,57× | fly ganha |
-| `fib` | 14,7 | 79,4 | 26,0 | 1,77× | fly ganha |
-| `json` | 333,6 | 267,0 | 122,0 | 0,37× | perde |
-| `life` | 2370,0 | 398,4 | 247,9 | 0,10× | perde |
-| `loop` | 34,3 | 106,4 | 54,4 | 1,59× | fly ganha |
-| `mandelbrot` | 23,5 | 81,5 | 30,9 | 1,31× | fly ganha |
-| `matrix` | 139,8 | 66,9 | 29,7 | 0,21× | perde |
-| `method_calls` | 214,0 | 63,0 | 23,1 | 0,11× | perde |
-| `nbody_objects` | 376,3 | 82,8 | 32,0 | 0,08× | perde |
-| `num_to_string` | 152,7 | 107,7 | 105,9 | 0,69× | perde |
-| `objects` | 5,6 | 56,0 | 32,6 | 5,80× | fly ganha |
-| `sieve` | 503,5 | 267,3 | 165,0 | 0,33× | perde |
-| `sort_cmp` | 220,4 | 207,0 | 111,9 | 0,51× | perde |
-| `split_join` | 92,2 | 119,7 | 64,7 | 0,70× | perde |
-| `str_index` | 11,5 | 42,7 | 11,0 | 0,96× | perde |
-| `string` | 14,8 | 66,9 | 33,7 | 2,27× | fly ganha |
-| `string_builder` | 114,4 | 166,9 | 113,8 | 1,00× | perde |
-| `tak` | 126,0 | 65,7 | 26,6 | 0,21× | perde |
+| `array` | 64,4 | 99,6 | 60,0 | 0,93× | perde |
+| `binary_trees` | 106,9 | 58,0 | 43,0 | 0,40× | perde |
+| `char_codes` | 68,0 | 57,7 | 37,2 | 0,55× | perde |
+| `closures` | 108,3 | 41,1 | 60,2 | 0,38× | perde |
+| `console_lines` | 25,9 | 441,2 | 109,7 | 4,24× | fly ganha |
+| `dict_keys` | 12,8 | 45,3 | 23,9 | 1,86× | fly ganha |
+| `exceptions` | 41,1 | 262,0 | 47,4 | 1,15× | fly ganha |
+| `fib` | 9,2 | 42,8 | 14,9 | 1,62× | fly ganha |
+| `json` | 159,7 | 158,0 | 90,9 | 0,57× | perde |
+| `life` | 1230,2 | 200,3 | 142,3 | 0,12× | perde |
+| `loop` | 21,5 | 84,1 | 32,2 | 1,50× | fly ganha |
+| `mandelbrot` | 12,0 | 43,5 | 17,3 | 1,44× | fly ganha |
+| `matrix` | 74,2 | 39,3 | 17,9 | 0,24× | perde |
+| `method_calls` | 133,5 | 38,6 | 14,3 | 0,11× | perde |
+| `nbody_objects` | 282,9 | 41,9 | 17,0 | 0,06× | perde |
+| `num_to_string` | 101,5 | 59,9 | 56,8 | 0,56× | perde |
+| `objects` | 3,6 | 34,9 | 20,0 | 5,63× | fly ganha |
+| `sieve` | 355,8 | 160,6 | 76,1 | 0,21× | perde |
+| `sort_cmp` | 117,8 | 110,3 | 74,2 | 0,63× | perde |
+| `split_join` | 55,5 | 86,3 | 48,7 | 0,88× | perde |
+| `str_index` | 8,8 | 35,0 | 10,3 | 1,18× | fly ganha |
+| `string` | 9,0 | 43,0 | 18,8 | 2,09× | fly ganha |
+| `string_builder` | 54,4 | 105,7 | 67,9 | 1,25× | fly ganha |
+| `tak` | 9,4 | 41,5 | 17,7 | 1,87× | fly ganha |
 
-**Leitura**: o fly é mais rápido que o Node e o Bun em **9 de 24** programas. Ganha com folga em `console_lines` (5,7×), `objects` (5,8×), `string` (2,3×), `dict_keys` (1,8×), `fib` (1,8×), `loop` (1,6×) e `exceptions` (1,6×). Ganha por pouco em `mandelbrot` (1,3×) e `array` (1,2×). `str_index` e `string_builder` ficam em volta de 1× e trocam de lado de uma rodada para outra.
+**Leitura**: o fly é mais rápido que o Node e o Bun em **11 de 24** programas. Ganha com folga em `console_lines` (4,24×), `objects` (5,63×), `string` (2,09×), `dict_keys` (1,86×), `tak` (1,87×), `fib` (1,62×) e `loop` (1,50×). Ganha por pouco em `mandelbrot` (1,44×), `string_builder` (1,25×), `str_index` (1,18×) e `exceptions` (1,15×). `array` (0,93×) e `split_join` (0,88×) ficam perto de 1×.
 
-Perde nos programas em que o tempo está em acessos a propriedades e elementos de arrays e em chamadas de função: `life` e `nbody_objects` ficam em 0,10× e 0,08× do melhor dos outros, `method_calls` em 0,11×, e `matrix`, `sieve`, `tak`, `closures` e `binary_trees` entre 0,21× e 0,35×. Pelo `callgrind`, o custo está nas buscas de propriedade e nas chamadas: cada acesso chama um auxiliar que copia e solta valores com contagem de referências, e cada chamada monta um quadro.
+Perde nos programas em que o tempo está em acessos a propriedades e a elementos de arrays e em chamadas de função: `nbody_objects` (0,06×), `method_calls` (0,11×), `life` (0,12×), `sieve` (0,21×), `matrix` (0,24×), `closures` (0,38×) e `binary_trees` (0,40×). `json` (0,57×), `char_codes` (0,55×), `num_to_string` (0,56×) e `sort_cmp` (0,63×) ficam entre 0,5× e 0,65×.
 
-**O objetivo de ser mais rápido em qualquer situação ainda não foi atingido**: 15 das 24 cargas ficam atrás de pelo menos um dos dois. O próximo passo para essas cargas é um JIT que compile acessos a propriedades e chamadas para código nativo, com formas de objeto (um índice fixo por campo) e sem contagem de referências a cada leitura.
+**O objetivo de ser mais rápido em qualquer situação ainda não foi atingido**: 13 das 24 cargas ficam atrás de pelo menos um dos dois. As medições desta rodada mostram onde está o gargalo, e ele está na forma como o código roda, não num auxiliar específico:
+- Em `tak`, antes de compilar as funções com expressões mais fundas, 65% das instruções estavam em chamada e retorno (`callgrind`). Agora `tak` roda em código nativo de números e ficou à frente.
+- Em `nbody_objects`, cerca de um terço das instruções está em leituras e escritas de propriedade: a busca, a cópia do valor e a liberação dele.
+- Em `method_calls`, cada iteração tem cerca de 720 instruções, somando a chamada, os acessos a propriedade e o código gerado para as operações.
+- Ajustes no caminho geral de chamadas mudaram menos de 0,3% das instruções. O custo está espalhado em muitos passos pequenos, e só cai com um quadro de chamada montado pelo próprio código nativo.
+
+Para chegar a 2× ou mais nessas cargas, o código nativo precisa ler elementos e propriedades direto da memória. Isso pede um layout estável para arrays e objetos, que hoje são `Vec` e `RefCell`, sem layout definido. Ver o roadmap.
 
 | | fly | Bun 1.4 | Node 22 |
 | --- | ---: | ---: | ---: |
 | tamanho do executável | **1,2 MB** | 107 MB | 123 MB |
-| inicialização (`-e 'console.log(1)'`) | **3,5 ms** | 9 ms | 43 ms |
+| inicialização (`-e 'console.log(1)'`) | **2,7 ms** | 6 ms | 34 ms |
 
-**Build com PGO**: `scripts/pgo-build.sh` treina o binário com os próprios benchmarks e fixtures e recompila com esse perfil. Precisa do componente `llvm-tools` do rustup (`rustup component add llvm-tools`). Nesta etapa o ganho foi pequeno e desigual: cerca de 6% a 13% no `array`, e nenhum ganho claro em `fib` e no laço. O `cargo build --release` comum já fica perto.
+**Build com PGO**: `scripts/pgo-build.sh` treina o binário com os próprios benchmarks e fixtures e recompila com esse perfil. Precisa do componente `llvm-tools` do rustup (`rustup component add llvm-tools`). Numa medição feita antes das otimizações desta rodada, o ganho foi pequeno e desigual: cerca de 6% a 13% no `array`, e nenhum ganho claro em `fib` e no laço. O `cargo build --release` comum já fica perto. Não foi medido de novo nesta rodada.
 
 **Otimizações feitas**:
 - **Acessos a elementos sem cópia**: `a[i]`, `m[i][j]` e as atribuições a eles, quando o array é uma variável local, leem e escrevem o array no próprio quadro, sem copiá-lo a cada acesso (`GetIndexLocal`, `GetIndex2Local`, `SetIndexLocal`, `SetIndex2Local`). Em `life`, `matrix` e `sieve`, medido antes e depois na mesma máquina: 2436→1983 ms, 115→98 ms e 673→526 ms.
@@ -160,7 +166,12 @@ Perde nos programas em que o tempo está em acessos a propriedades e elementos d
 - **Chamadas diretas entre funções compiladas**: o código nativo chama o código do callee sem passar pelo despacho geral. Os quadros ficam num buffer de layout fixo (`FrameStack`), e a volta informa onde o quadro do chamador ficou, porque a pilha pode ter sido realocada.
 - **`push` no código nativo**: `arr.push(v)`, com `arr` numa variável e `push` embutido, é feito por uma função direta (`rt::push_call`), sem montar a chamada geral. O valor vai para o array, e o novo tamanho substitui o `push`.
 - **Inicialização**: o binário não tem `main` do Rust. O `main` do C (`#![no_main]`) pula a inicialização padrão do runtime, que custa cerca de 0,2 ms, e mantém o que o runtime fazia: `SIGPIPE` ignorado e a saída descarregada no fim. `--version` e `--help` não criam a thread do interpretador. A thread de 256 MB custa cerca de 0,5 ms, mas é ela que sustenta a liberação recursiva de estruturas longas (uma lista de 300 mil nós estoura uma pilha de 8 MB). A linkagem estática pouparia cerca de 0,7 ms, mas o binário passaria de 900 KB para 1,9 MB, então não é o padrão.
-- **Escalares sem `drop`**: sobrescrever ou descartar um número não chama o destrutor do valor.
+- **Escalares sem `drop`**: sobrescrever ou descartar um número não chama o destrutor do valor, nem nos auxiliares de índice e de `%`. Em `life`, com 20 gerações, isso tirou cerca de 6% das instruções (1484 M para 1391 M, pelo `callgrind`).
+- **Funções de números com expressões mais fundas**: a pilha de operandos de uma função de números vai até a profundidade 13, em `xmm2` a `xmm15`, porque os locais de uma função ficam no quadro, não em registradores. Antes, o limite de 7 deixava `tak` (chamadas aninhadas nos argumentos, profundidade 9) no interpretador. Pelo `callgrind`, `tak` foi de 924 M para 78 M instruções (−92%).
+- **Concatenação no código nativo**: um `+` com string e valores primitivos roda no auxiliar `rt::concat_top`, que estende a string no lugar quando ela não é compartilhada. Objetos seguem pelo caminho da instrução, porque convertem com código do usuário. Números entram direto, sem `String` temporária (`int_text`). Pelo `callgrind`, `string_builder` foi de 410 M para 263 M instruções (−36%), e `num_to_string`, de 1162 M para 1082 M (−7%).
+- **Busca de método com a posição do acesso**: a leitura de um método de string ou de array guarda a posição que achou, e a próxima leitura do mesmo acesso confere o nome nessa posição antes de procurar (`sorted_lookup_hinted`). Pelo `callgrind`, `char_codes` foi de 996 M para 766 M instruções (−23%).
+- **JSON sem cópias**: `JSON.stringify` lê arrays e objetos onde estão, escreve cada membro direto na saída e formata números sem `String` temporária, e `JSON.parse` entrega as strings sem copiá-las. Pelo `callgrind`, `json` foi de 1533 M para 1040 M instruções (−32%).
+- **`sort` com comparador numérico**: quando o comparador é compilado para números e os itens também são, o `sort` chama a função nativa direto, sem o caminho de callback a cada comparação. Pelo `callgrind`, `sort_cmp` foi de 1148 M para 807 M instruções (−30%).
 
 ## Arquitetura
 
@@ -205,10 +216,15 @@ Os scripts em `tests/fixtures/*.fly` são executados duas vezes, com código nat
 
 Os fixtures `index_locals` e `property_hints` cobrem os acessos a elementos sem cópia e as posições guardadas por nome. `collections`, `destructuring`, `classes`, `error_classes`, `object_protos`, `objects_globals` e `delete_zero` comparam as funcionalidades novas com o Node, com e sem código nativo.
 
+Os fixtures `deep_calls` (funções de números com a pilha de operandos mais funda, em chamadas aninhadas), `concat_forms` (`+` com string, números, valores especiais, objetos e cópias que não podem mudar), `json_forms` (escapes, aninhamento, indentação, ordem das chaves e valores omitidos) e `sort_comparators` (comparadores numéricos e não numéricos) também comparam com o Node, com e sem código nativo.
+
 ## Roadmap
 
-1. **Chamadas ainda mais baratas**: o código nativo empurra e tira os quadros, busca upvalues sem uma função auxiliar e acessa os closures com layout fixo, em vez de contar referências a cada chamada. É o que falta para `fib` e os callbacks chegarem a 2×.
-2. **Registradores no código nativo**: os locais de laços já ficam em XMM. Falta estender a funções inteiras, aos temporários e às constantes.
-3. **Valores com NaN-boxing**, para que valores não tenham tamanho de 16 bytes nem contagem de referências nos números.
-4. **Formas de objeto**: objetos com os mesmos campos, na mesma ordem, compartilhariam uma tabela de posições, e o código nativo leria o campo por índice, sem comparar nomes. Hoje a posição fica guardada por função e por nome.
-5. **Promises, async/await, generators e Symbol**, que são as partes do Node moderno que faltam, além da zona morta temporal (TDZ) de `let` e `const`.
+1. **Quadros de chamada no código nativo**: o código nativo empurra e tira o quadro sozinho, sobre uma pilha de valores com layout fixo. Hoje uma chamada geral custa cerca de 250 instruções, espalhadas em muitos passos pequenos. É o que falta para `method_calls`, `closures` e `binary_trees`.
+2. **Layout estável para arrays e objetos**: `Vec` e `RefCell` não têm layout definido, então o código nativo não lê um elemento ou uma propriedade direto da memória. Um tipo próprio, com ponteiro e tamanho, permitiria ler `a[i]` e `o.campo` no código nativo, o que pede `life`, `matrix` e `sieve`.
+3. **Formas de objeto**: objetos com os mesmos campos, na mesma ordem, compartilhariam uma tabela de posições, e o código nativo leria o campo por índice. Sozinho ganha pouco, porque a busca por nome com posição guardada já é barata, e o custo maior está no auxiliar que a chama. Faz sentido depois do item 2.
+4. **Laços com acesso a elementos em registradores**: um laço que chama `a[i]` cai hoje no código geral, com os locais na memória. Manter os números em XMM e salvá-los só em volta da chamada do auxiliar é o próximo passo para `life` e `matrix`.
+5. **Globais por índice**: `GetGlobal` busca o nome numa tabela a cada leitura (`String`, `Math`, funções de topo do arquivo).
+6. **Registradores no código nativo**: estender os locais de laço às funções inteiras, aos temporários e às constantes.
+7. **Valores com NaN-boxing**, para que valores não tenham 16 bytes nem contagem de referências nos números.
+8. **Promises, async/await, generators e Symbol**, que são as partes do Node moderno que faltam, além da zona morta temporal (TDZ) de `let` e `const`.
