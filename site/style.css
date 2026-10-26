@@ -144,7 +144,7 @@ h1, h2, h3 { text-wrap: balance; }
 p, li { text-wrap: pretty; }
 a { color: inherit; }
 code {
-  font: 400 0.875em var(--mono);
+  font: 400 var(--text-sm)/var(--lh-sm) var(--mono);
   color: var(--fg);
   background: var(--surface-2);
   padding: 0.125em var(--s-50);
@@ -192,23 +192,27 @@ main:focus { outline: none; }
   padding: calc(env(safe-area-inset-top, 0px) + var(--s-100)) max(var(--s-200), env(safe-area-inset-right, 0px)) 0 max(var(--s-200), env(safe-area-inset-left, 0px));
 }
 .top-in {
+  position: relative;
+  isolation: isolate;
   display: flex;
   align-items: center;
   gap: var(--s-200);
   max-width: 100%;
   padding: var(--s-75) var(--s-75) var(--s-75) var(--s-200);
-  background: color-mix(in oklab, var(--bg) 97%, transparent);
   border: 1px solid var(--line);
   border-radius: var(--r-2xl);
 }
-/* No computador, a barra é translúcida e desfocada. O desfoque fica só ali: um desfoque de ancestral prenderia o painel
-   do celular à barra. No celular, o fundo quase opaco impede que o texto de baixo se misture com os itens da barra. */
-@media (min-width: 768px) {
-  .top-in {
-    background: color-mix(in oklab, var(--bg) 86%, transparent);
-    -webkit-backdrop-filter: blur(12px);
-    backdrop-filter: blur(12px);
-  }
+/* O fundo translúcido e o desfoque ficam numa camada atrás do conteúdo, em todas as larguras. Essa camada é irmã do painel
+   do celular, e não sua ancestral: um desfoque no próprio cabeçalho prenderia o painel à barra. */
+.top-in::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: color-mix(in oklab, var(--bg) 90%, transparent);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
 }
 .brand {
   position: relative;
@@ -243,21 +247,21 @@ main:focus { outline: none; }
 .menu-toggle:active { transform: scale(0.98); }
 /* Três linhas que viram um X: o movimento usa só transform e opacity. */
 .bars { position: relative; display: block; width: var(--s-200); height: var(--s-200); }
-.bars i {
+.bars span {
   position: absolute;
   left: 0;
   right: 0;
   height: 2px;
   background: currentColor;
-  border-radius: 1px;
+  border-radius: var(--r-sm);
   transition: transform 500ms var(--ease), opacity 500ms var(--ease);
 }
-.bars i:nth-child(1) { top: 3px; }
-.bars i:nth-child(2) { top: 7px; }
-.bars i:nth-child(3) { top: 11px; }
-.menu-toggle[aria-expanded="true"] .bars i:nth-child(1) { transform: translateY(4px) rotate(45deg); }
-.menu-toggle[aria-expanded="true"] .bars i:nth-child(2) { opacity: 0; }
-.menu-toggle[aria-expanded="true"] .bars i:nth-child(3) { transform: translateY(-4px) rotate(-45deg); }
+.bars span:nth-child(1) { top: 3px; }
+.bars span:nth-child(2) { top: 7px; }
+.bars span:nth-child(3) { top: 11px; }
+.menu-toggle[aria-expanded="true"] .bars span:nth-child(1) { transform: translateY(4px) rotate(45deg); }
+.menu-toggle[aria-expanded="true"] .bars span:nth-child(2) { opacity: 0; }
+.menu-toggle[aria-expanded="true"] .bars span:nth-child(3) { transform: translateY(-4px) rotate(-45deg); }
 
 .menu { display: flex; align-items: center; gap: var(--s-200); }
 /* No celular, o painel ocupa a tela inteira, com o fundo da superfície quase opaco e um desfoque forte. */
@@ -277,9 +281,9 @@ main:focus { outline: none; }
     opacity: 0;
     visibility: hidden;
     /* Ao fechar, a visibilidade só some depois da transição; ao abrir, ela vale já, para o foco entrar no painel. */
-    transition: opacity 500ms var(--ease), visibility 0s linear 500ms;
+    transition: opacity 500ms var(--ease), visibility 0s var(--ease) 500ms;
   }
-  .menu.is-open { opacity: 1; visibility: visible; transition: opacity 500ms var(--ease), visibility 0s linear 0s; }
+  .menu.is-open { opacity: 1; visibility: visible; transition: opacity 500ms var(--ease), visibility 0s var(--ease) 0s; }
 }
 
 .top-nav { display: flex; align-items: center; gap: var(--s-50); }
@@ -296,7 +300,7 @@ main:focus { outline: none; }
 
 .theme {
   padding: var(--s-75) var(--s-100);
-  font: 500 var(--text-sm)/var(--lh-sm) var(--mono);
+  font: 600 var(--text-sm)/var(--lh-sm) var(--sans);
   color: var(--muted);
   background: transparent;
   border: 1px solid var(--line-2);
@@ -349,7 +353,7 @@ main:focus { outline: none; }
 .badges { display: flex; flex-wrap: wrap; gap: var(--s-75); }
 .badge {
   padding: var(--s-50) var(--s-75);
-  font: 500 var(--text-xs)/var(--lh-xs) var(--mono);
+  font: 500 var(--text-xs)/var(--lh-xs) var(--sans);
   color: var(--muted);
   border: 1px solid var(--line-2);
   border-radius: var(--r);
@@ -370,6 +374,8 @@ main:focus { outline: none; }
 .hero .lede { font: 400 var(--text-lg)/var(--lh-lg) var(--sans); color: var(--text); }
 @media (min-width: 768px) { .hero .lede { font-size: var(--text-xl); line-height: var(--lh-xl); } }
 .cta { display: flex; flex-wrap: wrap; gap: var(--s-100); margin-top: var(--s-400); }
+/* No celular, o botão discreto cai para a linha de baixo: a margem negativa alinha o texto à borda dos botões. */
+@media (max-width: 767px) { .cta .btn.quiet { margin-left: calc(var(--s-100) * -1); } }
 /* Botões principais: 8px de altura de respiro, 12px nas laterais, texto de 16px em semibold. */
 .btn {
   display: inline-flex;
@@ -442,7 +448,7 @@ main:focus { outline: none; }
 @media (min-width: 768px) { .resumo { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s-500); } }
 .resumo-item h3 {
   margin: 0 0 var(--s-75);
-  font: 500 var(--text-xs)/var(--lh-xs) var(--mono);
+  font: 500 var(--text-xs)/var(--lh-xs) var(--sans);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--accent);
@@ -504,7 +510,7 @@ main:focus { outline: none; }
 }
 .card-head {
   padding: var(--s-100) var(--s-200);
-  font: 500 var(--text-xs)/var(--lh-xs) var(--mono);
+  font: 500 var(--text-xs)/var(--lh-xs) var(--sans);
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--muted);
@@ -532,7 +538,7 @@ main:focus { outline: none; }
 .como-ler { min-width: 0; }
 .como-ler .label {
   margin: 0 0 var(--s-100);
-  font: 500 var(--text-xs)/var(--lh-xs) var(--mono);
+  font: 500 var(--text-xs)/var(--lh-xs) var(--sans);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--accent);
@@ -576,7 +582,7 @@ main:focus { outline: none; }
   width: min(1200px, 100%);
   margin-inline: auto;
   padding: var(--s-400) max(var(--s-200), env(safe-area-inset-right, 0px)) var(--s-500) max(var(--s-200), env(safe-area-inset-left, 0px));
-  font: 400 var(--text-sm)/var(--lh-sm) var(--mono);
+  font: 400 var(--text-sm)/var(--lh-sm) var(--sans);
   color: var(--muted);
 }
 .foot a { color: var(--muted); transition: color 300ms var(--ease); }
@@ -606,7 +612,7 @@ main:focus { outline: none; }
   justify-content: space-between;
   gap: var(--s-100);
   padding: var(--s-100) var(--s-200);
-  font: 500 var(--text-sm)/var(--lh-sm) var(--mono);
+  font: 500 var(--text-sm)/var(--lh-sm) var(--sans);
   color: var(--fg);
   background: var(--surface);
   border: 1px solid var(--line-2);
@@ -643,13 +649,13 @@ main:focus { outline: none; }
   border-radius: var(--r-md);
 }
 .results a:hover { background: var(--surface-2); }
-.r-page { display: block; font: 500 var(--text-xs)/var(--lh-xs) var(--mono); color: var(--muted); }
+.r-page { display: block; font: 500 var(--text-xs)/var(--lh-xs) var(--sans); color: var(--muted); }
 .r-sec { font: 400 var(--text-sm)/var(--lh-sm) var(--sans); }
 .results .none { padding: var(--s-75) var(--s-100); font: 400 var(--text-sm)/var(--lh-sm) var(--sans); color: var(--muted); }
 .side-nav { display: grid; }
 .side-nav .group-label {
   margin: var(--s-300) 0 var(--s-75);
-  font: 500 var(--text-xs)/var(--lh-xs) var(--mono);
+  font: 500 var(--text-xs)/var(--lh-xs) var(--sans);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted);
@@ -671,7 +677,7 @@ main:focus { outline: none; }
 
 .doc { padding-top: var(--s-100); scroll-margin-top: calc(var(--head) + var(--s-300)); }
 .doc-head { max-width: 760px; }
-.crumb { margin: 0 0 var(--s-200); font: 500 var(--text-xs)/var(--lh-xs) var(--mono); letter-spacing: 0.02em; color: var(--muted); }
+.crumb { margin: 0 0 var(--s-200); font: 500 var(--text-xs)/var(--lh-xs) var(--sans); letter-spacing: 0.02em; color: var(--muted); }
 .doc h1 {
   margin: 0 0 var(--s-200);
   font: 600 var(--text-3xl)/var(--lh-3xl) var(--sans);
@@ -776,7 +782,7 @@ td pre.mini { font: 400 var(--text-sm)/var(--lh-sm) var(--mono); white-space: pr
 .note { margin: var(--s-400) 0; padding: var(--s-200); background: var(--surface-2); border-radius: var(--r-lg); }
 .note-label {
   margin: 0 0 var(--s-50);
-  font: 500 var(--text-xs)/var(--lh-xs) var(--mono);
+  font: 500 var(--text-xs)/var(--lh-xs) var(--sans);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--amber);
@@ -801,7 +807,7 @@ td pre.mini { font: 400 var(--text-sm)/var(--lh-sm) var(--mono); white-space: pr
 .pager .dir {
   display: block;
   margin-bottom: var(--s-50);
-  font: 500 var(--text-xs)/var(--lh-xs) var(--mono);
+  font: 500 var(--text-xs)/var(--lh-xs) var(--sans);
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--muted);
@@ -813,7 +819,7 @@ td pre.mini { font: 400 var(--text-sm)/var(--lh-sm) var(--mono); white-space: pr
 }
 .toc-title {
   margin: 0 0 var(--s-100);
-  font: 500 var(--text-xs)/var(--lh-xs) var(--mono);
+  font: 500 var(--text-xs)/var(--lh-xs) var(--sans);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted);
@@ -831,10 +837,50 @@ td pre.mini { font: 400 var(--text-sm)/var(--lh-sm) var(--mono); white-space: pr
 }
 .toc a:hover { color: var(--fg); }
 
+/* ----- como começar, perguntas e privacidade ----- */
+/* Os passos são numerados com a fonte monoespaçada, a mesma dos números do desempenho. */
+.steps {
+  display: grid;
+  gap: var(--s-300);
+  max-width: 680px;
+  margin: 0 0 var(--s-400);
+  padding: 0;
+  list-style: none;
+  counter-reset: passo;
+}
+.steps li {
+  position: relative;
+  min-width: 0;
+  padding-left: var(--s-500);
+  color: var(--text);
+  counter-increment: passo;
+}
+.steps li::before {
+  content: counter(passo, decimal-leading-zero);
+  position: absolute;
+  top: 0;
+  left: 0;
+  font: 500 var(--text-sm)/var(--lh-sm) var(--mono);
+  color: var(--accent);
+}
+.faq { display: grid; gap: var(--s-400); max-width: 680px; }
+/* Cada pergunta fica junto da sua resposta; o espaço maior separa um par do próximo. */
+.qa { display: grid; gap: var(--s-75); min-width: 0; }
+.faq h3 { margin: 0; font: 600 var(--text-lg)/var(--lh-lg) var(--sans); color: var(--fg); }
+.faq p { color: var(--text); }
+.legal { display: grid; gap: var(--s-200); max-width: 680px; }
+.legal p { color: var(--text); }
+
+/* ----- estados ativos ----- */
+/* Ao apertar, um cartão ou um botão encolhe um pouco, e um link desce 1px. */
+.topic:active, .pager a:active, .results a:active, .side-box summary:active, .bench-more > summary:active { transform: scale(0.98); }
+.top-nav a:active, .side-nav a:active, .foot a:active { transform: translateY(1px); }
+.menu.is-open .top-nav a:active { transform: translateY(1px); }
+
 /* ----- movimento reduzido ----- */
 /* Sem movimento: as seções e as palavras só mudam de opacidade, e o resto aparece de uma vez. */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; scroll-behavior: auto !important; transition: none !important; }
-  .js .reveal { transform: none !important; transition: opacity 300ms linear !important; }
-  .tl-w { transition: opacity 300ms linear !important; transition-delay: 0ms !important; }
+  .js .reveal { transform: none !important; transition: opacity 300ms var(--ease) !important; }
+  .tl-w { transition: opacity 300ms var(--ease) !important; transition-delay: 0ms !important; }
 }

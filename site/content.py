@@ -16,7 +16,31 @@ Se um exemplo falhar, o build para. Os blocos são tuplas:
 
 HOME = {
     "tagline": ["A sintaxe do JavaScript.", "O modelo do Node.js.", "Um binário de 1,2 MB."],
-    "final": "O projeto não tem dependências externas. Compile com o cargo e rode um arquivo `.fly`.",
+    "final": "O projeto não tem dependências externas. Compile com o cargo e rode um arquivo `.fly`. Não há cadastro nem cartão para começar.",
+    "como_comecar": {
+        "lede": "Três passos. Além do Rust, não é preciso instalar nada.",
+        "passos": [
+            "Instale o Rust, que traz o cargo.",
+            "Dentro da pasta do repositório, rode `cargo build --release`. O executável sai em `target/release/fly`, com cerca de 1,2 MB.",
+            'Crie um arquivo `ola.fly` com `console.log("Olá, fly!");` e rode `./target/release/fly ola.fly`.',
+        ],
+    },
+    "faq": [
+        ("Preciso ter o Node instalado?", "Não. O fly é um binário só. O Node aparece nas medições como comparação, e o projeto não depende dele."),
+        ("O fly roda todo o JavaScript?", "Não. A sintaxe é a do JavaScript, mas faltam Promises, async/await, generators, expressões regulares, Symbol e `?.`. A lista completa está em Diferenças."),
+        ("Ele é mais rápido que o Node?", "Depende do programa. Nas 24 cargas medidas, o fly ganha em 11 e perde nas outras 13, sobretudo nas que acessam propriedades e elementos de arrays e fazem muitas chamadas de função."),
+        ("Posso usar pacotes do npm?", "Não. Não há node_modules: o require resolve arquivos `.fly` e os módulos fs e path, que vêm com o fly."),
+        ("O fly funciona em qualquer sistema?", "O código nativo é só para x86 de 64 bits. Em outras plataformas, ou com `FLY_JIT=0`, o fly roda no interpretador."),
+        ("O que acontece com um erro não tratado?", "A mensagem vai para o erro padrão, começando com `Uncaught`, e o processo termina com código 1."),
+        ("A saída é igual à do Node?", "A marca Igual ao Node aparece só quando a saída do fly é idêntica à do Node, nos exemplos que o build compara. Os arquivos de teste foram conferidos com o Node 22, e as duas exceções são decisões do próprio fly."),
+        ("A linguagem está pronta para produção?", "Não. A versão é 0.1.0, e faltam recursos do JavaScript moderno, como Promises e async/await. O roadmap do projeto mostra o que vem a seguir."),
+    ],
+    "privacidade": [
+        "O site não usa cookies, não tem análise de acesso e não pede dados pessoais.",
+        "A única coisa guardada no navegador é a escolha de tema, na chave `fly-tema` do armazenamento local. Ela não sai do aparelho.",
+        "A fonte Geist vem do Google Fonts. Ao abrir a página, o navegador pede o arquivo a esse serviço, que recebe o endereço IP de quem acessa.",
+        "Os links para o GitHub abrem o repositório em outra aba, e lá valem as regras do GitHub.",
+    ],
     "lede": "A sintaxe do JavaScript e o modelo de execução do Node.js, num binário de 1,2 MB que abre em 2,7 ms.",
     "badges": ["Versão 0.1.0", "Sem dependências", "Binário de 1,2 MB"],
     "resumo": [
@@ -28,7 +52,7 @@ HOME = {
     "como_ler": "De 24 programas, o fly é mais rápido que o Bun e o Node em 11. Nos outros 13 ainda perde, em geral nos programas com acessos a propriedades e elementos de arrays e chamadas de função. Diferenças menores que 10% dependem da máquina, e alguns casos perto de 1× trocam de lado de uma medição para outra.",
     "limites": [
         "Não há Promises, async/await, generators, expressões regulares nem Symbol.",
-        "Strings são indexadas por caractere Unicode, não por unidade UTF-16. Por isso `\"😀\".length` é 1.",
+        "Strings são indexadas por caractere Unicode, não por unidade de 16 bits. Por isso `\"😀\".length` é 1.",
         "A pilha de chamadas aguenta cerca de 10 mil quadros no interpretador.",
     ],
 }
@@ -444,7 +468,7 @@ page(
         ("ex", {
             "title": "nextTick com argumentos",
             "desc": "`process.nextTick` aceita argumentos depois da função.",
-            "file": "argumentos-tick.fly",
+            "file": "argumentos_tick.fly",
             "code": 'process.nextTick((a, b) => console.log("soma", a + b), 2, 3);\nconsole.log("antes");',
         }),
         ("p", "As operações de arquivo com callback, como `fs.readFile`, também chegam pelo event loop. Veja em Sistema."),

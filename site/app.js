@@ -36,7 +36,7 @@
   const pageLinks = $$('#side-nav a[data-page]');
   const articles = new Map($$('article.doc').map((a) => [a.id, a]));
   const FIRST = articles.keys().next().value;
-  const HOME_ANCHORS = new Set(['resumo', 'desempenho', 'documentacao', 'limites']);
+  const HOME_ANCHORS = new Set(['resumo', 'desempenho', 'documentacao', 'limites', 'privacidade']);
 
   // A altura real do cabeçalho flutuante, que no celular quebra em duas linhas. Âncoras e o índice usam essa margem.
   const setHead = () => root.style.setProperty('--head', `${header.offsetHeight}px`);
@@ -237,7 +237,7 @@
     if (!hits.length) {
       const none = document.createElement('p');
       none.className = 'none';
-      none.textContent = 'Nenhum resultado';
+      none.textContent = `Nenhum resultado para “${query.value.trim()}”. Tente outro termo.`;
       results.append(none);
       return;
     }

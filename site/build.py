@@ -425,7 +425,22 @@ def home_html():
         for slug, title, desc in content.TOPICS
     )
     limites = "".join(f"<li>{inline(t)}</li>" for t in h["limites"])
-    return f"""<div class="view wrap" data-view="inicio">
+    steps = "".join(f"<li>{inline(t)}</li>" for t in h["como_comecar"]["passos"])
+    faq_items = h["faq"]
+    faq = "".join(f'<div class="qa"><h3>{esc(q)}</h3><p>{inline(a)}</p></div>' for q, a in faq_items)
+    faq_ld = json.dumps(
+        {
+            "@context": "https://schema.org",
+            "@type": "FAQPage",
+            "mainEntity": [
+                {"@type": "Question", "name": plain(q), "acceptedAnswer": {"@type": "Answer", "text": plain(a)}}
+                for q, a in faq_items
+            ],
+        },
+        ensure_ascii=False,
+    ).replace("<", "\\u003c")
+    legal = "".join(f"<p>{inline(t)}</p>" for t in h["privacidade"])
+    return f"""<div class="view wrap" data-view="inicio" id="inicio">
 <section class="hero">
   <div class="hero-art">
     <canvas id="signal" width="720" height="720" role="img" aria-label="borboleta em 3D, girando em linhas de varredura"></canvas>
@@ -435,20 +450,26 @@ def home_html():
     <h1>fly</h1>
     <p class="lede">{esc(h["lede"])}</p>
     <div class="cta">
-      <a class="btn primary" href="#docs-comecar">Começar</a>
-      <a class="btn" href="#docs">Documentação</a>
-      <a class="btn quiet" href="https://github.com/davixyzc/New-Project" target="_blank" rel="noopener">Código no GitHub</a>
+      <a class="btn primary" href="#docs-comecar">Rodar o primeiro programa</a>
+      <a class="btn quiet" href="#docs">Ler a documentação</a>
     </div>
   </div>
+</section>
+
+<section class="block reveal" id="resumo">
+  <h2>Em resumo</h2>
+  <div class="resumo">{resumo}</div>
 </section>
 
 <section class="tagline" aria-label="frase de destaque">
   <p class="tagline-text">{tagline_html(h["tagline"])}</p>
 </section>
 
-<section class="block reveal" id="resumo">
-  <h2>Em resumo</h2>
-  <div class="resumo">{resumo}</div>
+<section class="block reveal" id="como-comecar">
+  <h2>Como começar</h2>
+  <p class="block-lede">{esc(h["como_comecar"]["lede"])}</p>
+  <ol class="steps">{steps}</ol>
+  <p><a href="#docs-comecar">Passo a passo completo</a>, com exemplos que rodam de verdade.</p>
 </section>
 
 <section class="block reveal" id="desempenho">
@@ -480,13 +501,24 @@ def home_html():
   <p><a href="#docs-diferencas">Ver todas as diferenças do JavaScript</a></p>
 </section>
 
+<section class="block reveal" id="faq" aria-labelledby="faq-titulo">
+  <h2 id="faq-titulo">Perguntas frequentes</h2>
+  <div class="faq">{faq}</div>
+  <script type="application/ld+json">{faq_ld}</script>
+</section>
+
 <section class="block final reveal" aria-labelledby="final-titulo">
   <h2 id="final-titulo">Rode o primeiro programa</h2>
   <p class="block-lede">{inline(h["final"])}</p>
   <div class="cta">
-    <a class="btn primary" href="#docs-comecar">Começar</a>
-    <a class="btn" href="#docs">Documentação</a>
+    <a class="btn primary" href="#docs-comecar">Ver o passo a passo</a>
+    <a class="btn quiet" href="#docs">Ler a documentação</a>
   </div>
+</section>
+
+<section class="block" id="privacidade" aria-labelledby="privacidade-titulo">
+  <h2 id="privacidade-titulo">Privacidade</h2>
+  <div class="legal">{legal}</div>
 </section>
 </div>"""
 
@@ -529,7 +561,7 @@ def header_html():
         '<header class="top"><div class="top-in">'
         '<a class="brand" href="#inicio" aria-label="fly, início">fly<small>0.1.0</small></a>'
         '<button class="menu-toggle" type="button" aria-expanded="false" aria-controls="menu">'
-        '<span class="bars" aria-hidden="true"><i></i><i></i><i></i></span>Menu</button>'
+        '<span class="bars" aria-hidden="true"><span></span><span></span><span></span></span>Menu</button>'
         '<div class="menu" id="menu">'
         '<nav class="top-nav" aria-label="principal">'
         '<a href="#inicio" data-top="inicio" style="--i:0">Início</a>'
@@ -546,6 +578,7 @@ def footer_html():
         '<footer class="foot"><div class="foot-in">'
         "<span>fly · linguagem e runtime em Rust</span>"
         '<span class="foot-links"><a href="#inicio">Voltar ao início</a>'
+        '<a href="#privacidade">Privacidade</a>'
         '<a href="https://github.com/davixyzc/New-Project" target="_blank" rel="noopener">Código no GitHub</a></span>'
         "</div></footer>"
     )
@@ -621,6 +654,7 @@ def build():
         '<meta property="og:type" content="website">\n'
         '<meta property="og:title" content="Linguagem fly">\n'
         f'<meta property="og:description" content="{desc}">\n'
+        '<meta name="twitter:card" content="summary">\n'
         '<meta name="theme-color" content="#f5f6fa" media="(prefers-color-scheme: light)">\n'
         '<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">\n'
         f'<link rel="icon" href="{icon}">\n'
