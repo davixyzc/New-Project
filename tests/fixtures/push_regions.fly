@@ -1,0 +1,36 @@
+// `push` in numeric loops, which run as regions: booleans and numbers written past the end, the length that
+// `push` returns used in a comparison and a sum, an alias of the array, a `push` on a value that is not an
+// array, and element reads of the array that grows in the same loop.
+const flags = [];
+for (let i = 0; i < 1000; i++) flags.push(i % 5 === 0);
+let count = 0;
+for (let i = 0; i < flags.length; i++) if (flags[i]) count += 1;
+console.log(flags.length, count, flags[0], flags[1], flags[995]);
+const nums = [1, 2, 3];
+let last = 0;
+for (let i = 0; i < 20; i++) last = nums.push(i * 0.5);
+console.log(last, nums.length, nums[3], nums[22]);
+const mixed = [];
+for (let i = 0; i < 30; i++) {
+  mixed.push(i > 10);
+  mixed.push(i / 4);
+}
+console.log(mixed.length, mixed[0], mixed[1], mixed[21], mixed[58]);
+const alias = [];
+const other = alias;
+let hits = 0;
+for (let i = 0; i < 200; i++) {
+  if (other.push(i) > 50) hits += 1;
+}
+console.log(alias.length, hits, alias[199]);
+const log = { items: [], push(x) { this.items.push(x); return this.items.length; } };
+let total = 0;
+for (let i = 0; i < 10; i++) total += log.push(i);
+console.log(total, log.items.length);
+const grow = [];
+let sum = 0;
+for (let i = 0; i < 300; i++) {
+  grow.push(i);
+  sum += grow[i];
+}
+console.log(grow.length, sum, grow[299]);

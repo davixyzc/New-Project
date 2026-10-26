@@ -118,6 +118,11 @@ enum Mark {
     /// An element of an array, which is a number or a boolean. Its register holds the number, or 0.0 or 1.0 for a
     /// boolean, and its tag is kept in the operand's tag cell, which a side exit writes back.
     Elem,
+    /// The `push` of the array in local `s`, which only a call takes. It has no register, and the probe that
+    /// `Op::GetLocalProp` runs there checked that the array has room.
+    Push(u32),
+    /// The array in local `s`, which only the call of a `push` takes as its receiver. It has no register.
+    Array(u32),
 }
 
 /// Plans a loop region for the loop whose back jumps go to `header`. `None` if the loop has an
@@ -132,11 +137,11 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
                 .any(|&(next, _)| next == header)
     })?;
     let inside = |ip: usize| (header..=last).contains(&ip);
-    // A local that an index operation names is an array. The loop reads its elements in place.
+    // A local that an index operation or a `push` names is an array. The loop reads its elements in place.
     let mut arrays = vec![false; proto.nlocals as usize];
     for ip in header..=last {
         if depth[ip] >= 0 {
-            if let Some(a) = index_base(code[ip]) {
+            if let Some(a) = index_base(code[ip]).or_else(|| push_base(proto, code[ip])) {
                 arrays[a as usize] = true;
             }
         }
@@ -173,7 +178,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         if !allowed(proto, op) {
             return None;
         }
-        if index_base(op).is_some() {
+        if index_base(op).is_some() || push_base(proto, op).is_some() {
             resumes.push(ip);
         }
         if is_test(op) && !consumed(code, ip) {
@@ -219,7 +224,12 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
             }
             _ => {}
         }
-        reads.extend(reads_of(op).into_iter().map(|i| (ip, i)));
+        reads.extend(
+            reads_of(op)
+                .into_iter()
+                .filter(|&i| !arrays[i as usize])
+                .map(|i| (ip, i)),
+        );
     }
     if entries.iter().any(|&e| depth[e] != 0) {
         return None;
@@ -595,6 +605,9 @@ fn allowed(proto: &Proto, op: Op) -> bool {
         | Op::GetIndex2Local(_)
         | Op::SetIndexLocal(_)
         | Op::SetIndex2Local(_) => arr_layout().is_some(),
+        // A `push` is the probe of the method and the call that takes its receiver (see `step`).
+        Op::GetLocalProp(_, n) => is_push(proto, n) && arr_layout().is_some(),
+        Op::Call(1) => arr_layout().is_some(),
         _ => false,
     }
 }
@@ -610,18 +623,50 @@ fn index_base(op: Op) -> Option<u32> {
     }
 }
 
+/// Whether `name` is the property `push`, which a loop region runs on an array (see `Op::GetLocalProp`).
+fn is_push(proto: &Proto, name: u32) -> bool {
+    &*proto.names[name as usize] == "push"
+}
+
+/// The array local that the probe of a `push` reads, if `op` is one.
+fn push_base(proto: &Proto, op: Op) -> Option<u32> {
+    match op {
+        Op::GetLocalProp(s, n) if is_push(proto, n) => Some(s),
+        _ => None,
+    }
+}
+
+/// Whether a kind is a `push` or its receiver, which only the call of the `push` takes (see `step`).
+fn is_receiver(m: &Mark) -> bool {
+    matches!(m, Mark::Push(_) | Mark::Array(_))
+}
+
 /// Pops `n` operand kinds from the stack of kinds, and returns them from the top down.
 fn pop_kinds(state: &mut Vec<Mark>, n: usize) -> Option<Vec<Mark>> {
     let at = state.len().checked_sub(n)?;
+    if state[at..].iter().any(is_receiver) {
+        return None;
+    }
     Some(state.split_off(at).into_iter().rev().collect())
 }
 
 /// Steps the kinds of the operands through `op`. `false` when an operand has a kind that `op` cannot take, or a local
 /// is used in a way that an array does not allow. A boolean and an element read as the number 0 or 1, so arithmetic
 /// and the ordering comparisons take them. Strict equality, a local and an index take numbers only.
-fn step(op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
+fn step(proto: &Proto, op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
     let plain = |i: u32| !arrays[i as usize];
     let number = |m: &Mark| *m == Mark::Num;
+    // A side exit resumes the generic code with the operands of the instruction on the stack, so none of them may be a
+    // receiver, which has no register to write back.
+    if matches!(
+        op,
+        Op::GetIndexLocal(_) | Op::GetIndex2Local(_) | Op::SetIndexLocal(_) | Op::SetIndex2Local(_)
+    ) || push_base(proto, op).is_some()
+    {
+        if state.iter().any(is_receiver) {
+            return false;
+        }
+    }
     match op {
         Op::Const(_) => state.push(Mark::Num),
         Op::True | Op::False => state.push(Mark::Bool),
@@ -631,8 +676,8 @@ fn step(op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
             }
         }
         Op::Dup => match state.last().copied() {
-            Some(top) => state.push(top),
-            None => return false,
+            Some(top) if !is_receiver(&top) => state.push(top),
+            _ => return false,
         },
         Op::Swap => {
             let n = state.len();
@@ -641,10 +686,32 @@ fn step(op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
             }
             state.swap(n - 1, n - 2);
         }
+        Op::GetLocalProp(s, n) if is_push(proto, n) => {
+            if !arrays[s as usize] {
+                return false;
+            }
+            state.push(Mark::Push(s));
+        }
+        Op::GetLocal(i) if arrays[i as usize] => state.push(Mark::Array(i)),
         Op::GetLocal(i) => {
             if !plain(i) {
                 return false;
             }
+            state.push(Mark::Num);
+        }
+        // The `push` of an array, whose value is a number or a boolean, with the array as its receiver. The result is
+        // the new length.
+        Op::Call(1) => {
+            let n = state.len();
+            let pushes = n >= 3
+                && matches!(
+                    (state[n - 3], state[n - 2], state[n - 1]),
+                    (Mark::Push(s), Mark::Array(a), Mark::Num | Mark::Bool) if s == a
+                );
+            if !pushes {
+                return false;
+            }
+            state.truncate(n - 3);
             state.push(Mark::Num);
         }
         Op::SetLocal(i) | Op::PopToLocal(i) => match pop_kinds(state, 1) {
@@ -764,7 +831,7 @@ fn operand_marks(
     while let Some(ip) = work.pop() {
         let entered = before[ip - header].clone()?;
         let mut state = entered.clone();
-        if !step(code[ip], &mut state, arrays) {
+        if !step(proto, code[ip], &mut state, arrays) {
             return None;
         }
         for (next, next_depth) in successors(code[ip], ip, depth[ip]) {
@@ -1321,6 +1388,8 @@ impl Emitter<'_, '_> {
                 self.a.mov_store8(top, RCX);
                 self.a.mov_store8(under, RAX);
             }
+            // An array is read in its slot by the `push` that takes it (see `Op::Call`), so it has no register.
+            Op::GetLocal(i) if self.lp.arrays.contains(&i) => {}
             Op::GetLocal(i) => self.read_local(i, self.reg(d)),
             Op::SetLocal(i) | Op::PopToLocal(i) => self.write_local(i, x),
             Op::AddToLocal(i) => self.update_local(i, SSE_ADD, x),
@@ -1475,9 +1544,89 @@ impl Emitter<'_, '_> {
                 self.elem_write(key, value, boolean, exit);
                 self.a.movapd_rr(row, value);
             }
+            Op::GetLocalProp(s, _) => self.push_probe(ip, d, s),
+            Op::Call(_) if self.lp.function.is_none() => self.push_call(ip, d),
             Op::Call(argc) => self.call(d, argc as i32),
             _ => unreachable!("the planners admit only the operations above"),
         }
+    }
+
+    /// The probe of a `push` on the array in local `s`: the local must hold an array with room for one more element.
+    /// Anything else leaves the loop at `ip`, where the generic code runs the instruction. Nothing is on the stack
+    /// before the probe, so the side exit writes back the operands below it, and no more.
+    fn push_probe(&mut self, ip: usize, d: i32, s: u32) {
+        let exit = self.side_exit(ip, d);
+        let layout = arr_layout().expect("the planner admits a push only with a known layout");
+        self.a.cmp8_imm(local_mem(s), TAG_ARR);
+        self.a.jcc(CC_NE, exit);
+        self.a.mov_load(R8, local_mem(s).at(8));
+        self.a.mov_rr(RCX, R8);
+        self.a.add64_imm32(RCX, layout.vec);
+        self.a.mov_load(
+            RAX,
+            Mem {
+                base: RCX,
+                disp: layout.len,
+            },
+        );
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: RCX,
+                disp: layout.cap,
+            },
+        );
+        self.a.cmp_rr64(RAX, RDX);
+        self.a.jcc(CC_AE, exit);
+    }
+
+    /// The call of a `push` whose probe checked the room (see `push_probe`). The value, a number or a boolean, goes
+    /// past the end of the array in local `s`, and the array's length grows. The new length is the result, which takes
+    /// the register of the callee.
+    fn push_call(&mut self, ip: usize, d: i32) {
+        let Mark::Array(s) = self.mark(ip, d - 2) else {
+            unreachable!("the planner admits a call only as a push of an array (see `step`)")
+        };
+        let layout = arr_layout().expect("the planner admits a push only with a known layout");
+        let value = self.reg(d - 1);
+        let boolean = self.mark(ip, d - 1) == Mark::Bool;
+        self.a.mov_load(R8, local_mem(s).at(8));
+        self.a.mov_rr(RCX, R8);
+        self.a.add64_imm32(RCX, layout.vec);
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: RCX,
+                disp: layout.len,
+            },
+        );
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: RCX,
+                disp: layout.buf,
+            },
+        );
+        self.a.mov_rr(RAX, RSI);
+        self.a.shl64_imm(RAX, 4);
+        self.a.add64(RDX, RAX);
+        if boolean {
+            self.a.mov8_imm(Mem { base: RDX, disp: 0 }, TAG_BOOL);
+            self.a.cvttsd2si(RAX, value);
+            self.a.mov_store8(Mem { base: RDX, disp: 1 }, RAX);
+        } else {
+            self.a.mov8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
+            self.a.movsd_store(Mem { base: RDX, disp: 8 }, value);
+        }
+        self.a.add64_imm8(RSI, 1);
+        self.a.mov_store(
+            Mem {
+                base: RCX,
+                disp: layout.len,
+            },
+            RSI,
+        );
+        self.a.cvtsi2sd(self.reg(d - 3), RSI);
     }
 
     /// A call of the function's own body with `argc` arguments, which are the top operands. The callee
@@ -1652,6 +1801,9 @@ impl Emitter<'_, '_> {
                     self.a.bind(num);
                     self.a.movsd_store(slot.at(8), x);
                     self.a.bind(done);
+                }
+                Mark::Push(_) | Mark::Array(_) => {
+                    unreachable!("a receiver is never on the stack at a side exit (see `step`)")
                 }
                 _ => {
                     self.a.mov8_imm(slot, TAG_NUM);

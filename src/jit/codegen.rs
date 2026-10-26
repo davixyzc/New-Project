@@ -467,6 +467,8 @@ struct Gen<'a> {
     a: Asm,
     /// The label at the start of each instruction. The last one marks the end of the code.
     ops: Vec<Label>,
+    /// The label of each instruction's own code, after the entry of a region there (see `enter_region`).
+    resumed: Vec<Label>,
     /// Out-of-line slow paths: where each starts, the instruction it belongs to, and what it does.
     slow: Vec<(Label, usize, Slow)>,
     /// Leaves the function with an exception pending.
@@ -489,6 +491,7 @@ impl<'a> Gen<'a> {
     fn new(proto: &'a Proto, depth: &'a [i32], types: Numbers) -> Gen<'a> {
         let mut a = Asm::default();
         let ops = (0..=proto.code.len()).map(|_| a.label()).collect();
+        let resumed = (0..proto.code.len()).map(|_| a.label()).collect();
         let threw = a.label();
         let done = a.label();
         let mut regions = Vec::new();
@@ -511,6 +514,7 @@ impl<'a> Gen<'a> {
             nlocals: proto.nlocals as i32,
             a,
             ops,
+            resumed,
             slow: Vec::new(),
             threw,
             done,
@@ -1159,7 +1163,7 @@ impl<'a> Gen<'a> {
 
     /// Runs the region entered at instruction `ip`, then continues at the exit it left by. When a
     /// guard failed the region did not run, and the instruction at `ip` runs here instead.
-    fn enter_region(&mut self, entry: Label, ip: usize, exits: &[usize]) {
+    fn enter_region(&mut self, entry: Label, ip: usize, exits: &[usize], resumes: &[usize]) {
         self.a.mov_imm32(RDX, ip as u32);
         self.a.call_label(entry);
         self.reload_all();
@@ -1170,6 +1174,13 @@ impl<'a> Gen<'a> {
         for &t in exits {
             self.a.cmp64_imm32(RAX, t as i32);
             let target = self.target(t as u32);
+            self.a.jcc(CC_E, target);
+        }
+        // A side exit resumes at the instruction's own code, past the entry of a region there. Otherwise an
+        // instruction that is also an entry would enter the region again, and the same side exit would repeat.
+        for &t in resumes {
+            self.a.cmp64_imm32(RAX, t as i32);
+            let target = self.resumed[t];
             self.a.jcc(CC_E, target);
         }
         self.a.ud2();
@@ -1846,10 +1857,14 @@ impl<'a> Gen<'a> {
             }
             if let Some(r) = self.entry_at[ip] {
                 // A region returns an exit of the loop, or the instruction where a side exit resumes.
-                let (mut exits, entry) = (self.regions[r].0.exits.clone(), self.regions[r].1);
-                exits.extend_from_slice(&self.regions[r].0.resumes);
-                self.enter_region(entry, ip, &exits);
+                let (exits, resumes) = (
+                    self.regions[r].0.exits.clone(),
+                    self.regions[r].0.resumes.clone(),
+                );
+                let entry = self.regions[r].1;
+                self.enter_region(entry, ip, &exits, &resumes);
             }
+            self.a.bind(self.resumed[ip]);
             let op = self.proto.code[ip];
             self.cur = ip;
             match op {
