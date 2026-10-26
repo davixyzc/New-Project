@@ -187,6 +187,7 @@ mod tests {
             consts: vec![Value::Num(0.0)],
             names: Vec::new(),
             hints: Vec::new(),
+            global_hints: Vec::new(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,

@@ -1,0 +1,39 @@
+// Globais criados por atribuição, lidos e trocados em funções diferentes, com os nomes em ordens diferentes.
+h0 = 0; h1 = 1; h2 = 2; h3 = 3; h4 = 4; h5 = 5; h6 = 6; h7 = 7; h8 = 8; h9 = 9;
+g1 = 1;
+g2 = 2;
+g3 = 3;
+
+function leGlobais(k) {
+  let total = 0;
+  for (let i = 0; i < k; i++) {
+    total += g3 * 100 + g1 * 10 + g2;
+    g2 = g2 + 1;
+  }
+  return total;
+}
+
+function trocaGlobais() {
+  h9 = h0 + h8;
+  h0 = h7;
+  return h9 * 1000 + h0;
+}
+
+console.log(leGlobais(3), g1, g2, g3);
+console.log(trocaGlobais(), h0, h9);
+console.log(typeof naoExiste, typeof Math, typeof g2);
+try {
+  console.log(naoExiste);
+} catch (e) {
+  console.log(e instanceof ReferenceError, e.message);
+}
+
+let cont = 0;
+for (let i = 0; i < 1000; i++) if (Infinity > i) cont++;
+console.log(cont);
+
+for (let i = 0; i < 4; i++) {
+  if (typeof novo === "undefined") novo = 0;
+  novo += Math.floor(i / 2) + g1;
+}
+console.log(novo);

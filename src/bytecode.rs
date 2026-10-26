@@ -183,6 +183,8 @@ pub struct Proto {
     /// Where each name was last found in an object, one per name. Native code tries that position first. It
     /// is only a guess: a position that does not hold the same key is skipped.
     pub hints: Vec<Cell<u32>>,
+    /// Where each global name was last found, one per name. As with `hints`, it is a guess, checked before use.
+    pub global_hints: Vec<Cell<u32>>,
     pub protos: Vec<Rc<Proto>>,
     pub upvals: Vec<UpvalDesc>,
     pub nparams: u32,

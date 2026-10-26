@@ -1,7 +1,7 @@
 //! The virtual machine: call frames, the dispatch loop, property access,
 //! error objects and the timer-based event loop.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::io::{BufWriter, Stdout, Write};
@@ -404,10 +404,74 @@ pub struct Timer {
     pub interval: Option<Duration>,
 }
 
+/// The global variables. Each name has a slot. A read or a write remembers the slot where it found the name, so the
+/// next one checks that slot first. Globals are never removed, so a slot keeps its name.
+#[derive(Default)]
+pub struct Globals {
+    slots: Vec<(Rc<str>, Value)>,
+    index: NameMap<u32>,
+}
+
+impl Globals {
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.index.get(name).map(|&i| &self.slots[i as usize].1)
+    }
+
+    pub fn insert(&mut self, name: Rc<str>, v: Value) {
+        match self.index.get(&*name) {
+            Some(&i) => {
+                self.slots[i as usize].1 = v;
+            }
+            None => {
+                self.push(name, v);
+            }
+        }
+    }
+
+    fn push(&mut self, name: Rc<str>, v: Value) -> u32 {
+        let i = self.slots.len() as u32;
+        self.index.insert(name.clone(), i);
+        self.slots.push((name, v));
+        i
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Rc<str>, &Value)> {
+        self.slots.iter().map(|(name, v)| (name, v))
+    }
+
+    /// `get`, trying first the slot in `hint`. The hint moves to the slot where the name is found.
+    pub fn get_hinted(&self, name: &Rc<str>, hint: &Cell<u32>) -> Option<&Value> {
+        if let Some((key, v)) = self.slots.get(hint.get() as usize) {
+            if Rc::ptr_eq(key, name) || **key == **name {
+                return Some(v);
+            }
+        }
+        let i = *self.index.get(&**name)?;
+        hint.set(i);
+        Some(&self.slots[i as usize].1)
+    }
+
+    /// `insert`, trying first the slot in `hint`. The hint moves to the slot where the name ends up.
+    pub fn insert_hinted(&mut self, name: &Rc<str>, hint: &Cell<u32>, v: Value) {
+        if let Some((key, slot)) = self.slots.get_mut(hint.get() as usize) {
+            if Rc::ptr_eq(key, name) || **key == **name {
+                *slot = v;
+                return;
+            }
+        }
+        let i = match self.index.get(&**name) {
+            Some(&i) => i,
+            None => self.push(name.clone(), Value::Undef),
+        };
+        hint.set(i);
+        self.slots[i as usize].1 = v;
+    }
+}
+
 pub struct Vm {
     pub stack: Vec<Value>,
     pub frames: FrameStack,
-    pub globals: NameMap<Value>,
+    pub globals: Globals,
     /// The prototype of each kind of error, by its name. The prototype of `Error` is the one that the others inherit.
     pub error_protos: Vec<(&'static str, ObjRef)>,
     /// Module objects (`{ exports }`) keyed by absolute path, so each file runs once.
@@ -537,7 +601,7 @@ impl Vm {
         let mut vm = Vm {
             stack: Vec::with_capacity(1024),
             frames: FrameStack::new(),
-            globals: NameMap::default(),
+            globals: Globals::default(),
             error_protos: error_protos(),
             modules: HashMap::new(),
             out: BufWriter::new(std::io::stdout()),
@@ -1568,7 +1632,10 @@ impl Vm {
             Op::GetGlobal(i) => {
                 self.sync_ip(ip);
                 let name: &str = &proto.names[i as usize];
-                let found = self.globals.get(name).cloned();
+                let found = self
+                    .globals
+                    .get_hinted(&proto.names[i as usize], &proto.global_hints[i as usize])
+                    .cloned();
                 match found {
                     Some(v) => self.stack.push(v),
                     None => {
@@ -1581,15 +1648,18 @@ impl Vm {
             Op::GetGlobalOrUndef(i) => {
                 let v = self
                     .globals
-                    .get(&*proto.names[i as usize])
+                    .get_hinted(&proto.names[i as usize], &proto.global_hints[i as usize])
                     .cloned()
                     .unwrap_or(Value::Undef);
                 self.stack.push(v);
             }
             Op::SetGlobal(i) => {
-                let name = proto.names[i as usize].clone();
                 let v = self.top().clone();
-                self.globals.insert(name, v);
+                self.globals.insert_hinted(
+                    &proto.names[i as usize],
+                    &proto.global_hints[i as usize],
+                    v,
+                );
             }
             Op::ConstAssign(_) => {
                 self.sync_ip(ip);

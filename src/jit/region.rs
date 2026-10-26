@@ -1453,6 +1453,7 @@ mod tests {
             consts,
             names: Vec::new(),
             hints: Vec::new(),
+            global_hints: Vec::new(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams,

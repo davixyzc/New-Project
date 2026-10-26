@@ -1054,9 +1054,16 @@ impl<'a> Gen<'a> {
             Op::GetGlobal(i) => {
                 // Pushes a global. A name that is not defined takes the slow path, which reports it.
                 let name = &self.proto.names[i as usize] as *const Rc<str> as usize;
+                let hint = &self.proto.global_hints[i as usize] as *const Cell<u32> as usize;
                 let dst = self.temp(d);
                 let get = rt::get_global_into as *const () as usize;
-                self.direct_call(get, &[Arg::Vm, Arg::Imm(name as u64), Arg::Addr(dst)]);
+                let args = [
+                    Arg::Vm,
+                    Arg::Imm(name as u64),
+                    Arg::Addr(dst),
+                    Arg::Imm(hint as u64),
+                ];
+                self.direct_call(get, &args);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
                 Fast::Guarded
@@ -1361,6 +1368,7 @@ mod tests {
             consts: vec![Value::Num(1.0), Value::Num(2.0)],
             names: Vec::new(),
             hints: Vec::new(),
+            global_hints: Vec::new(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,
@@ -1393,6 +1401,7 @@ mod tests {
             consts: vec![Value::Num(0.0)],
             names: Vec::new(),
             hints: Vec::new(),
+            global_hints: Vec::new(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,

@@ -379,13 +379,15 @@ pub unsafe extern "C" fn strict_eq_into(x: *mut Value, y: *mut Value, negate: u6
 /// instruction's own path reports the error.
 ///
 /// # Safety
-/// `vm` must be the running VM, `name` as for `get_prop_top`, and `dst` a dead slot.
+/// `vm` must be the running VM, `name` as for `get_prop_top`, `dst` a dead slot, and `hint` the `global_hints`
+/// cell of the same name in the same prototype.
 pub unsafe extern "C" fn get_global_into(
     vm: *mut Vm,
     name: *const Rc<str>,
     dst: *mut Value,
+    hint: *const Cell<u32>,
 ) -> bool {
-    match (*vm).globals.get(&**name) {
+    match (*vm).globals.get_hinted(&*name, &*hint) {
         Some(v) => {
             ptr::write(dst, v.clone());
             true

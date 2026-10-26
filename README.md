@@ -172,6 +172,7 @@ Para chegar a 2× ou mais nessas cargas, o código nativo precisa ler elementos 
 - **Busca de método com a posição do acesso**: a leitura de um método de string ou de array guarda a posição que achou, e a próxima leitura do mesmo acesso confere o nome nessa posição antes de procurar (`sorted_lookup_hinted`). Pelo `callgrind`, `char_codes` foi de 996 M para 766 M instruções (−23%).
 - **JSON sem cópias**: `JSON.stringify` lê arrays e objetos onde estão, escreve cada membro direto na saída e formata números sem `String` temporária, e `JSON.parse` entrega as strings sem copiá-las. Pelo `callgrind`, `json` foi de 1533 M para 1040 M instruções (−32%).
 - **`sort` com comparador numérico**: quando o comparador é compilado para números e os itens também são, o `sort` chama a função nativa direto, sem o caminho de callback a cada comparação. Pelo `callgrind`, `sort_cmp` foi de 1148 M para 807 M instruções (−30%).
+- **Globais por índice**: cada global guarda o slot onde o nome foi achado, e a próxima leitura ou escrita confere esse slot antes de procurar. Nenhum global é removido, então um slot nunca muda de nome. Pelo `callgrind`, quatro milhões de leituras de `Infinity` e `NaN` foram de 725 M para 405 M instruções (−44%). Um `console.log` em loop perdeu 5% das instruções, e `nbody_objects`, 3%. Em tempo de parede, a leitura de globais ficou 32% mais rápida, e `console_lines`, cerca de 7%.
 
 ## Arquitetura
 
@@ -224,7 +225,6 @@ Os fixtures `deep_calls` (funções de números com a pilha de operandos mais fu
 2. **Layout estável para arrays e objetos**: `Vec` e `RefCell` não têm layout definido, então o código nativo não lê um elemento ou uma propriedade direto da memória. Um tipo próprio, com ponteiro e tamanho, permitiria ler `a[i]` e `o.campo` no código nativo, o que pede `life`, `matrix` e `sieve`.
 3. **Formas de objeto**: objetos com os mesmos campos, na mesma ordem, compartilhariam uma tabela de posições, e o código nativo leria o campo por índice. Sozinho ganha pouco, porque a busca por nome com posição guardada já é barata, e o custo maior está no auxiliar que a chama. Faz sentido depois do item 2.
 4. **Laços com acesso a elementos em registradores**: um laço que chama `a[i]` cai hoje no código geral, com os locais na memória. Manter os números em XMM e salvá-los só em volta da chamada do auxiliar é o próximo passo para `life` e `matrix`.
-5. **Globais por índice**: `GetGlobal` busca o nome numa tabela a cada leitura (`String`, `Math`, funções de topo do arquivo).
-6. **Registradores no código nativo**: estender os locais de laço às funções inteiras, aos temporários e às constantes.
-7. **Valores com NaN-boxing**, para que valores não tenham 16 bytes nem contagem de referências nos números.
-8. **Promises, async/await, generators e Symbol**, que são as partes do Node moderno que faltam, além da zona morta temporal (TDZ) de `let` e `const`.
+5. **Registradores no código nativo**: estender os locais de laço às funções inteiras, aos temporários e às constantes.
+6. **Valores com NaN-boxing**, para que valores não tenham 16 bytes nem contagem de referências nos números.
+7. **Promises, async/await, generators e Symbol**, que são as partes do Node moderno que faltam, além da zona morta temporal (TDZ) de `let` e `const`.
