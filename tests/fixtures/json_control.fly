@@ -1,0 +1,3 @@
+// JSON.stringify of control characters: the short escapes, and \u for the others.
+console.log(JSON.stringify("a\bb\fc\nd\re\tf\u0001g\u001fh"));
+console.log(JSON.stringify({ "k\b": ["\f", "\u0000", "\"\\/"] }, null, 1));
