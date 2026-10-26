@@ -1,0 +1,52 @@
+// `Math.sqrt` in loops whose region reads the global `Math` once, on entry. A loop that writes `sqrt` itself, a `Math`
+// that a local shadows, and an argument that is not a number must each still get what the generic code gives.
+const builtin = Math.sqrt;
+
+let total = 0;
+for (let i = 0; i < 300; i++) total += Math.sqrt(i);
+console.log(total.toFixed(6));
+
+let nans = 0;
+for (let i = -3; i < 3; i++) if (Math.sqrt(i) !== Math.sqrt(i)) nans++;
+console.log(nans);
+
+// The loop writes `sqrt` in the middle, so the calls after the write get the new one.
+let r = 0;
+for (let i = 0; i < 10; i++) {
+  if (i === 5) Math.sqrt = (x) => 100;
+  r += Math.sqrt(4);
+}
+console.log(r);
+Math.sqrt = builtin;
+
+const saved = Math.sqrt;
+Math.sqrt = (x) => x * 10;
+let q = 0;
+for (let i = 0; i < 5; i++) q += Math.sqrt(i);
+console.log(q);
+Math.sqrt = saved;
+
+let s = 0;
+for (let i = 0; i < 4; i++) s += Math.sqrt("16");
+console.log(s);
+
+function shadowed(n) {
+  const Math = { sqrt: (x) => -1 };
+  let t = 0;
+  for (let i = 0; i < n; i++) t += Math.sqrt(i);
+  return t;
+}
+console.log(shadowed(5));
+
+function inFunction(x) {
+  let acc = 0;
+  for (let i = 0; i < 10; i++) acc += Math.sqrt(x + i) * 2;
+  return acc;
+}
+console.log(inFunction(3).toFixed(6));
+console.log(inFunction(-20) !== inFunction(-20));
+
+const box = { v: 2 };
+let w = 0;
+for (let i = 0; i < 6; i++) w += Math.sqrt(box.v + i);
+console.log(w.toFixed(6));

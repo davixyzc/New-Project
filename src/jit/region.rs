@@ -105,6 +105,9 @@ pub(super) struct Region {
     object_guards: Vec<u32>,
     /// The instructions that read an element into an object local (see `Mark::Owned`).
     object_reads: Vec<usize>,
+    /// The global `Math` and the property `sqrt` that the loop reads through it, as name indices. The entry checks that
+    /// `Math.sqrt` is the built-in, which nothing in the loop can change (see `math_reads`).
+    math: Option<(u32, u32)>,
     /// The kind of each operand before each instruction of a loop, from `header` on (see `operand_marks`).
     marks: Vec<Vec<Mark>>,
     /// The instructions of a loop that read or write an element. A side exit resumes the generic code at one of
@@ -142,6 +145,9 @@ enum Mark {
     /// The built-in `sqrt`, which a property read of `sqrt` from an object gives. It has no register and no slot. The
     /// read checks that the property is the built-in (see `Op::GetProp`), and a side exit writes it back.
     Sqrt,
+    /// The built-in `Math` global, which a loop reads through its name (see `Region::math`). It has no register and no
+    /// slot, and nothing on the stack may need it at a side exit.
+    Math,
 }
 
 /// Plans a loop region for the loop whose back jumps go to `header`. `None` if the loop has an
@@ -372,10 +378,13 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
                     .any(|&e| reads_before_write(proto, depth, header, last, e, i))
         })
         .collect();
+    let math = math_reads(proto, depth, header, last)?;
     let kinds = Kinds {
         arrays: &arrays,
         objects: &objects,
         object_reads: &object_reads,
+        math_global: math.map(|m| m.0),
+        math_sqrt: math.map(|m| m.1),
     };
     let marks = operand_marks(proto, depth, header, last, &entries, &kinds)?;
     Some(Region {
@@ -394,6 +403,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
             .collect(),
         object_guards,
         object_reads,
+        math,
         marks,
         resumes,
         function: None,
@@ -463,6 +473,7 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
         objects: Vec::new(),
         object_guards: Vec::new(),
         object_reads: Vec::new(),
+        math: None,
         marks: Vec::new(),
         resumes: Vec::new(),
         function: Some(Function {
@@ -708,6 +719,10 @@ struct Kinds<'a> {
     objects: &'a [bool],
     /// The instructions that read an element into an object local (see `Region::object_reads`).
     object_reads: &'a [usize],
+    /// The name index of the global `Math`, when the loop reads `Math.sqrt` (see `Region::math`).
+    math_global: Option<u32>,
+    /// The name index of `sqrt`, when the loop reads it through `Math`.
+    math_sqrt: Option<u32>,
 }
 
 /// Whether `name` is the property `length`, which an array answers by its length (see `Op::GetLocalProp`).
@@ -718,6 +733,44 @@ fn is_length(proto: &Proto, name: u32) -> bool {
 /// Whether `name` is `sqrt`, which a loop reads from an object and calls (see `Mark::Sqrt`).
 fn is_sqrt(proto: &Proto, name: u32) -> bool {
     &*proto.names[name as usize] == "sqrt"
+}
+
+/// The global `Math` and its `sqrt`, as name indices, when the loop reads `Math.sqrt`. `Some(None)` when the loop does not
+/// read `Math`, and `None` when it reads `Math` without `sqrt`, or writes `sqrt`, which would change the built-in that the
+/// entry checks.
+fn math_reads(
+    proto: &Proto,
+    depth: &[i32],
+    header: usize,
+    last: usize,
+) -> Option<Option<(u32, u32)>> {
+    let (mut global, mut sqrt, mut written) = (None, None, false);
+    for (&d, &op) in depth[header..=last].iter().zip(&proto.code[header..=last]) {
+        if d < 0 {
+            continue;
+        }
+        match op {
+            Op::GetGlobal(k) if &*proto.names[k as usize] == "Math" => {
+                if global.is_some_and(|g| g != k) {
+                    return None;
+                }
+                global = Some(k);
+            }
+            Op::GetProp(n) if is_sqrt(proto, n) => {
+                if sqrt.is_some_and(|s| s != n) {
+                    return None;
+                }
+                sqrt = Some(n);
+            }
+            Op::SetProp(n) if is_sqrt(proto, n) => written = true,
+            _ => {}
+        }
+    }
+    match (global, sqrt) {
+        (None, _) => Some(None),
+        (Some(k), Some(n)) if !written => Some(Some((k, n))),
+        _ => None,
+    }
 }
 
 /// Whether an operand of this kind has a register (see `Mark`).
@@ -825,7 +878,12 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
         || object_base(proto, op).is_some()
         || matches!(op, Op::GetProp(_) | Op::SetProp(_) | Op::GetGlobal(_))
         || matches!(op, Op::PopToLocal(i) if objects[i as usize]);
-    if side_exit && state.iter().any(is_receiver) {
+    // The read of `sqrt` from `Math` needs no side exit, since the entry checks that it is the built-in
+    // (see `Region::math`).
+    let math_read =
+        matches!(op, Op::GetProp(n) if is_sqrt(proto, n)) && state.last() == Some(&Mark::Math);
+    // The built-in `Math` has no slot to write back, so a side exit never has it on the stack.
+    if side_exit && !math_read && state.iter().any(|m| is_receiver(m) || *m == Mark::Math) {
         return false;
     }
     // A write to a local that a view of it is on the stack would change what the view reads.
@@ -837,6 +895,7 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
     match op {
         Op::Const(_) => state.push(Mark::Num),
         Op::True | Op::False => state.push(Mark::Bool),
+        Op::GetGlobal(k) if kinds.math_global == Some(k) => state.push(Mark::Math),
         Op::GetGlobal(_) => state.push(Mark::Owned),
         Op::Pop => {
             if pop_kinds(state, 1).is_none() {
@@ -873,6 +932,10 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
         Op::GetLocalProp(s, n) if objects[s as usize] && !is_push(proto, n) => {
             state.push(Mark::Num)
         }
+        Op::GetProp(n) if is_sqrt(proto, n) && state.last() == Some(&Mark::Math) => {
+            state.pop();
+            state.push(Mark::Sqrt);
+        }
         Op::GetProp(n) if is_sqrt(proto, n) && state.last() == Some(&Mark::Owned) => {
             state.pop();
             state.push(Mark::Sqrt);
@@ -884,6 +947,8 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
             state.pop();
             state.push(Mark::Num);
         }
+        // The loop reads `sqrt` through `Math` as the built-in, so it must not write one.
+        Op::SetProp(n) if kinds.math_sqrt.is_some() && is_sqrt(proto, n) => return false,
         Op::SetProp(_) => {
             let n = state.len();
             if n < 2 || state[n - 1] != Mark::Num || !matches!(state[n - 2], Mark::View(_)) {
@@ -911,7 +976,10 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
         Op::Call(1)
             if state.len() >= 3
                 && state[state.len() - 3] == Mark::Sqrt
-                && matches!(state[state.len() - 2], Mark::View(_) | Mark::Owned)
+                && matches!(
+                    state[state.len() - 2],
+                    Mark::View(_) | Mark::Owned | Mark::Math
+                )
                 && state[state.len() - 1] == Mark::Num =>
         {
             let n = state.len();
@@ -1198,6 +1266,32 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
     for &o in &lp.object_guards {
         e.a.cmp8_imm(local_mem(o), TAG_OBJ);
         e.a.jcc(CC_NE, not_entered);
+    }
+    if let Some((k, n)) = lp.math {
+        // The loop takes `Math.sqrt` to be the built-in, which the entry checks once, since nothing in the loop changes
+        // the global or the property (see `math_reads`). The checks clobber rdx, which the dispatch below needs, so r9
+        // keeps it.
+        e.a.mov_rr(R9, RDX);
+        let name = &proto.names[k as usize] as *const std::rc::Rc<str> as usize;
+        let hint = &proto.global_hints[k as usize] as *const std::cell::Cell<u32> as usize;
+        let layout = entry_layout().expect("the planner admits a global only with a known layout");
+        find_global(&mut *e.a, name, hint, layout, not_entered);
+        let math = Mem {
+            base: RDX,
+            disp: layout.value,
+        };
+        let site = PropSite {
+            hint: &proto.hints[n as usize] as *const PropHint as usize,
+            layout: prop_layout().expect("the planner admits a property only with a known layout"),
+        };
+        find_prop(&mut *e.a, math, site, not_entered);
+        e.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_NATIVE);
+        e.a.jcc(CC_NE, not_entered);
+        e.a.mov_load(RCX, Mem { base: RDX, disp: 8 });
+        e.a.mov_imm64(RAX, sqrt_address());
+        e.a.cmp_rr64(RCX, RAX);
+        e.a.jcc(CC_NE, not_entered);
+        e.a.mov_rr(RDX, R9);
     }
     for &(i, home) in &lp.locals {
         if let Home::Reg(x) = home {
@@ -1618,7 +1712,8 @@ impl Emitter<'_, '_> {
                 self.count_up(to);
             }
             Op::Dup
-                if self.lp.function.is_none() && matches!(self.mark(ip, d - 1), Mark::View(_)) => {}
+                if self.lp.function.is_none()
+                    && matches!(self.mark(ip, d - 1), Mark::View(_) | Mark::Math) => {}
             Op::Dup => {
                 self.a.movapd_rr(self.reg(d), x);
                 let (from, to) = (self.tag_cell(d - 1), self.tag_cell(d));
@@ -1840,6 +1935,8 @@ impl Emitter<'_, '_> {
                 self.elem_write(key, value, boolean, exit);
                 self.a.movapd_rr(row, value);
             }
+            // The built-in `Math` is not read here: the entry checked that `Math.sqrt` is the built-in (see `emit`).
+            Op::GetGlobal(k) if self.lp.math.map(|m| m.0) == Some(k) => {}
             Op::GetGlobal(k) => {
                 // A global is read in place, as the generic code reads it (see `find_global`). It must be an object,
                 // which the operand takes a reference to.
@@ -1879,6 +1976,7 @@ impl Emitter<'_, '_> {
                 self.a.cvtsi2sd(self.reg(d), RSI);
             }
             Op::GetLocalProp(s, _) => self.push_probe(ip, d, s),
+            Op::GetProp(_) if self.lp.function.is_none() && self.mark(ip, d - 1) == Mark::Math => {}
             Op::GetProp(n) if self.lp.function.is_none() && self.mark(ip, d - 1) == Mark::Owned => {
                 // The `sqrt` of an object: the property must be the built-in. The object gives up its reference after
                 // every check, so a side exit leaves it as it was.
@@ -1917,8 +2015,8 @@ impl Emitter<'_, '_> {
             }
             Op::Call(1) if self.lp.function.is_none() && self.mark(ip, d - 3) == Mark::Sqrt => {
                 // The object is released after its checks, as the other side exits leave the counts alone until then.
-                let exit = self.side_exit(ip, d);
                 if self.mark(ip, d - 2) == Mark::Owned {
+                    let exit = self.side_exit(ip, d);
                     let this = self.operand_mem(d - 2);
                     self.check_last(this, exit);
                     self.count_down(this);
@@ -2195,6 +2293,9 @@ impl Emitter<'_, '_> {
                     self.a.mov_imm64(RAX, sqrt_address());
                     self.a.mov_store(slot.at(8), RAX);
                 }
+                Mark::Math => unreachable!(
+                    "the built-in `Math` is never on the stack at a side exit (see `step`)"
+                ),
                 _ => {
                     self.a.mov8_imm(slot, TAG_NUM);
                     self.a.movsd_store(slot.at(8), x);
