@@ -754,6 +754,69 @@ impl<'a> Gen<'a> {
         self.a.jmp(generic);
     }
 
+    /// `push` of a plain value onto an array with room for it, done in place, as `rt::push_call` does: the value goes past
+    /// the end, the array's length grows, the receiver's reference is released and the new length replaces the callee.
+    /// A receiver that is not an array, a value with a reference, and a full array all jump to `slow`, before anything has
+    /// changed (apart from the callee, which only the last step writes).
+    fn inline_push(&mut self, callee: Mem, this: Mem, arg: Mem, slow: Label, done: Label) {
+        let Some(layout) = arr_layout() else {
+            self.a.jmp(slow);
+            return;
+        };
+        self.check_tag(this, TAG_ARR, slow);
+        self.check_release(this, slow);
+        // A value without a reference is copied as it is, so the element needs no release.
+        self.a.cmp8_imm(arg, TAG_NUM);
+        self.a.jcc(CC_A, slow);
+        self.a.mov_load(RDX, this.at(8));
+        self.a.add64_imm32(RDX, layout.vec);
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: RDX,
+                disp: layout.len,
+            },
+        );
+        self.a.mov_load(
+            RDI,
+            Mem {
+                base: RDX,
+                disp: layout.cap,
+            },
+        );
+        self.a.cmp_rr64(RSI, RDI);
+        self.a.jcc(CC_AE, slow);
+        self.a.mov_load(
+            RDI,
+            Mem {
+                base: RDX,
+                disp: layout.buf,
+            },
+        );
+        self.a.mov_rr(R8, RSI);
+        self.a.shl64_imm(R8, 4);
+        self.a.add64(RDI, R8);
+        self.a.mov_load(R8, arg);
+        self.a.mov_store(Mem { base: RDI, disp: 0 }, R8);
+        self.a.mov_load(R8, arg.at(8));
+        self.a.mov_store(Mem { base: RDI, disp: 8 }, R8);
+        self.a.add64_imm8(RSI, 1);
+        self.a.mov_store(
+            Mem {
+                base: RDX,
+                disp: layout.len,
+            },
+            RSI,
+        );
+        self.release_owned(this);
+        // The receiver's slot is dead now, so it holds a plain value, which nothing drops.
+        self.a.mov8_imm(this, TAG_UNDEF);
+        self.a.cvtsi2sd64(0, RSI);
+        self.a.mov8_imm(callee, TAG_NUM);
+        self.a.movsd_store(callee.at(8), 0);
+        self.a.jmp(done);
+    }
+
     /// A call of a compiled closure, which native code makes itself. The callee is a closure whose code is compiled,
     /// it takes exactly the arguments of this call and no rest parameter, and the frame stack and the value stack
     /// have room for its frame. The arguments are already in place, at the top of this frame, and they become the
@@ -1022,6 +1085,14 @@ impl<'a> Gen<'a> {
             let push_helper = rt::push_call as *const () as usize;
             let char_code_helper = rt::char_code_call as *const () as usize;
             let string_helper = rt::string_call as *const () as usize;
+            // `push` of a plain value onto an array with room is done here, and anything else calls the helper.
+            let push_slow = self.a.label();
+            self.a.mov_load(RAX, callee.at(8));
+            self.a.mov_imm64(RCX, push);
+            self.a.cmp_rr64(RAX, RCX);
+            self.a.jcc(CC_NE, not_push);
+            self.inline_push(callee, this, arg, push_slow, done);
+            self.a.bind(push_slow);
             self.builtin_call1(callee, push, push_helper, not_push, generic, done);
             self.a.bind(not_push);
             self.builtin_call1(

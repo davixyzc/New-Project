@@ -1,0 +1,39 @@
+// Loops with `&&`, `||` and `continue`, and with `%` by a variable, over whole and fractional numbers, negative numbers,
+// -0, NaN, zero and large values, which take the native remainder only when both operands are whole and suitable.
+let hits = 0, misses = 0;
+for (let i = -6; i < 6; i++) {
+  for (let j = -3; j < 4; j++) {
+    if (i === 0 && j === 0) continue;
+    if (i > 0 && j < 0 || i === j) hits++;
+    else misses++;
+  }
+}
+console.log(hits, misses);
+const divisors = [3, -3, 0.5, 2.5, 0, NaN, 7];
+const values = [9, -9, 0, -0, 7.5, -7.5, 1e15, 2147483648, NaN, 4];
+let acc = "";
+for (let a = 0; a < values.length; a++) {
+  for (let d = 0; d < divisors.length; d++) {
+    const x = values[a], y = divisors[d];
+    acc += (x % y) + (Object.is(x % y, -0) ? "n" : "") + ",";
+  }
+}
+console.log(acc);
+let total = 0, n = 0;
+for (let i = 0; i < 400; i++) {
+  const r = i % 7;
+  const q = (i * 3) % 11;
+  if (r === 0 || q === 2 && r !== 3) total += r + q;
+  else if (r > 4 && q > 5) n++;
+  total += i % 5 === 0 ? 1 : 0;
+}
+console.log(total, n);
+// Flags that combine with `&&` and `||` and then feed arithmetic.
+const flags = [];
+for (let i = 0; i < 200; i++) flags.push(i % 3 === 0);
+let mixed = 0;
+for (let i = 0; i < 200; i++) mixed += (flags[i] && i > 10) || (!flags[i] && i % 4 === 1) ? 1 : 0;
+console.log(mixed);
+let fractional = 0;
+for (let i = 0; i < 300; i++) fractional += (i / 4) % 3;
+console.log(fractional);

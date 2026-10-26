@@ -251,15 +251,23 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
     let mut order: Vec<u32> = (0..proto.nlocals)
         .filter(|&i| uses[i as usize] > 0 && !arrays[i as usize])
         .collect();
-    if order.len() > LOCAL_REGS.len() {
-        return None;
-    }
     order.sort_by_key(|&i| (std::cmp::Reverse(uses[i as usize]), i));
+    // The most used locals take the registers, and the others stay in their frame slots.
     let locals: Vec<(u32, Home)> = order
-        .into_iter()
-        .zip(LOCAL_REGS)
-        .map(|(i, x)| (i, Home::Reg(x)))
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| match LOCAL_REGS.clone().nth(k) {
+            Some(x) => (i, Home::Reg(x)),
+            None => (i, Home::Mem(local_mem(i).at(8))),
+        })
         .collect();
+    // The integer copy lives in a register, so its local must have one.
+    let int_local = int_local.filter(|&i| {
+        locals
+            .iter()
+            .any(|&(l, h)| l == i && matches!(h, Home::Reg(_)))
+    });
+    let rem = if int_local.is_some() { rem } else { None };
     // Constants take registers from the top down, which must not reach the operand registers.
     let fits = TEMP_BASE as usize + deepest as usize + wanted.len() <= 16;
     let consts: Vec<(u64, u8)> = if fits {
@@ -581,7 +589,7 @@ fn allowed(proto: &Proto, op: Op) -> bool {
         Op::Jump(_) | Op::JumpIfFalse(_) | Op::JumpIfTrue(_) => true,
         Op::JumpIfNotLt(_) | Op::JumpIfNotLe(_) | Op::JumpIfNotGt(_) | Op::JumpIfNotGe(_) => true,
         Op::JumpIfLtLL(..) | Op::JumpIfNotLtLL(..) => true,
-        Op::True | Op::False => true,
+        Op::True | Op::False | Op::AndJump(_) | Op::OrJump(_) => true,
         // The element code needs the layout of arrays, which the generic code needs too (see `arr_layout`).
         Op::GetIndexLocal(_)
         | Op::GetIndex2Local(_)
@@ -690,7 +698,7 @@ fn step(op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
             _ => return false,
         },
         Op::Jump(_) => {}
-        Op::JumpIfFalse(_) | Op::JumpIfTrue(_) => {
+        Op::JumpIfFalse(_) | Op::JumpIfTrue(_) | Op::AndJump(_) | Op::OrJump(_) => {
             if pop_kinds(state, 1).is_none() {
                 return false;
             }
@@ -754,20 +762,28 @@ fn operand_marks(
         work.push(e);
     }
     while let Some(ip) = work.pop() {
-        let mut state = before[ip - header].clone()?;
+        let entered = before[ip - header].clone()?;
+        let mut state = entered.clone();
         if !step(code[ip], &mut state, arrays) {
             return None;
         }
-        for (next, _) in successors(code[ip], ip, depth[ip]) {
+        for (next, next_depth) in successors(code[ip], ip, depth[ip]) {
             if !inside(next) {
                 continue;
             }
+            // A taken `&&` or `||` keeps the operand it tested, which its successor's depth shows.
+            let incoming =
+                if next_depth == depth[ip] && matches!(code[ip], Op::AndJump(_) | Op::OrJump(_)) {
+                    &entered
+                } else {
+                    &state
+                };
             match &before[next - header] {
                 None => {
-                    before[next - header] = Some(state.clone());
+                    before[next - header] = Some(incoming.clone());
                     work.push(next);
                 }
-                Some(known) if *known != state => return None,
+                Some(known) if known != incoming => return None,
                 Some(_) => {}
             }
         }
@@ -1319,9 +1335,14 @@ impl Emitter<'_, '_> {
             Op::Mul => self.a.sse(SSE_MUL, y, x),
             Op::Div => self.a.sse(SSE_DIV, y, x),
             Op::Mod => {
+                let (slow, done) = (self.a.label(), self.a.label());
+                self.int_remainder(y, x, slow);
+                self.a.jmp(done);
+                self.a.bind(slow);
                 self.a.movapd_rr(0, y);
                 self.a.movapd_rr(1, x);
                 self.call_mod(y);
+                self.a.bind(done);
             }
             Op::Neg => {
                 self.a.mov_imm64(RAX, 1 << 63);
@@ -1364,6 +1385,15 @@ impl Emitter<'_, '_> {
             Op::JumpIfFalse(t) => {
                 self.zero_test(x);
                 self.jump_if(t, CC_E);
+            }
+            // `a && b` and `a || b` keep `a` on the stack when they jump, and pop it when they do not.
+            Op::AndJump(t) => {
+                self.zero_test(x);
+                self.jump_if(t, CC_E);
+            }
+            Op::OrJump(t) => {
+                self.zero_test(x);
+                self.jump_if(t, CC_NE);
             }
             Op::JumpIfTrue(t) => {
                 self.zero_test(x);
@@ -1521,7 +1551,14 @@ impl Emitter<'_, '_> {
     fn write_local(&mut self, i: u32, src: u8) {
         match self.home(i) {
             Home::Reg(x) => self.a.movapd_rr(x, src),
-            Home::Mem(m) => self.a.movsd_store(m, src),
+            Home::Mem(m) => {
+                // A loop's frame slot is a value, whose tag comes before the payload that `m` addresses. A
+                // function's slot holds the number alone.
+                if self.lp.function.is_none() {
+                    self.a.mov8_imm(m.at(-8), TAG_NUM);
+                }
+                self.a.movsd_store(m, src);
+            }
         }
     }
 
@@ -1535,6 +1572,32 @@ impl Emitter<'_, '_> {
                 self.a.movsd_store(m, 0);
             }
         }
+    }
+
+    /// Leaves in `dst` (the left operand) the remainder of `left` by `right`, when both are whole numbers, `left` has no sign
+    /// bit and `right` is positive. Any other pair jumps to `slow`, which computes the remainder in full.
+    fn int_remainder(&mut self, left: u8, right: u8, slow: Label) {
+        self.a.cvttsd2si(RAX, left);
+        self.a.cvtsi2sd(0, RAX);
+        self.a.ucomisd(left, 0);
+        self.a.jcc(CC_NE, slow);
+        self.a.jcc(CC_P, slow);
+        // The sign bit also marks -0, whose remainder is -0, so it takes the slow path too.
+        self.a.movmskpd(RAX, left);
+        self.a.mov_imm32(RCX, 1);
+        self.a.test32(RAX, RCX);
+        self.a.jcc(CC_NE, slow);
+        self.a.cvttsd2si(RCX, right);
+        self.a.cvtsi2sd(0, RCX);
+        self.a.ucomisd(right, 0);
+        self.a.jcc(CC_NE, slow);
+        self.a.jcc(CC_P, slow);
+        self.a.test32(RCX, RCX);
+        self.a.jcc(CC_LE, slow);
+        self.a.cvttsd2si(RAX, left);
+        self.a.mov_imm32(RDX, 0);
+        self.a.div32(RCX);
+        self.a.cvtsi2sd(left, RDX);
     }
 
     /// Loads the number `n` as the operand at depth `d`.

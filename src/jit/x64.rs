@@ -31,6 +31,7 @@ pub const CC_S: u8 = 0x8;
 pub const CC_P: u8 = 0xA;
 pub const CC_NP: u8 = 0xB;
 pub const CC_L: u8 = 0xC;
+pub const CC_LE: u8 = 0xE;
 pub const CC_G: u8 = 0xF;
 
 /// The second opcode byte of the scalar double operations (`F2 0F xx`).
@@ -253,6 +254,11 @@ impl Asm {
     /// `idiv r32`: divides EDX:EAX by `r`, leaving the quotient in EAX and the remainder in EDX.
     pub fn idiv32(&mut self, r: u8) {
         self.op(None, false, &[0xF7], 7, Rm::Reg(r));
+    }
+
+    /// `div r32`: divides EDX:EAX by `r` as unsigned numbers, leaving the quotient in EAX and the remainder in EDX.
+    pub fn div32(&mut self, r: u8) {
+        self.op(None, false, &[0xF7], 6, Rm::Reg(r));
     }
 
     /// `movsxd dst, src32`: sign-extends a 32-bit register into 64 bits.
