@@ -2428,7 +2428,68 @@ impl<'a> Gen<'a> {
                     Fast::Guarded
                 }
             }
-            Op::StrictEq | Op::StrictNe | Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+            Op::StrictEq | Op::StrictNe => {
+                // Values of different tags are never strictly equal. Numbers compare as numbers, booleans by their byte,
+                // undefined and null equal themselves, and other references by their pointer. Two strings compare by
+                // their contents in the helper, which this path calls for them.
+                let (x, y) = (self.temp(d - 2), self.temp(d - 1));
+                let negate = matches!(op, Op::StrictNe);
+                let (differ, equal, numbers, bools, store) = (
+                    self.a.label(),
+                    self.a.label(),
+                    self.a.label(),
+                    self.a.label(),
+                    self.a.label(),
+                );
+                self.a.movzx_load8(RAX, x);
+                self.a.movzx_load8(RCX, y);
+                self.a.cmp_rr64(RAX, RCX);
+                self.a.jcc(CC_NE, differ);
+                self.a.cmp64_imm8(RAX, TAG_NUM);
+                self.a.jcc(CC_E, numbers);
+                self.a.cmp64_imm8(RAX, TAG_STR);
+                self.a.jcc(CC_E, slow);
+                self.a.cmp64_imm8(RAX, TAG_BOOL);
+                self.a.jcc(CC_E, bools);
+                self.a.cmp64_imm8(RAX, TAG_NULL);
+                self.a.jcc(CC_BE, equal);
+                self.a.mov_load(RCX, x.at(8));
+                self.a.mov_load(RDX, y.at(8));
+                self.a.cmp_rr64(RCX, RDX);
+                self.a.setcc(CC_E, RAX);
+                self.a.jmp(store);
+                self.a.bind(bools);
+                self.a.movzx_load8(RCX, x.at(1));
+                self.a.movzx_load8(RDX, y.at(1));
+                self.a.cmp_rr64(RCX, RDX);
+                self.a.setcc(CC_E, RAX);
+                self.a.jmp(store);
+                self.a.bind(numbers);
+                self.a.movsd_load(0, x.at(8));
+                self.a.movsd_load(1, y.at(8));
+                // An unordered (NaN) comparison sets ZF and PF, so equality also checks the parity flag.
+                self.a.ucomisd(0, 1);
+                self.a.setcc(CC_E, RAX);
+                self.a.setcc(CC_NP, RCX);
+                self.a.and8(RAX, RCX);
+                self.a.jmp(store);
+                self.a.bind(differ);
+                self.a.mov_imm32(RAX, 0);
+                self.a.jmp(store);
+                self.a.bind(equal);
+                self.a.mov_imm32(RAX, 1);
+                self.a.bind(store);
+                if negate {
+                    self.a.xor32_imm8(RAX, 1);
+                }
+                self.store_bool(x);
+                let eq = rt::strict_eq_into as *const () as usize;
+                Fast::Direct(
+                    eq,
+                    vec![Arg::Addr(x), Arg::Addr(y), Arg::Imm(u64::from(negate))],
+                )
+            }
+            Op::Lt | Op::Le | Op::Gt | Op::Ge => {
                 let (x, y) = (self.temp(d - 2), self.temp(d - 1));
                 self.check_tag(x, TAG_NUM, slow);
                 self.check_tag(y, TAG_NUM, slow);
@@ -2453,26 +2514,9 @@ impl<'a> Gen<'a> {
                         self.a.ucomisd(0, 1);
                         self.a.setcc(CC_AE, RAX);
                     }
-                    Op::StrictEq => {
-                        self.a.ucomisd(0, 1);
-                        self.a.setcc(CC_E, RAX);
-                        self.a.setcc(CC_NP, RCX);
-                        self.a.and8(RAX, RCX);
-                    }
-                    _ => {
-                        self.a.ucomisd(0, 1);
-                        self.a.setcc(CC_NE, RAX);
-                        self.a.setcc(CC_P, RCX);
-                        self.a.or8(RAX, RCX);
-                    }
+                    _ => unreachable!("the arm admits only the ordering comparisons"),
                 }
                 self.store_bool(x);
-                if matches!(op, Op::StrictEq | Op::StrictNe) {
-                    // Any other pair of values takes the helper, which compares strings too.
-                    let eq = rt::strict_eq_into as *const () as usize;
-                    let negate = u64::from(op == Op::StrictNe);
-                    return Fast::Direct(eq, vec![Arg::Addr(x), Arg::Addr(y), Arg::Imm(negate)]);
-                }
                 Fast::Guarded
             }
             Op::Neg => {

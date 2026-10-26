@@ -1,0 +1,26 @@
+// `===` and `!==` between every kind of value: different kinds, numbers with NaN and -0, booleans, undefined and null,
+// strings equal by their contents, and references equal only to themselves.
+const o1 = { a: 1 }, o2 = { a: 1 }, f1 = () => 1, f2 = () => 1, a1 = [1], a2 = [1];
+const values = [0, -0, 1, NaN, Infinity, true, false, undefined, null, "", "x", "x" + 1, o1, o2, f1, f2, a1, a2];
+const names = ["0", "-0", "1", "NaN", "Inf", "true", "false", "undef", "null", "''", "'x'", "'x1'", "o1", "o2", "f1", "f2", "a1", "a2"];
+let rows = [];
+for (let i = 0; i < values.length; i++) {
+  let row = "";
+  for (let j = 0; j < values.length; j++) {
+    const eq = values[i] === values[j];
+    const ne = values[i] !== values[j];
+    row += (eq ? "1" : "0") + (ne === !eq ? "" : "!");
+  }
+  rows.push(names[i] + " " + row);
+}
+console.log(rows.join("\n"));
+let count = 0;
+for (let k = 0; k < 300; k++) {
+  const v = values[k % values.length];
+  if (v === null) count += 1;
+  if (v === undefined) count += 10;
+  if (v === 1) count += 100;
+  if (v !== "x") count += 1000;
+}
+console.log(count);
+console.log(NaN === NaN, 0 === -0, "x" === "x" + "", o1 === o2, o1 === o1, null === undefined, true === 1);
