@@ -2644,23 +2644,24 @@ impl Vm {
         let base = frame.base;
         let closure = frame.closure();
         let child = closure.proto.protos[i].clone();
-        let mut upvals = Vec::with_capacity(child.upvals.len());
-        for d in &child.upvals {
-            if d.from_local {
+        // The list is sized from the descriptors up front, so it takes one allocation and no growth checks.
+        let upvals: Vec<Value> = child
+            .upvals
+            .iter()
+            .map(|d| {
+                if !d.from_local {
+                    return closure.upvals[d.index as usize].clone();
+                }
                 let slot = &self.stack[base + d.index as usize];
-                let captured = if d.by_value {
-                    slot.clone()
-                } else {
-                    match slot {
-                        Value::Cell(c) => Value::Cell(c.clone()),
-                        other => Value::Cell(Rc::new(RefCell::new(other.clone()))),
-                    }
-                };
-                upvals.push(captured);
-            } else {
-                upvals.push(closure.upvals[d.index as usize].clone());
-            }
-        }
+                if d.by_value {
+                    return slot.clone();
+                }
+                match slot {
+                    Value::Cell(c) => Value::Cell(c.clone()),
+                    other => Value::Cell(Rc::new(RefCell::new(other.clone()))),
+                }
+            })
+            .collect();
         let this = if !child.is_arrow {
             Value::Undef
         } else if closure.proto.is_arrow {
