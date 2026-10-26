@@ -599,6 +599,20 @@ impl<'a> Gen<'a> {
         self.a.mov8_imm(dst, TAG_NUM);
     }
 
+    /// Stores the result of a strict equality, which is in al, at `dst`, negated for `!==`.
+    fn store_result(&mut self, dst: Mem, negate: bool) {
+        if negate {
+            self.a.xor32_imm8(RAX, 1);
+        }
+        self.store_bool(dst);
+    }
+
+    /// Stores the boolean `value` at `dst`, without a register.
+    fn store_known(&mut self, dst: Mem, value: bool) {
+        self.a.mov8_imm(dst, TAG_BOOL);
+        self.a.mov8_imm(dst.at(1), u8::from(value));
+    }
+
     /// Stores the boolean in al at `dst`.
     fn store_bool(&mut self, dst: Mem) {
         self.a.mov8_imm(dst, TAG_BOOL);
@@ -2494,12 +2508,12 @@ impl<'a> Gen<'a> {
                 }
             }
             Op::StrictEq | Op::StrictNe => {
-                // Values of different tags are never strictly equal. Numbers compare as numbers, booleans by their byte,
-                // undefined and null equal themselves, and other references by their pointer. Two strings compare by
-                // their contents in the helper, which this path calls for them.
+                // Values of different tags are never strictly equal, and the result is known from the tags alone. Numbers
+                // compare as numbers, booleans by their byte, undefined and null equal themselves, and other references by
+                // their pointer. Two strings compare by their contents in the helper, which this path calls for them.
                 let (x, y) = (self.temp(d - 2), self.temp(d - 1));
                 let negate = matches!(op, Op::StrictNe);
-                let (differ, equal, numbers, bools, store) = (
+                let (same, numbers, bools, equal, done) = (
                     self.a.label(),
                     self.a.label(),
                     self.a.label(),
@@ -2509,26 +2523,44 @@ impl<'a> Gen<'a> {
                 self.a.movzx_load8(RAX, x);
                 self.a.movzx_load8(RCX, y);
                 self.a.cmp_rr64(RAX, RCX);
-                self.a.jcc(CC_NE, differ);
+                self.a.jcc(CC_E, same);
+                // Both operands are consumed, so a reference that either holds is released. A last reference goes to
+                // the helper, which frees it, before anything is written.
+                self.check_release(x, slow);
+                self.check_release(y, slow);
+                self.release_owned(x);
+                self.release_owned(y);
+                self.store_known(x, negate);
+                self.a.jmp(done);
+                self.a.bind(same);
                 self.a.cmp64_imm8(RAX, TAG_NUM);
                 self.a.jcc(CC_E, numbers);
                 self.a.cmp64_imm8(RAX, TAG_STR);
+                let eq = rt::strict_eq_into as *const () as usize;
                 self.a.jcc(CC_E, slow);
                 self.a.cmp64_imm8(RAX, TAG_BOOL);
                 self.a.jcc(CC_E, bools);
                 self.a.cmp64_imm8(RAX, TAG_NULL);
                 self.a.jcc(CC_BE, equal);
+                // Other references are equal when they point at the same allocation. Both are released after the
+                // comparison, as above.
+                self.check_release(x, slow);
+                self.check_release(y, slow);
                 self.a.mov_load(RCX, x.at(8));
                 self.a.mov_load(RDX, y.at(8));
                 self.a.cmp_rr64(RCX, RDX);
                 self.a.setcc(CC_E, RAX);
-                self.a.jmp(store);
+                self.release_owned(x);
+                self.release_owned(y);
+                self.store_result(x, negate);
+                self.a.jmp(done);
                 self.a.bind(bools);
                 self.a.movzx_load8(RCX, x.at(1));
                 self.a.movzx_load8(RDX, y.at(1));
                 self.a.cmp_rr64(RCX, RDX);
                 self.a.setcc(CC_E, RAX);
-                self.a.jmp(store);
+                self.store_result(x, negate);
+                self.a.jmp(done);
                 self.a.bind(numbers);
                 self.a.movsd_load(0, x.at(8));
                 self.a.movsd_load(1, y.at(8));
@@ -2537,18 +2569,12 @@ impl<'a> Gen<'a> {
                 self.a.setcc(CC_E, RAX);
                 self.a.setcc(CC_NP, RCX);
                 self.a.and8(RAX, RCX);
-                self.a.jmp(store);
-                self.a.bind(differ);
-                self.a.mov_imm32(RAX, 0);
-                self.a.jmp(store);
+                self.store_result(x, negate);
+                self.a.jmp(done);
                 self.a.bind(equal);
-                self.a.mov_imm32(RAX, 1);
-                self.a.bind(store);
-                if negate {
-                    self.a.xor32_imm8(RAX, 1);
-                }
-                self.store_bool(x);
-                let eq = rt::strict_eq_into as *const () as usize;
+                self.store_known(x, !negate);
+                self.a.jmp(done);
+                self.a.bind(done);
                 Fast::Direct(
                     eq,
                     vec![Arg::Addr(x), Arg::Addr(y), Arg::Imm(u64::from(negate))],
