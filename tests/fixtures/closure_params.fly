@@ -1,0 +1,86 @@
+// Parameters that closures capture: copied into them when nothing writes them, and shared when something does.
+function makeAdder(k) { return (x) => x + k; }
+const adders = [];
+for (let i = 0; i < 5; i++) adders.push(makeAdder(i * 10));
+console.log(adders.map((f) => f(1)).join(","));
+// A copy is made when the closure is made, and the parameter itself is only read here.
+function counter(start) {
+  const inc = () => start + 1;
+  const twice = () => inc() + inc();
+  return [inc(), twice(), start];
+}
+console.log(counter(4).join(","));
+// Written in the body: the closure shares the cell and sees the new value.
+function written(k) {
+  const get = () => k;
+  k = k * 2;
+  return get();
+}
+console.log(written(21));
+// Written by a nested closure: every closure sees the same variable.
+function shared(k) {
+  const bump = () => { k += 1; return k; };
+  const read = () => k;
+  bump();
+  bump();
+  return [read(), bump(), read()];
+}
+console.log(shared(10).join(","));
+// Incremented, destructured and used as a `for` target in a nested function.
+function viaUpdate(n) {
+  const f = () => n++;
+  f();
+  return [n, f(), n];
+}
+console.log(viaUpdate(7).join(","));
+function viaPattern(a, b) {
+  const set = () => { [a, b] = [b, a]; };
+  set();
+  return a + "-" + b;
+}
+console.log(viaPattern("x", "y"));
+function viaForOf(list) {
+  const seen = () => list;
+  for (list of [1, 2]) {}
+  return seen();
+}
+console.log(viaForOf([9]));
+// A default value replaces the argument, so it is not copied (the closure still sees the default).
+function withDefault(v = 5) { return () => v; }
+console.log(withDefault()(), withDefault(8)());
+// A parameter captured through two nested closures.
+function deep(a) { return (b) => () => a + b; }
+console.log(deep(3)(4)());
+// A hoisted function declaration that captures a parameter.
+function hoisted(p) {
+  return inner();
+  function inner() { return p * 3; }
+}
+console.log(hoisted(7));
+// A recursive closure that captures a copied parameter.
+function countDown(n) {
+  const step = (m) => (m <= 0 ? [] : [m].concat(step(m - 1)));
+  return step(n);
+}
+console.log(countDown(4).join(" "));
+// A method of a class that captures the constructor's parameter.
+class Box {
+  constructor(label) { this.label = label; this.show = () => this.label + "!"; this.raw = () => label; }
+}
+const b = new Box("hi");
+console.log(b.show(), b.raw());
+// Shadowed by a declaration in a nested function: the parameter is still shared with the closure that writes it.
+function shadow(s) {
+  const f = () => { let s = 1; return s; };
+  const g = () => s;
+  return [f(), g(), s];
+}
+console.log(shadow("kept").join(","));
+// A parameter read by a closure many times in a loop.
+function sum(n) {
+  const add = (x) => x + n;
+  let total = 0;
+  for (let i = 0; i < 100; i++) total = add(total) - n + n;
+  return total;
+}
+console.log(sum(2));

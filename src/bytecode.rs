@@ -166,9 +166,12 @@ pub enum Op {
 /// Describes where a closure finds one captured variable when it is created.
 #[derive(Debug, Clone, Copy)]
 pub struct UpvalDesc {
-    /// True: the cell lives in a local slot of the enclosing frame.
+    /// True: the variable lives in a local slot of the enclosing frame.
     /// False: it is one of the enclosing closure's own upvalues.
     pub from_local: bool,
+    /// True, for a local: the variable is a parameter that nothing writes. The closure keeps a copy of its value, and the
+    /// slot holds the value rather than a cell. False: the closure shares a cell with the enclosing frame.
+    pub by_value: bool,
     pub index: u32,
 }
 

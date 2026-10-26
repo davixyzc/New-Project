@@ -317,8 +317,11 @@ pub(crate) fn call_numbers(closure: &Rc<Closure>, args: &[f64]) -> Option<Value>
     }
     if let Some(upval) = spec.self_upval {
         let is_self = match closure.upvals.get(upval as usize) {
-            Some(cell) => matches!(&*cell.borrow(), Value::Func(f) if Rc::ptr_eq(f, closure)),
-            None => false,
+            Some(Value::Cell(cell)) => {
+                matches!(&*cell.borrow(), Value::Func(f) if Rc::ptr_eq(f, closure))
+            }
+            Some(Value::Func(f)) => Rc::ptr_eq(f, closure),
+            _ => false,
         };
         if !is_self {
             return None;

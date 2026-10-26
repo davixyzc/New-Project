@@ -32,6 +32,11 @@ struct Compiler {
 struct FuncState {
     /// Names that nested functions refer to. Locals with these names live in cells.
     captured: HashSet<String>,
+    /// Parameters that nested functions refer to, which are copied into them, since nothing assigns them (see
+    /// `UpvalDesc::by_value`). They are not cells.
+    by_value: HashSet<String>,
+    /// The slots of the parameters in `by_value`.
+    by_value_slots: HashSet<u32>,
     /// For each slot, whether its current occupant is a cell.
     slot_boxed: Vec<bool>,
     code: Vec<Op>,
@@ -89,9 +94,11 @@ enum Ref {
 }
 
 impl FuncState {
-    fn new(captured: HashSet<String>, line: u32) -> Self {
+    fn new(captured: HashSet<String>, by_value: HashSet<String>, line: u32) -> Self {
         FuncState {
             captured,
+            by_value,
+            by_value_slots: HashSet::new(),
             slot_boxed: Vec::new(),
             code: Vec::new(),
             lines: Vec::new(),
@@ -114,10 +121,18 @@ impl FuncState {
 
 // ----- capture analysis -------------------------------------------------------
 
-/// Names that nested functions in `def` refer to. Over-approximating is safe: a local that
-/// is boxed needlessly only runs a little slower.
-fn captured_names(def: &FuncDef) -> HashSet<String> {
-    let mut out = HashSet::new();
+/// What the body of a function mentions. Over-approximating is safe: a local that is boxed needlessly only runs a
+/// little slower, and a parameter that is not copied only keeps its cell.
+#[derive(Default)]
+struct Mentions {
+    /// The names that nested functions refer to.
+    captured: HashSet<String>,
+    /// The names that the function, or a function nested in it, assigns or declares.
+    written: HashSet<String>,
+}
+
+fn mentions_of(def: &FuncDef) -> Mentions {
+    let mut out = Mentions::default();
     if def.has_inner {
         for p in &def.params {
             if let Some(d) = &p.default {
@@ -132,30 +147,66 @@ fn captured_names(def: &FuncDef) -> HashSet<String> {
 }
 
 /// Records a name when inside a nested function. Outside one, names are not captures.
-fn note(name: &str, nested: bool, out: &mut HashSet<String>) {
-    if nested && !out.contains(name) {
-        out.insert(name.to_string());
+fn note(name: &str, nested: bool, out: &mut Mentions) {
+    if nested && !out.captured.contains(name) {
+        out.captured.insert(name.to_string());
     }
 }
 
-/// Everything a nested function mentions is a potential capture.
-fn scan_func(def: &FuncDef, out: &mut HashSet<String>) {
+/// Records a name that is assigned or declared.
+fn wrote(name: &str, out: &mut Mentions) {
+    if !out.written.contains(name) {
+        out.written.insert(name.to_string());
+    }
+}
+
+/// Records the names that an assignment target writes: a name, or the names inside a destructuring pattern.
+fn wrote_target(e: &Expr, out: &mut Mentions) {
+    match e {
+        Expr::Ident(name) => wrote(name, out),
+        Expr::Array(items) => {
+            for item in items {
+                wrote_target(item, out);
+            }
+        }
+        Expr::Object(props) => {
+            for (_, v) in props {
+                wrote_target(v, out);
+            }
+        }
+        Expr::Spread(x) => wrote_target(x, out),
+        Expr::Assign(_, target, _) => wrote_target(target, out),
+        _ => {}
+    }
+}
+
+/// Everything a nested function mentions is a potential capture. Its own parameters, rest parameter and name are
+/// declarations, and so are written names of the enclosing function.
+fn scan_func(def: &FuncDef, out: &mut Mentions) {
     for p in &def.params {
+        wrote(&p.name, out);
         if let Some(d) = &p.default {
             scan_expr(d, true, out);
         }
+    }
+    if let Some(rest) = &def.rest {
+        wrote(rest, out);
+    }
+    if let Some(name) = &def.name {
+        wrote(name, out);
     }
     for s in &def.body {
         scan_stmt(s, true, out);
     }
 }
 
-fn scan_stmt(s: &Stmt, nested: bool, out: &mut HashSet<String>) {
+fn scan_stmt(s: &Stmt, nested: bool, out: &mut Mentions) {
     match s {
         Stmt::Expr(e, _) | Stmt::Throw(e, _) => scan_expr(e, nested, out),
         Stmt::Var(_, decls, _) => {
             for (name, init) in decls {
                 note(name, nested, out);
+                wrote(name, out);
                 if let Some(e) = init {
                     scan_expr(e, nested, out);
                 }
@@ -207,6 +258,7 @@ fn scan_stmt(s: &Stmt, nested: bool, out: &mut HashSet<String>) {
             name, iter, body, ..
         } => {
             note(name, nested, out);
+            wrote(name, out);
             scan_expr(iter, nested, out);
             scan_stmt(body, nested, out);
         }
@@ -223,6 +275,7 @@ fn scan_stmt(s: &Stmt, nested: bool, out: &mut HashSet<String>) {
             }
             if let Some(p) = param {
                 note(p, nested, out);
+                wrote(p, out);
             }
             for s in handler.iter().flatten() {
                 scan_stmt(s, nested, out);
@@ -250,7 +303,7 @@ fn scan_stmt(s: &Stmt, nested: bool, out: &mut HashSet<String>) {
     }
 }
 
-fn scan_expr(e: &Expr, nested: bool, out: &mut HashSet<String>) {
+fn scan_expr(e: &Expr, nested: bool, out: &mut Mentions) {
     match e {
         Expr::Ident(name) => note(name, nested, out),
         Expr::Func(def) => scan_func(def, out),
@@ -265,11 +318,16 @@ fn scan_expr(e: &Expr, nested: bool, out: &mut HashSet<String>) {
             }
         }
         Expr::Unary(_, x) | Expr::Spread(x) | Expr::Member(x, _) => scan_expr(x, nested, out),
-        Expr::Update { target, .. } => scan_expr(target, nested, out),
-        Expr::Binary(_, a, b)
-        | Expr::Logical(_, a, b)
-        | Expr::Assign(_, a, b)
-        | Expr::Index(a, b) => {
+        Expr::Update { target, .. } => {
+            wrote_target(target, out);
+            scan_expr(target, nested, out);
+        }
+        Expr::Assign(_, a, b) => {
+            wrote_target(a, out);
+            scan_expr(a, nested, out);
+            scan_expr(b, nested, out);
+        }
+        Expr::Binary(_, a, b) | Expr::Logical(_, a, b) | Expr::Index(a, b) => {
             scan_expr(a, nested, out);
             scan_expr(b, nested, out);
         }
@@ -540,7 +598,11 @@ impl Compiler {
     /// Declares a variable of the current scope. It is a cell only if a nested function uses its name.
     fn declare(&mut self, name: &str, is_const: bool) -> u32 {
         let slot = self.alloc_slot();
-        let boxed = self.fs().captured.contains(name);
+        let by_value = self.fs().by_value.contains(name);
+        if by_value {
+            self.fs().by_value_slots.insert(slot);
+        }
+        let boxed = self.fs().captured.contains(name) && !by_value;
         let was_boxed = std::mem::replace(&mut self.fs().slot_boxed[slot as usize], boxed);
         if was_boxed && !boxed {
             // The slot may still hold the cell of an earlier variable. Clear it before use.
@@ -610,6 +672,7 @@ impl Compiler {
             Ref::Local { slot, is_const } => (
                 UpvalDesc {
                     from_local: true,
+                    by_value: self.funcs[level - 1].by_value_slots.contains(&slot),
                     index: slot,
                 },
                 is_const,
@@ -617,6 +680,7 @@ impl Compiler {
             Ref::Upval { index, is_const } => (
                 UpvalDesc {
                     from_local: false,
+                    by_value: false,
                     index,
                 },
                 is_const,
@@ -729,8 +793,21 @@ impl Compiler {
     // ----- functions --------------------------------------------------------
 
     fn function(&mut self, def: &FuncDef) -> Result<Proto, String> {
+        let mentions = mentions_of(def);
+        // A parameter that nested functions refer to is copied into them when nothing writes it. A default value
+        // replaces the argument, so such a parameter is not copied.
+        let by_value = def
+            .params
+            .iter()
+            .filter(|p| {
+                p.default.is_none()
+                    && mentions.captured.contains(&p.name)
+                    && !mentions.written.contains(&p.name)
+            })
+            .map(|p| p.name.clone())
+            .collect();
         self.funcs
-            .push(FuncState::new(captured_names(def), def.line));
+            .push(FuncState::new(mentions.captured, by_value, def.line));
         self.enter_scope();
         let nfixed = def.params.len() as u32;
         for p in &def.params {

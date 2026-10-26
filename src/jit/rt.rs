@@ -342,9 +342,10 @@ pub unsafe extern "C" fn move_into(src: *mut Value, dst: *mut Value) {
 /// # Safety
 /// `vm` must be the running VM, with a frame on it. `dst` must be a dead slot.
 pub unsafe extern "C" fn upval_into(vm: *mut Vm, idx: usize, dst: *mut Value) {
-    let v = (*vm).frames.last().unwrap().closure().upvals[idx]
-        .borrow()
-        .clone();
+    let v = match &(*vm).frames.last().unwrap().closure().upvals[idx] {
+        Value::Cell(cell) => cell.borrow().clone(),
+        value => value.clone(),
+    };
     ptr::write(dst, v);
 }
 

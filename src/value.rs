@@ -341,7 +341,9 @@ pub struct NativeDef {
 /// A user function together with the variables it captured.
 pub struct Closure {
     pub proto: Rc<Proto>,
-    pub upvals: Vec<Rc<RefCell<Value>>>,
+    /// The captured variables: a `Value::Cell` for a variable that is shared with the enclosing frame, or the value
+    /// itself for a parameter copied in (see `UpvalDesc::by_value`).
+    pub upvals: Vec<Value>,
     /// `this` captured at creation time; only used by arrow functions.
     pub this: Value,
     /// What the function holds as a class or as a constructor (see `ClassInfo`). Most functions hold none.
@@ -477,7 +479,7 @@ pub enum Value {
     Obj(ObjRef),
     Func(Rc<Closure>),
     Native(&'static NativeDef),
-    /// A boxed local. It only ever sits in a frame slot and is never visible to user code.
+    /// A boxed local. It sits in a frame slot or in the upvalues of a closure, and is never visible to user code.
     Cell(Rc<RefCell<Value>>),
 }
 

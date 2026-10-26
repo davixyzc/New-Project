@@ -1792,14 +1792,19 @@ impl Vm {
             }
 
             Op::GetUpval(i) => {
-                let v = self.frames.last().unwrap().closure().upvals[i as usize]
-                    .borrow()
-                    .clone();
+                let v = match &self.frames.last().unwrap().closure().upvals[i as usize] {
+                    Value::Cell(cell) => cell.borrow().clone(),
+                    value => value.clone(),
+                };
                 self.stack.push(v);
             }
             Op::SetUpval(i) => {
                 let v = self.top().clone();
-                *self.frames.last().unwrap().closure().upvals[i as usize].borrow_mut() = v;
+                match &self.frames.last().unwrap().closure().upvals[i as usize] {
+                    Value::Cell(cell) => *cell.borrow_mut() = v,
+                    // The compiler gives no assignment to a parameter that is copied into a closure.
+                    _ => unreachable!("an assignment to a parameter copied into a closure"),
+                }
             }
 
             Op::GetGlobal(i) => {
@@ -2642,11 +2647,16 @@ impl Vm {
         let mut upvals = Vec::with_capacity(child.upvals.len());
         for d in &child.upvals {
             if d.from_local {
-                let cell = match &self.stack[base + d.index as usize] {
-                    Value::Cell(c) => c.clone(),
-                    other => Rc::new(RefCell::new(other.clone())),
+                let slot = &self.stack[base + d.index as usize];
+                let captured = if d.by_value {
+                    slot.clone()
+                } else {
+                    match slot {
+                        Value::Cell(c) => Value::Cell(c.clone()),
+                        other => Value::Cell(Rc::new(RefCell::new(other.clone()))),
+                    }
                 };
-                upvals.push(cell);
+                upvals.push(captured);
             } else {
                 upvals.push(closure.upvals[d.index as usize].clone());
             }

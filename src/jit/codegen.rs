@@ -32,6 +32,7 @@ pub(super) const TAG_BOOL: u8 = 2;
 pub(super) const TAG_NUM: u8 = 3;
 const TAG_STR: u8 = 4;
 pub(super) const TAG_ARR: u8 = 5;
+const TAG_CELL: u8 = 9;
 const TAG_OBJ: u8 = 6;
 const TAG_FUNC: u8 = 7;
 const TAG_NATIVE: u8 = 8;
@@ -2080,18 +2081,37 @@ impl<'a> Gen<'a> {
                         disp: upvals + layout.buf,
                     },
                 );
+                // Each upvalue is a value, which is a cell for a variable that the enclosing frame shares. A copied value
+                // is read where it is, and a cell's value is read through the cell's allocation.
+                let (copied, read) = (self.a.label(), self.a.label());
+                self.a.movzx_load8(
+                    RAX,
+                    Mem {
+                        base: RDX,
+                        disp: 16 * i as i32,
+                    },
+                );
+                self.a.cmp64_imm8(RAX, TAG_CELL);
+                self.a.jcc(CC_NE, copied);
                 self.a.mov_load(
                     RDX,
                     Mem {
                         base: RDX,
-                        disp: 8 * i as i32,
+                        disp: 16 * i as i32 + 8,
                     },
                 );
-                // The cell's allocation holds the value, which is copied and counted as a clone counts it.
+                // The value is copied and counted as a clone counts it.
                 self.load_clone(Mem {
                     base: RDX,
                     disp: cell_value,
                 });
+                self.a.jmp(read);
+                self.a.bind(copied);
+                self.load_clone(Mem {
+                    base: RDX,
+                    disp: 16 * i as i32,
+                });
+                self.a.bind(read);
                 self.a.mov_store(dst, RAX);
                 self.a.mov_store(dst.at(8), RCX);
                 self.a.jmp(done);
