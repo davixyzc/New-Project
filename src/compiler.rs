@@ -775,6 +775,7 @@ impl Compiler {
             global_hints: vec![Cell::new(0); fs.names.len()],
             call_entry: Cell::new(0),
             call_frame_len: Cell::new(0),
+            call_argc: Cell::new(u32::MAX),
             names: fs.names,
             protos: fs.protos,
             upvals: fs.upvals.iter().map(|(_, d, _)| *d).collect(),

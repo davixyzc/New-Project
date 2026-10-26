@@ -874,18 +874,13 @@ impl<'a> Gen<'a> {
             },
         );
         self.a.add64_imm32(RDX, super::RC_VALUE);
-        // The code must be compiled, and the function must take the arguments of this call and no rest parameter.
+        // The code must be compiled, and the function must take the arguments of this call and no rest parameter. The
+        // count in `call_argc` says both: it is set together with `call_entry`, and is `u32::MAX` otherwise.
         self.a
             .mov_load(R8, proto_field(std::mem::offset_of!(Proto, call_entry)));
-        self.a.test64(R8, R8);
-        self.a.jcc(CC_E, generic);
         self.a
-            .mov32_load(R9, proto_field(std::mem::offset_of!(Proto, nparams)));
+            .mov32_load(R9, proto_field(std::mem::offset_of!(Proto, call_argc)));
         self.a.cmp64_imm32(R9, argc);
-        self.a.jcc(CC_NE, generic);
-        self.a
-            .movzx_load8(R9, proto_field(std::mem::offset_of!(Proto, has_rest)));
-        self.a.test32(R9, R9);
         self.a.jcc(CC_NE, generic);
         // The frame stack has room for one more frame.
         self.a.mov_load(
@@ -938,7 +933,15 @@ impl<'a> Gen<'a> {
         self.a.add64(RSI, RDI);
         self.a.cmp_rr64(R11, RSI);
         self.a.jcc(CC_A, generic);
-        // The locals that the arguments do not fill start as undefined: their tags are written here.
+        // The locals that the arguments do not fill start as undefined: their tags are written here. A function whose
+        // locals are all arguments has none. R10 is the number of frames, and RDI the bottom of the value stack.
+        let (fill, filled) = (self.a.label(), self.a.label());
+        self.a
+            .mov32_load(R11, proto_field(std::mem::offset_of!(Proto, nlocals)));
+        self.a.cmp64_imm32(R11, argc);
+        self.a.jcc(CC_E, filled);
+        self.a.shl64_imm(R11, 4);
+        self.a.add64(R11, R9);
         self.a.lea(
             RSI,
             Mem {
@@ -946,26 +949,15 @@ impl<'a> Gen<'a> {
                 disp: 16 * (nlocals + d),
             },
         );
-        self.a
-            .mov32_load(RDI, proto_field(std::mem::offset_of!(Proto, nlocals)));
-        self.a.shl64_imm(RDI, 4);
-        self.a.add64(RDI, R9);
-        let (fill, filled) = (self.a.label(), self.a.label());
         self.a.bind(fill);
-        self.a.cmp_rr64(RSI, RDI);
+        self.a.cmp_rr64(RSI, R11);
         self.a.jcc(CC_AE, filled);
         self.a.mov8_imm(Mem { base: RSI, disp: 0 }, TAG_UNDEF);
         self.a.add64_imm32(RSI, 16);
         self.a.jmp(fill);
         self.a.bind(filled);
-        // The caller's ip is saved, and the frame goes after the last one. Every field of it is written.
-        self.a.mov_load(
-            R10,
-            Mem {
-                base: RBX,
-                disp: frames_len,
-            },
-        );
+        // The caller's ip is saved, and the frame goes after the last one. Every field of it is written, and the
+        // caller's ip goes into the caller's frame, which is the one before the new one.
         self.a.imul64_imm(R10, R10, frame_size);
         self.a.mov_load(
             R11,
@@ -975,13 +967,12 @@ impl<'a> Gen<'a> {
             },
         );
         self.a.add64(R11, R10);
-        self.a.mov_imm64(RSI, (ip + 1) as u64);
-        self.a.mov_store(
+        self.a.mov64_store_imm32(
             Mem {
                 base: R11,
                 disp: f_ip - frame_size,
             },
-            RSI,
+            (ip + 1) as i32,
         );
         self.a.mov_store(
             Mem {
@@ -990,45 +981,36 @@ impl<'a> Gen<'a> {
             },
             RCX,
         );
-        self.a.mov_imm64(RSI, 0);
-        self.a.mov_store(
+        self.a.mov64_store_imm32(
             Mem {
                 base: R11,
                 disp: f_ip,
             },
-            RSI,
+            0,
         );
-        self.a.mov_store(
+        self.a.mov64_store_imm32(
             Mem {
                 base: R11,
                 disp: f_handlers,
             },
-            RSI,
+            0,
         );
-        self.a.mov_imm64(R10, 0);
-        self.a.mov_store8(
+        self.a.mov8_imm(
             Mem {
                 base: R11,
                 disp: f_ctor,
             },
-            R10,
+            0,
         );
-        self.a.mov_store8(
+        self.a.mov8_imm(
             Mem {
                 base: R11,
                 disp: f_session,
             },
-            R10,
+            0,
         );
         self.a.mov_rr(R10, R12);
-        self.a.mov_load(
-            RSI,
-            Mem {
-                base: RBX,
-                disp: stack_buf,
-            },
-        );
-        self.a.sub64(R10, RSI);
+        self.a.sub64(R10, RDI);
         self.a.shr64_imm(R10, 4);
         self.a.add64_imm32(R10, nlocals + d - argc);
         self.a.mov_store(
@@ -1038,20 +1020,12 @@ impl<'a> Gen<'a> {
             },
             R10,
         );
-        self.a.mov_load(
-            R10,
+        self.a.add64_mem_imm8(
             Mem {
                 base: RBX,
                 disp: frames_len,
             },
-        );
-        self.a.add64_imm8(R10, 1);
-        self.a.mov_store(
-            Mem {
-                base: RBX,
-                disp: frames_len,
-            },
-            R10,
+            1,
         );
         // The callee runs from its first instruction, with its frame at its first argument.
         self.a.lea(
@@ -1699,11 +1673,9 @@ impl<'a> Gen<'a> {
             self.a.bt(RCX, RAX);
             self.a.jcc(CC_AE, skip);
             self.a.mov_load(RCX, m.at(8));
-            self.a.mov_load(RAX, Mem { base: RCX, disp: 0 });
-            self.a.cmp64_imm8(RAX, 1);
+            self.a.cmp64_mem_imm8(Mem { base: RCX, disp: 0 }, 1);
             self.a.jcc(CC_BE, dead);
-            self.a.add64_imm8(RAX, -1);
-            self.a.mov_store(Mem { base: RCX, disp: 0 }, RAX);
+            self.a.add64_mem_imm8(Mem { base: RCX, disp: 0 }, -1);
             self.a.jmp(skip);
             self.a.bind(dead);
             self.a.lea(RDI, m);
@@ -2773,6 +2745,7 @@ mod tests {
             global_hints: Vec::new(),
             call_entry: Default::default(),
             call_frame_len: Default::default(),
+            call_argc: std::cell::Cell::new(u32::MAX),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,
@@ -2808,6 +2781,7 @@ mod tests {
             global_hints: Vec::new(),
             call_entry: Default::default(),
             call_frame_len: Default::default(),
+            call_argc: std::cell::Cell::new(u32::MAX),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,

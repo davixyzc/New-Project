@@ -190,6 +190,10 @@ pub struct Proto {
     pub call_entry: Cell<usize>,
     /// The stack slots the compiled frame needs, set together with `call_entry`.
     pub call_frame_len: Cell<usize>,
+    /// The number of arguments that native code passes to the compiled function directly, set together with
+    /// `call_entry`: its number of parameters. It is `u32::MAX` when the function has a rest parameter or is not compiled,
+    /// since no call has that many arguments.
+    pub call_argc: Cell<u32>,
     pub protos: Vec<Rc<Proto>>,
     pub upvals: Vec<UpvalDesc>,
     pub nparams: u32,
@@ -211,6 +215,11 @@ impl Proto {
                     if !code.has_numeric_entry() {
                         self.call_entry.set(code.entry() as usize);
                         self.call_frame_len.set(code.frame_len());
+                        self.call_argc.set(if self.has_rest {
+                            u32::MAX
+                        } else {
+                            self.nparams
+                        });
                     }
                 }
                 compiled

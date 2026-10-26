@@ -2107,6 +2107,7 @@ mod tests {
             global_hints: Vec::new(),
             call_entry: Default::default(),
             call_frame_len: Default::default(),
+            call_argc: std::cell::Cell::new(u32::MAX),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams,

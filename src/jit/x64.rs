@@ -363,6 +363,24 @@ impl Asm {
         self.code.push(imm as u8);
     }
 
+    /// `add qword [m], imm8` (a negative `imm` subtracts).
+    pub fn add64_mem_imm8(&mut self, m: Mem, imm: i8) {
+        self.op(None, true, &[0x83], 0, Rm::Mem(m));
+        self.code.push(imm as u8);
+    }
+
+    /// `cmp qword [m], imm8`.
+    pub fn cmp64_mem_imm8(&mut self, m: Mem, imm: i8) {
+        self.op(None, true, &[0x83], 7, Rm::Mem(m));
+        self.code.push(imm as u8);
+    }
+
+    /// `mov qword [m], imm32`, which is sign-extended.
+    pub fn mov64_store_imm32(&mut self, m: Mem, imm: i32) {
+        self.op(None, true, &[0xC7], 0, Rm::Mem(m));
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
     /// `cmp r64, imm32`.
     pub fn cmp64_imm32(&mut self, r: u8, imm: i32) {
         self.op(None, true, &[0x81], 7, Rm::Reg(r));
