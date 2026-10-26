@@ -588,6 +588,53 @@ fn probe_prop_layout() -> Option<PropLayout> {
     })
 }
 
+/// Where the elements of an array sit in memory, for native code (see `jit::codegen`). `vec` is from the allocation of
+/// the array to the `Vec` of its elements, and `buf` and `len` are the pointer and the length within that `Vec`.
+#[derive(Clone, Copy)]
+pub(crate) struct ArrLayout {
+    pub vec: i32,
+    pub buf: i32,
+    pub len: i32,
+}
+
+/// The layout of the elements of an array, when native code can rely on it. It is found once, as `prop_layout` is.
+pub(crate) fn arr_layout() -> Option<ArrLayout> {
+    static LAYOUT: std::sync::OnceLock<Option<ArrLayout>> = std::sync::OnceLock::new();
+    *LAYOUT.get_or_init(probe_arr_layout)
+}
+
+fn probe_arr_layout() -> Option<ArrLayout> {
+    use std::mem::size_of;
+    if !crate::jit::rc_layout_ok()
+        || size_of::<Vec<Value>>() != 3 * size_of::<usize>()
+        || size_of::<Value>() != 16
+    {
+        return None;
+    }
+    // Five slots, of which three are used, so that the length and the capacity differ.
+    let cell = RefCell::new(Vec::with_capacity(5));
+    cell.borrow_mut()
+        .extend([Value::Undef, Value::Undef, Value::Undef]);
+    let cell_value = cell.as_ptr() as usize - &cell as *const _ as usize;
+    let (ptr, len) = {
+        let items = cell.borrow();
+        (items.as_ptr() as usize, items.len())
+    };
+    // SAFETY: the `Vec` is the three words that the size check above confirms, and each is read as a `usize`.
+    let words: [usize; 3] = unsafe { std::mem::transmute_copy(&*cell.as_ptr()) };
+    let word_of = |want: usize| {
+        words
+            .iter()
+            .position(|&w| w == want)
+            .map(|i| (i * size_of::<usize>()) as i32)
+    };
+    Some(ArrLayout {
+        vec: crate::jit::RC_VALUE + cell_value as i32,
+        buf: word_of(ptr)?,
+        len: word_of(len)?,
+    })
+}
+
 /// A hasher for names, which are short: a rotate and a multiply per byte. The default hasher is built for long keys
 /// and is slow on short ones, and a built-in such as `Math` is looked up by name each time it is used.
 #[derive(Default)]

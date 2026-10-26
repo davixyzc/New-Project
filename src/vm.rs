@@ -570,6 +570,11 @@ pub struct Globals {
     index: NameMap<u32>,
 }
 
+/// Where the slots of the globals sit, from the start of the VM, for native code (see `jit::codegen`).
+pub(crate) fn globals_slots_offset() -> i32 {
+    (std::mem::offset_of!(Vm, globals) + std::mem::offset_of!(Globals, slots)) as i32
+}
+
 impl Globals {
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.index.get(name).map(|&i| &self.slots[i as usize].1)

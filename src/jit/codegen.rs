@@ -19,7 +19,8 @@ use super::rt::{self, STATUS_JUMP};
 use super::types::{number_slots, Numbers};
 use super::x64::*;
 use crate::bytecode::{Op, Proto};
-use crate::value::{prop_layout, PropLayout, Value};
+use crate::value::{arr_layout, prop_layout, ArrLayout, PropLayout, Value};
+use crate::vm::{globals_slots_offset, MAX_ARRAY_GROW};
 
 /// Tags of `Value`, the discriminants `#[repr(u8)]` gives its variants.
 const TAG_UNDEF: u8 = 0;
@@ -1125,6 +1126,168 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// Copies the value at `src` into RAX and RCX, and counts one more reference to it if it owns one. RDX is kept.
+    fn load_clone(&mut self, src: Mem) {
+        let plain = self.a.label();
+        self.a.mov_load(RAX, src);
+        self.a.mov_load(RCX, src.at(8));
+        self.a.movzx_load8(R9, src);
+        self.a.mov_imm32(R10, OWNING);
+        self.a.bt(R10, R9);
+        self.a.jcc(CC_AE, plain);
+        self.add_count(RCX, 1);
+        self.a.bind(plain);
+    }
+
+    /// Jumps to `miss` when the value at `v` owns a reference that is the last one, which releasing it would free.
+    fn check_release(&mut self, v: Mem, miss: Label) {
+        let plain = self.a.label();
+        self.a.movzx_load8(R9, v);
+        self.a.mov_imm32(R10, OWNING);
+        self.a.bt(R10, R9);
+        self.a.jcc(CC_AE, plain);
+        self.a.mov_load(R11, v.at(8));
+        self.a.mov_load(R8, Mem { base: R11, disp: 0 });
+        self.a.cmp64_imm8(R8, 1);
+        self.a.jcc(CC_BE, miss);
+        self.a.bind(plain);
+    }
+
+    /// Releases the reference of the value at `v`, when it owns one. Its count must be above one (see `check_release`).
+    fn release_owned(&mut self, v: Mem) {
+        let plain = self.a.label();
+        self.a.movzx_load8(R9, v);
+        self.a.mov_imm32(R10, OWNING);
+        self.a.bt(R10, R9);
+        self.a.jcc(CC_AE, plain);
+        self.a.mov_load(R11, v.at(8));
+        self.add_count(R11, -1);
+        self.a.bind(plain);
+    }
+
+    /// Leaves in RDX the address of the element that `key` indexes in the array at `arr`. The array must be an array,
+    /// and the key a number that is a whole index, as `vm::index_of` accepts. Anything else jumps to `miss`, before
+    /// anything has changed.
+    fn arr_elem(&mut self, arr: Mem, key: Mem, layout: ArrLayout, miss: Label) {
+        self.check_tag(arr, TAG_ARR, miss);
+        self.check_tag(key, TAG_NUM, miss);
+        // The number is a whole index when truncating it and converting it back give the same number. NaN fails the
+        // comparison, which sets the parity flag when the operands are unordered.
+        self.a.movsd_load(0, key.at(8));
+        self.a.cvttsd2si(RAX, 0);
+        self.a.cvtsi2sd(1, RAX);
+        self.a.ucomisd(0, 1);
+        self.a.jcc(CC_NE, miss);
+        self.a.jcc(CC_P, miss);
+        self.a.movsxd(RAX, RAX);
+        // A negative index is huge as an unsigned number, so the bounds below refuse it too.
+        self.a.cmp64_imm32(RAX, MAX_ARRAY_GROW as i32);
+        self.a.jcc(CC_AE, miss);
+        self.a.mov_load(RCX, arr.at(8));
+        self.a.add64_imm32(RCX, layout.vec);
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: RCX,
+                disp: layout.len,
+            },
+        );
+        self.a.cmp_rr64(RAX, RSI);
+        self.a.jcc(CC_AE, miss);
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: RCX,
+                disp: layout.buf,
+            },
+        );
+        self.a.shl64_imm(RAX, 4);
+        self.a.add64(RDX, RAX);
+    }
+
+    /// Leaves the length of the array at `arr` as a number in XMM1 (and in RSI as an integer). Anything that is not an
+    /// array jumps to `miss`.
+    fn arr_length(&mut self, arr: Mem, layout: ArrLayout, miss: Label) {
+        self.check_tag(arr, TAG_ARR, miss);
+        self.a.mov_load(RCX, arr.at(8));
+        self.a.add64_imm32(RCX, layout.vec);
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: RCX,
+                disp: layout.len,
+            },
+        );
+        self.a.cvtsi2sd(1, RSI);
+    }
+
+    /// Copies the global in the slot that `hint` holds into `dst`, when the slot has the name (see `Globals::get_hinted`).
+    /// Any other global jumps to `miss`, and a copy goes on to `done`.
+    fn get_global_native(
+        &mut self,
+        dst: Mem,
+        name: usize,
+        hint: usize,
+        layout: PropLayout,
+        miss: Label,
+        done: Label,
+    ) {
+        // The slots are a `Vec` inside the VM, which RBX points at.
+        self.a.lea(
+            RCX,
+            Mem {
+                base: RBX,
+                disp: globals_slots_offset(),
+            },
+        );
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: RCX,
+                disp: layout.len,
+            },
+        );
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: RCX,
+                disp: layout.buf,
+            },
+        );
+        self.a.mov_imm64(RAX, hint as u64);
+        self.a.mov32_load(RAX, Mem { base: RAX, disp: 0 });
+        self.a.cmp_rr64(RAX, RSI);
+        self.a.jcc(CC_AE, miss);
+        self.a.imul64_imm(RAX, RAX, layout.entry);
+        self.a.add64(RDX, RAX);
+        self.a.mov_imm64(RAX, name as u64);
+        for word in [0, 8] {
+            self.a.mov_load(
+                RSI,
+                Mem {
+                    base: RAX,
+                    disp: word,
+                },
+            );
+            self.a.mov_load(
+                RDI,
+                Mem {
+                    base: RDX,
+                    disp: layout.key + word,
+                },
+            );
+            self.a.cmp_rr64(RSI, RDI);
+            self.a.jcc(CC_NE, miss);
+        }
+        self.load_clone(Mem {
+            base: RDX,
+            disp: layout.value,
+        });
+        self.a.mov_store(dst, RAX);
+        self.a.mov_store(dst.at(8), RCX);
+        self.a.jmp(done);
+    }
+
     /// Copies the value of the property that `prop_entry` finds into `dst`, and jumps to `done`. A `consumed` object is
     /// the one that the instruction replaces, so its reference is released here, and it must not be the last one (the
     /// helper frees an object that the last reference leaves).
@@ -1641,6 +1804,17 @@ impl<'a> Gen<'a> {
                     self.a.bind(native_miss);
                 }
                 if &*self.proto.names[i as usize] == "length" {
+                    if let Some(layout) = arr_layout() {
+                        // The length of an array is read here, and the array, which is replaced, is released.
+                        let native_miss = self.a.label();
+                        self.arr_length(top, layout, native_miss);
+                        self.check_release(top, native_miss);
+                        self.release_owned(top);
+                        self.a.mov8_imm(top, TAG_NUM);
+                        self.a.movsd_store(top.at(8), 1);
+                        self.a.jmp(done);
+                        self.a.bind(native_miss);
+                    }
                     // The length of a string is read here, in place. Any other value takes the lookup.
                     self.check_tag(top, TAG_STR, lookup);
                     self.a.lea(RDI, top);
@@ -1693,6 +1867,17 @@ impl<'a> Gen<'a> {
                     self.get_prop_native(src, dst, site, false, native_miss, done);
                     self.a.bind(native_miss);
                 }
+                if &*self.proto.names[n as usize] == "length" {
+                    if let Some(layout) = arr_layout() {
+                        // The length of an array in a local is read here.
+                        let native_miss = self.a.label();
+                        self.arr_length(src, layout, native_miss);
+                        self.a.mov8_imm(dst, TAG_NUM);
+                        self.a.movsd_store(dst.at(8), 1);
+                        self.a.jmp(done);
+                        self.a.bind(native_miss);
+                    }
+                }
                 if &*self.proto.names[n as usize] == "push" {
                     // The `push` of an array is the built-in, so it is written here, without a lookup.
                     self.check_tag(src, TAG_ARR, lookup);
@@ -1723,45 +1908,120 @@ impl<'a> Gen<'a> {
                 // Replaces an array and a number in range by the element. Other operands take the slow path.
                 let (obj, key) = (self.temp(d - 2), self.temp(d - 1));
                 let get = rt::get_index_top as *const () as usize;
+                let done = self.a.label();
+                if let Some(layout) = arr_layout() {
+                    // An element of an array is read in place. The array is replaced, so it must have another reference.
+                    let native_miss = self.a.label();
+                    self.arr_elem(obj, key, layout, native_miss);
+                    self.check_release(obj, native_miss);
+                    self.load_clone(Mem { base: RDX, disp: 0 });
+                    self.release_owned(obj);
+                    self.a.mov_store(obj, RAX);
+                    self.a.mov_store(obj.at(8), RCX);
+                    self.a.jmp(done);
+                    self.a.bind(native_miss);
+                }
                 self.direct_call(get, &[Arg::Addr(obj), Arg::Addr(key)]);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
+                self.a.bind(done);
                 Fast::Guarded
             }
             Op::SetIndex => {
                 // Replaces an array, a number and a value by the value, of which the element keeps a copy.
                 let (obj, key, val) = (self.temp(d - 3), self.temp(d - 2), self.temp(d - 1));
                 let set = rt::set_index_top as *const () as usize;
+                let done = self.a.label();
+                if let Some(layout) = arr_layout() {
+                    // An element of an array is stored in place. The array and the old element are released, so each
+                    // must have another reference.
+                    let native_miss = self.a.label();
+                    self.arr_elem(obj, key, layout, native_miss);
+                    self.check_release(obj, native_miss);
+                    self.check_release(Mem { base: RDX, disp: 0 }, native_miss);
+                    self.load_clone(val);
+                    self.release_owned(Mem { base: RDX, disp: 0 });
+                    self.a.mov_store(Mem { base: RDX, disp: 0 }, RAX);
+                    self.a.mov_store(Mem { base: RDX, disp: 8 }, RCX);
+                    self.release_owned(obj);
+                    self.a.mov_store(obj, RAX);
+                    self.a.mov_store(obj.at(8), RCX);
+                    self.a.jmp(done);
+                    self.a.bind(native_miss);
+                }
                 self.direct_call(set, &[Arg::Addr(obj), Arg::Addr(key), Arg::Addr(val)]);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
+                self.a.bind(done);
                 Fast::Guarded
             }
             Op::GetIndexLocal(i) => {
                 // Replaces the key by the element of an array or string in a local. Other operands take the slow path.
                 let (obj, key) = (self.local(i), self.temp(d - 1));
                 let get = rt::get_index_local as *const () as usize;
+                let done = self.a.label();
+                if let Some(layout) = arr_layout() {
+                    // An element of an array in a local is read in place, into the key's slot.
+                    let native_miss = self.a.label();
+                    self.arr_elem(obj, key, layout, native_miss);
+                    self.load_clone(Mem { base: RDX, disp: 0 });
+                    self.a.mov_store(key, RAX);
+                    self.a.mov_store(key.at(8), RCX);
+                    self.a.jmp(done);
+                    self.a.bind(native_miss);
+                }
                 self.direct_call(get, &[Arg::Addr(obj), Arg::Addr(key)]);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
+                self.a.bind(done);
                 Fast::Guarded
             }
             Op::GetIndex2Local(i) => {
                 // Replaces the two keys by an element of a row of an array in a local. Other operands take the slow path.
                 let (obj, k1, k2) = (self.local(i), self.temp(d - 2), self.temp(d - 1));
                 let get = rt::get_index2_local as *const () as usize;
+                let done = self.a.label();
+                if let Some(layout) = arr_layout() {
+                    // An element of a row of an array in a local is read in place, into the first key's slot.
+                    let native_miss = self.a.label();
+                    self.arr_elem(obj, k1, layout, native_miss);
+                    self.arr_elem(Mem { base: RDX, disp: 0 }, k2, layout, native_miss);
+                    self.load_clone(Mem { base: RDX, disp: 0 });
+                    self.a.mov_store(k1, RAX);
+                    self.a.mov_store(k1.at(8), RCX);
+                    self.a.jmp(done);
+                    self.a.bind(native_miss);
+                }
                 self.direct_call(get, &[Arg::Addr(obj), Arg::Addr(k1), Arg::Addr(k2)]);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
+                self.a.bind(done);
                 Fast::Guarded
             }
             Op::SetIndexLocal(i) => {
                 // Replaces the key and the value by the value, of which the element keeps a copy.
                 let (obj, key, val) = (self.local(i), self.temp(d - 2), self.temp(d - 1));
                 let set = rt::set_index_local as *const () as usize;
+                let done = self.a.label();
+                if let Some(layout) = arr_layout() {
+                    // An element of an array in a local is stored in place. The old element is released, so it must
+                    // have another reference.
+                    let native_miss = self.a.label();
+                    self.arr_elem(obj, key, layout, native_miss);
+                    self.check_release(Mem { base: RDX, disp: 0 }, native_miss);
+                    self.load_clone(val);
+                    self.release_owned(Mem { base: RDX, disp: 0 });
+                    self.a.mov_store(Mem { base: RDX, disp: 0 }, RAX);
+                    self.a.mov_store(Mem { base: RDX, disp: 8 }, RCX);
+                    self.a.mov_store(key, RAX);
+                    self.a.mov_store(key.at(8), RCX);
+                    self.a.jmp(done);
+                    self.a.bind(native_miss);
+                }
                 self.direct_call(set, &[Arg::Addr(obj), Arg::Addr(key), Arg::Addr(val)]);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
+                self.a.bind(done);
                 Fast::Guarded
             }
             Op::SetIndex2Local(i) => {
@@ -1773,12 +2033,29 @@ impl<'a> Gen<'a> {
                     self.temp(d - 1),
                 );
                 let set = rt::set_index2_local as *const () as usize;
+                let done = self.a.label();
+                if let Some(layout) = arr_layout() {
+                    // An element of a row of an array in a local is stored in place, into the first key's slot.
+                    let native_miss = self.a.label();
+                    self.arr_elem(obj, k1, layout, native_miss);
+                    self.arr_elem(Mem { base: RDX, disp: 0 }, k2, layout, native_miss);
+                    self.check_release(Mem { base: RDX, disp: 0 }, native_miss);
+                    self.load_clone(val);
+                    self.release_owned(Mem { base: RDX, disp: 0 });
+                    self.a.mov_store(Mem { base: RDX, disp: 0 }, RAX);
+                    self.a.mov_store(Mem { base: RDX, disp: 8 }, RCX);
+                    self.a.mov_store(k1, RAX);
+                    self.a.mov_store(k1.at(8), RCX);
+                    self.a.jmp(done);
+                    self.a.bind(native_miss);
+                }
                 self.direct_call(
                     set,
                     &[Arg::Addr(obj), Arg::Addr(k1), Arg::Addr(k2), Arg::Addr(val)],
                 );
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
+                self.a.bind(done);
                 Fast::Guarded
             }
             Op::GetGlobal(i) => {
@@ -1793,9 +2070,17 @@ impl<'a> Gen<'a> {
                     Arg::Addr(dst),
                     Arg::Imm(hint as u64),
                 ];
+                let done = self.a.label();
+                if let Some(layout) = prop_layout() {
+                    // A global is read in place, when its hinted slot has the name (see `get_global_native`).
+                    let native_miss = self.a.label();
+                    self.get_global_native(dst, name, hint, layout, native_miss, done);
+                    self.a.bind(native_miss);
+                }
                 self.direct_call(get, &args);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
+                self.a.bind(done);
                 Fast::Guarded
             }
             Op::SetProp(i) => {

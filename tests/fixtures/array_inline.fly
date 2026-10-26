@@ -1,0 +1,81 @@
+// Element reads and writes from compiled code: globals and locals, rows, misses, growth, and reference counts.
+const G = [10, 20, 30, 40];
+let gsum = 0;
+for (let i = 0; i < 1000; i++) { gsum += G[i % 4]; G[i % 4] = G[i % 4] + 1; }
+console.log("global", gsum, G[0], G[3], G.length);
+
+const grid = [];
+for (let y = 0; y < 5; y++) { const row = []; for (let x = 0; x < 6; x++) row.push(x * y); grid.push(row); }
+let gridSum = 0;
+for (let y = 0; y < 5; y++) for (let x = 0; x < 6; x++) { gridSum += grid[y][x]; grid[y][x] = grid[y][x] + 1; }
+console.log("grid", gridSum, grid[4][5], grid[0].length, grid.length);
+
+function local(n) {
+  const a = [];
+  for (let i = 0; i < n; i++) a.push(i * 3);
+  let s = 0;
+  for (let i = 0; i < n; i++) { s += a[i]; a[i] = a[i] - 1; }
+  let t = 0;
+  for (let i = 0; i < a.length; i++) t += a[i];
+  return s * 1000 + t;
+}
+console.log("local", local(300));
+
+function misses() {
+  const a = [1, 2, 3];
+  const out = [];
+  out.push(a[5], a[-1], a[1.5], a["1"], a[NaN], a[-0], a[Infinity], a[1e10]);
+  a[2] = 7;
+  out.push(a.length, a[2]);
+  return out.join(",");
+}
+console.log("misses", misses());
+
+function growth() {
+  const a = [];
+  for (let i = 0; i < 50; i++) a[i] = i * i;
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i];
+  a[60] = 1;
+  return s + ":" + a.length + ":" + a[55];
+}
+console.log("growth", growth());
+
+const alias = [1, 2, 3];
+const other = alias;
+for (let i = 0; i < 6; i++) other[i % 3] = other[i % 3] * 2;
+console.log("alias", alias[0], alias[1], alias[2], other === alias);
+
+const self = [0, 1];
+self[0] = self;
+console.log("self", self[0][1], self[0][0][1]);
+
+const objs = [{ v: 1 }, { v: 2 }];
+let ov = 0;
+for (let i = 0; i < 200; i++) { ov += objs[i % 2].v; objs[i % 2] = { v: objs[i % 2].v + 1 }; }
+console.log("objects", ov, objs[0].v, objs[1].v);
+
+const shared = [{ v: 5 }];
+const keep = [shared[0]];
+for (let i = 0; i < 3; i++) shared[0] = { v: i };
+console.log("keep", keep[0].v, shared[0].v);
+
+const strs = ["ab", "cd"];
+let chars = "";
+for (let i = 0; i < 4; i++) chars += strs[i % 2][i % 2];
+console.log("strings", chars, "abc"[1], "abc".length);
+
+let len = 0;
+const grow = [];
+for (let i = 0; i < 40; i++) { grow.push(i); len = grow.length; }
+console.log("length", len, grow[39]);
+
+try { const nn = null; nn[0] = 1; } catch (e) { console.log("null", e instanceof TypeError); }
+
+const sparse = [1, undefined, 3];
+console.log("undef", sparse[1] === undefined, sparse[2]);
+
+const nested = [[1, 2], [3, 4]];
+let ns = 0;
+for (let r = 0; r < 100; r++) { nested[r % 2][r % 2] = nested[r % 2][r % 2] + 1; ns += nested[1][1]; }
+console.log("nested", ns, nested[0][0], nested[1][1]);
