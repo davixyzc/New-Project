@@ -98,39 +98,39 @@ Medido nesta máquina (Xeon 2,1 GHz, 4 vCPU), em tempo de parede do processo int
 
 | benchmark | fly ms | Node ms | Bun ms | fly em relação ao melhor dos outros | resultado |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `array` | 64,4 | 99,6 | 60,0 | 0,93× | perde |
-| `binary_trees` | 106,9 | 58,0 | 43,0 | 0,40× | perde |
-| `char_codes` | 68,0 | 57,7 | 37,2 | 0,55× | perde |
-| `closures` | 108,3 | 41,1 | 60,2 | 0,38× | perde |
-| `console_lines` | 25,9 | 441,2 | 109,7 | 4,24× | fly ganha |
-| `dict_keys` | 12,8 | 45,3 | 23,9 | 1,86× | fly ganha |
-| `exceptions` | 41,1 | 262,0 | 47,4 | 1,15× | fly ganha |
-| `fib` | 9,2 | 42,8 | 14,9 | 1,62× | fly ganha |
-| `json` | 159,7 | 158,0 | 90,9 | 0,57× | perde |
-| `life` | 1230,2 | 200,3 | 142,3 | 0,12× | perde |
-| `loop` | 21,5 | 84,1 | 32,2 | 1,50× | fly ganha |
-| `mandelbrot` | 12,0 | 43,5 | 17,3 | 1,44× | fly ganha |
-| `matrix` | 74,2 | 39,3 | 17,9 | 0,24× | perde |
-| `method_calls` | 133,5 | 38,6 | 14,3 | 0,11× | perde |
-| `nbody_objects` | 282,9 | 41,9 | 17,0 | 0,06× | perde |
-| `num_to_string` | 101,5 | 59,9 | 56,8 | 0,56× | perde |
-| `objects` | 3,6 | 34,9 | 20,0 | 5,63× | fly ganha |
-| `sieve` | 355,8 | 160,6 | 76,1 | 0,21× | perde |
-| `sort_cmp` | 117,8 | 110,3 | 74,2 | 0,63× | perde |
-| `split_join` | 55,5 | 86,3 | 48,7 | 0,88× | perde |
-| `str_index` | 8,8 | 35,0 | 10,3 | 1,18× | fly ganha |
-| `string` | 9,0 | 43,0 | 18,8 | 2,09× | fly ganha |
-| `string_builder` | 54,4 | 105,7 | 67,9 | 1,25× | fly ganha |
-| `tak` | 9,4 | 41,5 | 17,7 | 1,87× | fly ganha |
+| `array` | 49,4 | 112,5 | 60,5 | 1,22× | fly ganha |
+| `binary_trees` | 63,4 | 56,2 | 56,3 | 0,89× | perde |
+| `char_codes` | 42,3 | 61,1 | 46,1 | 1,09× | fly ganha |
+| `closures` | 84,2 | 39,8 | 62,2 | 0,47× | perde |
+| `console_lines` | 20,7 | 549,8 | 89,6 | 4,32× | fly ganha |
+| `dict_keys` | 14,4 | 57,4 | 25,0 | 1,74× | fly ganha |
+| `exceptions` | 33,5 | 328,2 | 68,3 | 2,04× | fly ganha |
+| `fib` | 10,2 | 42,3 | 15,8 | 1,55× | fly ganha |
+| `json` | 120,6 | 183,1 | 79,8 | 0,66× | perde |
+| `life` | 486,7 | 207,4 | 167,5 | 0,34× | perde |
+| `loop` | 32,8 | 70,6 | 40,4 | 1,23× | fly ganha |
+| `mandelbrot` | 16,6 | 54,3 | 19,7 | 1,18× | fly ganha |
+| `matrix` | 22,2 | 44,6 | 24,4 | 1,10× | fly ganha |
+| `method_calls` | 69,6 | 40,3 | 15,9 | 0,23× | perde |
+| `nbody_objects` | 108,6 | 48,9 | 23,0 | 0,21× | perde |
+| `num_to_string` | 44,0 | 74,7 | 90,7 | 1,70× | fly ganha |
+| `objects` | 4,7 | 38,6 | 25,0 | 5,36× | fly ganha |
+| `sieve` | 167,0 | 161,9 | 89,1 | 0,53× | perde |
+| `sort_cmp` | 61,0 | 135,8 | 85,2 | 1,40× | fly ganha |
+| `split_join` | 52,8 | 93,5 | 52,7 | 1,00× | perde |
+| `str_index` | 9,7 | 41,1 | 12,0 | 1,24× | fly ganha |
+| `string` | 9,9 | 61,1 | 22,2 | 2,25× | fly ganha |
+| `string_builder` | 56,4 | 118,9 | 79,9 | 1,42× | fly ganha |
+| `tak` | 11,0 | 45,4 | 18,7 | 1,70× | fly ganha |
 
-**Leitura**: o fly é mais rápido que o Node e o Bun em **11 de 24** programas. Ganha com folga em `console_lines` (4,24×), `objects` (5,63×), `string` (2,09×), `dict_keys` (1,86×), `tak` (1,87×), `fib` (1,62×) e `loop` (1,50×). Ganha por pouco em `mandelbrot` (1,44×), `string_builder` (1,25×), `str_index` (1,18×) e `exceptions` (1,15×). `array` (0,93×) e `split_join` (0,88×) ficam perto de 1×.
+**Leitura**: o fly é mais rápido que o Node e o Bun em **16 de 24** programas. Ganha com folga em `objects` (5,36×), `console_lines` (4,32×), `string` (2,25×), `exceptions` (2,04×), `dict_keys` (1,74×), `num_to_string` (1,70×), `tak` (1,70×), `fib` (1,55×), `string_builder` (1,42×) e `sort_cmp` (1,40×). Ganha por pouco em `loop` (1,23×), `str_index` (1,24×), `array` (1,22×), `mandelbrot` (1,18×), `matrix` (1,10×) e `char_codes` (1,09×).
 
-Perde nos programas em que o tempo está em acessos a propriedades e a elementos de arrays e em chamadas de função: `nbody_objects` (0,06×), `method_calls` (0,11×), `life` (0,12×), `sieve` (0,21×), `matrix` (0,24×), `closures` (0,38×) e `binary_trees` (0,40×). `json` (0,57×), `char_codes` (0,55×), `num_to_string` (0,56×) e `sort_cmp` (0,63×) ficam entre 0,5× e 0,65×.
+Perde nos programas em que o tempo está em chamadas de função e em acessos a propriedades de objetos: `nbody_objects` (0,21×), `method_calls` (0,23×), `life` (0,34×), `closures` (0,47×), `sieve` (0,53×), `json` (0,66×) e `binary_trees` (0,89×). `split_join` (1,00×) fica empatado.
 
-**O objetivo de ser mais rápido em qualquer situação ainda não foi atingido**: 13 das 24 cargas ficam atrás de pelo menos um dos dois. As medições desta rodada mostram onde está o gargalo, e ele está na forma como o código roda, não num auxiliar específico:
+**O objetivo de ser mais rápido em qualquer situação ainda não foi atingido**: 8 das 24 cargas ficam atrás de pelo menos um dos dois. As medições desta rodada mostram onde está o gargalo, e ele está na forma como o código roda, não num auxiliar específico:
 - Em `tak`, antes de compilar as funções com expressões mais fundas, 65% das instruções estavam em chamada e retorno (`callgrind`). Agora `tak` roda em código nativo de números e ficou à frente.
 - Em `nbody_objects`, cerca de um terço das instruções está em leituras e escritas de propriedade: a busca, a cópia do valor e a liberação dele.
-- Em `method_calls`, cada iteração tem cerca de 720 instruções, somando a chamada, os acessos a propriedade e o código gerado para as operações.
+- Em `method_calls`, cada iteração tem cerca de 380 instruções, somando a chamada, os acessos a propriedade e o código gerado para as operações.
 - Ajustes no caminho geral de chamadas mudaram menos de 0,3% das instruções. O custo está espalhado em muitos passos pequenos, e só cai com um quadro de chamada montado pelo próprio código nativo.
 
 Para chegar a 2× ou mais nessas cargas, o código nativo precisa ler elementos e propriedades direto da memória. Isso pede um layout estável para arrays e objetos, que hoje são `Vec` e `RefCell`, sem layout definido. Ver o roadmap.
