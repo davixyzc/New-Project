@@ -1,0 +1,40 @@
+// A deterministic mix of object loops: shapes change, values turn into strings, elements are replaced while
+// locals still hold them, and locals take other objects.
+let seed = 12345;
+function rnd(n) {
+  seed = (seed * 1103515245 + 12345) % 2147483648;
+  return seed % n;
+}
+const pool = [];
+for (let i = 0; i < 25; i++) {
+  const kind = rnd(3);
+  if (kind === 0) pool.push({ a: rnd(10), b: rnd(10), c: 0 });
+  else if (kind === 1) pool.push({ c: 1, a: rnd(10), b: rnd(10) });
+  else pool.push({ z: rnd(5), a: rnd(10), b: rnd(10), c: 2 });
+}
+let acc = 0;
+let strs = "";
+for (let round = 0; round < 12; round++) {
+  for (let i = 0; i < pool.length; i++) {
+    const p = pool[i];
+    for (let j = 0; j < pool.length; j += 3) {
+      const q = pool[j];
+      if (p === q) continue;
+      const diff = q.a - p.a;
+      p.b += diff * 0.5;
+      acc += p.b * q.c;
+      if (round === 7 && j === 6) q.z = "s" + i;
+      if (round === 9 && j === 9) pool[j] = { a: 1, b: 2, c: 3 };
+    }
+  }
+  let last = pool[0];
+  for (let k = 0; k < pool.length; k++) {
+    last = pool[k];
+    acc += last.a * 0.25;
+    if (typeof last.z === "string") strs = strs + last.z.length;
+  }
+}
+console.log(acc.toFixed(3), strs);
+let sumA = 0;
+for (let i = 0; i < pool.length; i++) sumA += pool[i].a + pool[i].b;
+console.log(String(sumA));

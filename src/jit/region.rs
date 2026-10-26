@@ -1,8 +1,11 @@
-//! Code that works on numbers only, with its locals in registers.
+//! Code that works on numbers, with its locals in registers.
 //!
 //! The generic code keeps each local in its frame slot and loads and stores it on every step. Two
-//! kinds of region avoid that for code that cannot run user code or touch the heap: numbers, locals,
-//! arithmetic, comparisons and jumps.
+//! kinds of region avoid that for code that cannot run user code: numbers, locals, arithmetic,
+//! comparisons and jumps. A loop region can also read and write the number properties of an object
+//! in a local, which it reaches in place (see `Mark::View`), take an object out of an array (see
+//! `Mark::Owned`), and call the built-in `sqrt` on `Math`. Each of these checks what it relies on,
+//! and a check that fails leaves the loop at that instruction, which the generic code then runs.
 //!
 //! A loop region loads the loop's locals into xmm registers once, runs the loop on them, and writes
 //! them back when it leaves. A function region is a whole function that the Rust side calls with
@@ -14,14 +17,15 @@
 //! returns at once when it is not a number, so the generic code runs the loop instead.
 
 use super::codegen::{
-    emit_mod_const, int_divisor, local_uses, magic, successors, TAG_ARR, TAG_BOOL, TAG_NUM,
+    emit_mod_const, find_global, find_prop, int_divisor, local_uses, magic, successors, PropSite,
+    OWNING, TAG_ARR, TAG_BOOL, TAG_NATIVE, TAG_NUM, TAG_OBJ,
 };
 use super::rt;
 use super::types::Numbers;
 use super::x64::*;
 use super::Batch;
 use crate::bytecode::{Op, Proto};
-use crate::value::{arr_layout, Value};
+use crate::value::{arr_layout, entry_layout, prop_layout, PropHint, Value};
 use crate::vm::MAX_ARRAY_GROW;
 use std::mem::offset_of;
 
@@ -95,6 +99,12 @@ pub(super) struct Region {
     /// The locals that hold arrays. A loop reads and writes their elements in place, so they have no register,
     /// and the loop checks on entry that they hold an array.
     arrays: Vec<u32>,
+    /// The locals that hold objects, which a loop reads in place (see `Mark::View`). They have no register.
+    pub(super) objects: Vec<u32>,
+    /// The object locals that a path reads from the entry before it writes them, which the loop checks on entry.
+    object_guards: Vec<u32>,
+    /// The instructions that read an element into an object local (see `Mark::Owned`).
+    object_reads: Vec<usize>,
     /// The kind of each operand before each instruction of a loop, from `header` on (see `operand_marks`).
     marks: Vec<Vec<Mark>>,
     /// The instructions of a loop that read or write an element. A side exit resumes the generic code at one of
@@ -123,6 +133,15 @@ enum Mark {
     Push(u32),
     /// The array in local `s`, which only the call of a `push` takes as its receiver. It has no register.
     Array(u32),
+    /// The object in local `s`, read in place: the operand has no register and no slot. The local must not be
+    /// written while the operand is on the stack, since the operand reads the local when it is used.
+    View(u32),
+    /// An object that the operand owns a reference to, kept in the operand's slot of the value stack. Whatever takes it
+    /// releases the reference.
+    Owned,
+    /// The built-in `sqrt`, which a property read of `sqrt` from an object gives. It has no register and no slot. The
+    /// read checks that the property is the built-in (see `Op::GetProp`), and a side exit writes it back.
+    Sqrt,
 }
 
 /// Plans a loop region for the loop whose back jumps go to `header`. `None` if the loop has an
@@ -146,6 +165,38 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
             }
         }
     }
+    // A local that a property read names is an object, unless it is an array, whose length the loop reads in place. An
+    // object local is only read and written as one, so a number operation that uses it is not planned.
+    let mut objects = vec![false; proto.nlocals as usize];
+    for ip in header..=last {
+        if depth[ip] >= 0 {
+            if let Some(s) = object_base(proto, code[ip]) {
+                objects[s as usize] = true;
+            }
+        }
+    }
+    for i in 0..proto.nlocals as usize {
+        if objects[i] && arrays[i] {
+            return None;
+        }
+    }
+    for ip in header..=last {
+        if depth[ip] >= 0
+            && local_uses(code[ip]).iter().any(|&i| objects[i as usize])
+            && !matches!(code[ip], Op::GetLocal(_) | Op::PopToLocal(_))
+        {
+            return None;
+        }
+    }
+    // An element that is stored in an object local is read as an object (see `Mark::Owned`).
+    let object_reads: Vec<usize> = (header..last)
+        .filter(|&ip| {
+            depth[ip] >= 0
+                && depth[ip + 1] >= 0
+                && matches!(code[ip], Op::GetIndexLocal(_))
+                && matches!(code[ip + 1], Op::PopToLocal(i) if objects[i as usize])
+        })
+        .collect();
     let mut resumes = Vec::new();
     let mut entries = vec![header];
     let mut exits = Vec::new();
@@ -178,7 +229,12 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         if !allowed(proto, op) {
             return None;
         }
-        if index_base(op).is_some() || push_base(proto, op).is_some() {
+        // A side exit of an operation that reads or writes an element, a property or an object resumes at it.
+        let object_side = object_base(proto, op).is_some()
+            || matches!(op, Op::GetProp(_) | Op::SetProp(_) | Op::GetGlobal(_))
+            || matches!(op, Op::PopToLocal(i) if objects[i as usize])
+            || (!object_reads.is_empty() && matches!(op, Op::Pop | Op::Dup | Op::Call(1)));
+        if index_base(op).is_some() || push_base(proto, op).is_some() || object_side {
             resumes.push(ip);
         }
         if is_test(op) && !consumed(code, ip) {
@@ -227,7 +283,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         reads.extend(
             reads_of(op)
                 .into_iter()
-                .filter(|&i| !arrays[i as usize])
+                .filter(|&i| !arrays[i as usize] && !objects[i as usize])
                 .map(|i| (ip, i)),
         );
     }
@@ -259,7 +315,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         }
     }
     let mut order: Vec<u32> = (0..proto.nlocals)
-        .filter(|&i| uses[i as usize] > 0 && !arrays[i as usize])
+        .filter(|&i| uses[i as usize] > 0 && !arrays[i as usize] && !objects[i as usize])
         .collect();
     order.sort_by_key(|&i| (std::cmp::Reverse(uses[i as usize]), i));
     // The most used locals take the registers, and the others stay in their frame slots.
@@ -308,7 +364,20 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
             guards.push(i);
         }
     }
-    let marks = operand_marks(proto, depth, header, last, &entries, &arrays)?;
+    let object_guards: Vec<u32> = (0..proto.nlocals)
+        .filter(|&i| {
+            objects[i as usize]
+                && entries
+                    .iter()
+                    .any(|&e| reads_before_write(proto, depth, header, last, e, i))
+        })
+        .collect();
+    let kinds = Kinds {
+        arrays: &arrays,
+        objects: &objects,
+        object_reads: &object_reads,
+    };
+    let marks = operand_marks(proto, depth, header, last, &entries, &kinds)?;
     Some(Region {
         header,
         last,
@@ -320,6 +389,11 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         int_local,
         rem,
         arrays: (0..proto.nlocals).filter(|&i| arrays[i as usize]).collect(),
+        objects: (0..proto.nlocals)
+            .filter(|&i| objects[i as usize])
+            .collect(),
+        object_guards,
+        object_reads,
         marks,
         resumes,
         function: None,
@@ -386,6 +460,9 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
         int_local: None,
         rem: None,
         arrays: Vec::new(),
+        objects: Vec::new(),
+        object_guards: Vec::new(),
+        object_reads: Vec::new(),
         marks: Vec::new(),
         resumes: Vec::new(),
         function: Some(Function {
@@ -613,10 +690,85 @@ fn allowed(proto: &Proto, op: Op) -> bool {
         | Op::SetIndexLocal(_)
         | Op::SetIndex2Local(_) => arr_layout().is_some(),
         // A `push` is the probe of the method and the call that takes its receiver (see `step`).
-        Op::GetLocalProp(_, n) => is_push(proto, n) && arr_layout().is_some(),
+        Op::GetLocalProp(_, n) if is_push(proto, n) || is_length(proto, n) => {
+            arr_layout().is_some()
+        }
+        Op::GetLocalProp(..) | Op::GetProp(_) | Op::SetProp(_) => prop_layout().is_some(),
+        Op::GetGlobal(_) => entry_layout().is_some(),
         Op::Call(1) => arr_layout().is_some(),
         _ => false,
     }
+}
+
+/// Where the planner's knowledge of a loop's locals and element reads goes (see `step`).
+struct Kinds<'a> {
+    /// The locals that hold arrays (see `plan`).
+    arrays: &'a [bool],
+    /// The locals that hold objects (see `plan`).
+    objects: &'a [bool],
+    /// The instructions that read an element into an object local (see `Region::object_reads`).
+    object_reads: &'a [usize],
+}
+
+/// Whether `name` is the property `length`, which an array answers by its length (see `Op::GetLocalProp`).
+fn is_length(proto: &Proto, name: u32) -> bool {
+    &*proto.names[name as usize] == "length"
+}
+
+/// Whether `name` is `sqrt`, which a loop reads from an object and calls (see `Mark::Sqrt`).
+fn is_sqrt(proto: &Proto, name: u32) -> bool {
+    &*proto.names[name as usize] == "sqrt"
+}
+
+/// Whether an operand of this kind has a register (see `Mark`).
+fn has_register(m: &Mark) -> bool {
+    matches!(m, Mark::Num | Mark::Bool | Mark::Elem)
+}
+
+/// The address of the built-in `sqrt`, which a loop compares a property with (see `Mark::Sqrt`).
+fn sqrt_address() -> u64 {
+    crate::builtins::global::sqrt_def() as *const _ as usize as u64
+}
+
+/// The object local that `op` reads a property of, when it is a property other than `push` and `length`.
+fn object_base(proto: &Proto, op: Op) -> Option<u32> {
+    match op {
+        Op::GetLocalProp(s, n) if !is_push(proto, n) && !is_length(proto, n) => Some(s),
+        _ => None,
+    }
+}
+
+/// Whether a path inside the loop, from `start`, reads object local `i` before it writes it.
+fn reads_before_write(
+    proto: &Proto,
+    depth: &[i32],
+    header: usize,
+    last: usize,
+    start: usize,
+    i: u32,
+) -> bool {
+    let code = &proto.code;
+    let mut seen = vec![false; code.len()];
+    let mut work = vec![start];
+    while let Some(ip) = work.pop() {
+        if ip < header || ip > last || seen[ip] || depth[ip] < 0 {
+            continue;
+        }
+        seen[ip] = true;
+        let op = code[ip];
+        if matches!(op, Op::GetLocal(j) if j == i) || object_base(proto, op) == Some(i) {
+            return true;
+        }
+        if matches!(op, Op::SetLocal(j) | Op::PopToLocal(j) if j == i) {
+            continue;
+        }
+        work.extend(
+            successors(op, ip, depth[ip])
+                .into_iter()
+                .map(|(next, _)| next),
+        );
+    }
+    false
 }
 
 /// The array local that an index operation reads or writes, if `op` is one.
@@ -660,7 +812,8 @@ fn pop_kinds(state: &mut Vec<Mark>, n: usize) -> Option<Vec<Mark>> {
 /// Steps the kinds of the operands through `op`. `false` when an operand has a kind that `op` cannot take, or a local
 /// is used in a way that an array does not allow. A boolean and an element read as the number 0 or 1, so arithmetic
 /// and the ordering comparisons take them. Strict equality, a local and an index take numbers only.
-fn step(proto: &Proto, op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
+fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) -> bool {
+    let (arrays, objects) = (kinds.arrays, kinds.objects);
     let plain = |i: u32| !arrays[i as usize];
     let number = |m: &Mark| *m == Mark::Num;
     // A side exit resumes the generic code with the operands of the instruction on the stack, so none of them may be a
@@ -668,13 +821,23 @@ fn step(proto: &Proto, op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
     let side_exit = matches!(
         op,
         Op::GetIndexLocal(_) | Op::GetIndex2Local(_) | Op::SetIndexLocal(_) | Op::SetIndex2Local(_)
-    ) || push_base(proto, op).is_some();
+    ) || push_base(proto, op).is_some()
+        || object_base(proto, op).is_some()
+        || matches!(op, Op::GetProp(_) | Op::SetProp(_) | Op::GetGlobal(_))
+        || matches!(op, Op::PopToLocal(i) if objects[i as usize]);
     if side_exit && state.iter().any(is_receiver) {
         return false;
+    }
+    // A write to a local that a view of it is on the stack would change what the view reads.
+    if let Op::SetLocal(i) | Op::PopToLocal(i) = op {
+        if state.contains(&Mark::View(i)) {
+            return false;
+        }
     }
     match op {
         Op::Const(_) => state.push(Mark::Num),
         Op::True | Op::False => state.push(Mark::Bool),
+        Op::GetGlobal(_) => state.push(Mark::Owned),
         Op::Pop => {
             if pop_kinds(state, 1).is_none() {
                 return false;
@@ -689,6 +852,10 @@ fn step(proto: &Proto, op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
             if n < 2 {
                 return false;
             }
+            // Operands with registers trade them; operands without one trade their slots (see `Op::Swap`).
+            if has_register(&state[n - 1]) != has_register(&state[n - 2]) {
+                return false;
+            }
             state.swap(n - 1, n - 2);
         }
         Op::GetLocalProp(s, n) if is_push(proto, n) => {
@@ -697,11 +864,58 @@ fn step(proto: &Proto, op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
             }
             state.push(Mark::Push(s));
         }
+        Op::GetLocalProp(s, n) if is_length(proto, n) => {
+            if !arrays[s as usize] {
+                return false;
+            }
+            state.push(Mark::Num);
+        }
+        Op::GetLocalProp(s, n) if objects[s as usize] && !is_push(proto, n) => {
+            state.push(Mark::Num)
+        }
+        Op::GetProp(n) if is_sqrt(proto, n) && state.last() == Some(&Mark::Owned) => {
+            state.pop();
+            state.push(Mark::Sqrt);
+        }
+        Op::GetProp(_) => {
+            if !matches!(state.last(), Some(Mark::View(_))) {
+                return false;
+            }
+            state.pop();
+            state.push(Mark::Num);
+        }
+        Op::SetProp(_) => {
+            let n = state.len();
+            if n < 2 || state[n - 1] != Mark::Num || !matches!(state[n - 2], Mark::View(_)) {
+                return false;
+            }
+            state.truncate(n - 2);
+            state.push(Mark::Num);
+        }
+        Op::PopToLocal(i) if objects[i as usize] => match state.last() {
+            Some(Mark::View(_) | Mark::Owned) => {
+                state.pop();
+            }
+            _ => return false,
+        },
+        Op::GetLocal(i) if objects[i as usize] => state.push(Mark::View(i)),
         Op::GetLocal(i) if arrays[i as usize] => state.push(Mark::Array(i)),
         Op::GetLocal(i) => {
             if !plain(i) {
                 return false;
             }
+            state.push(Mark::Num);
+        }
+        // `sqrt` of a number, called on an object: the callee is the built-in, the object is released, and the result is a
+        // number.
+        Op::Call(1)
+            if state.len() >= 3
+                && state[state.len() - 3] == Mark::Sqrt
+                && matches!(state[state.len() - 2], Mark::View(_) | Mark::Owned)
+                && state[state.len() - 1] == Mark::Num =>
+        {
+            let n = state.len();
+            state.truncate(n - 3);
             state.push(Mark::Num);
         }
         // The `push` of an array, whose value is a number or a boolean, with the array as its receiver. The result is
@@ -785,6 +999,13 @@ fn step(proto: &Proto, op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
             Some(kinds) if kinds.iter().all(number) => {}
             _ => return false,
         },
+        Op::GetIndexLocal(_) if kinds.object_reads.contains(&ip) => match state.last() {
+            Some(Mark::Num) => {
+                state.pop();
+                state.push(Mark::Owned);
+            }
+            _ => return false,
+        },
         Op::GetIndexLocal(a) | Op::GetIndex2Local(a) => {
             let keys = if matches!(op, Op::GetIndex2Local(_)) {
                 2
@@ -828,7 +1049,7 @@ fn operand_marks(
     header: usize,
     last: usize,
     entries: &[usize],
-    arrays: &[bool],
+    kinds: &Kinds,
 ) -> Option<Vec<Vec<Mark>>> {
     let code = &proto.code;
     let inside = |ip: usize| (header..=last).contains(&ip);
@@ -841,7 +1062,7 @@ fn operand_marks(
     while let Some(ip) = work.pop() {
         let entered = before[ip - header].clone()?;
         let mut state = entered.clone();
-        if !step(proto, code[ip], &mut state, arrays) {
+        if !step(proto, ip, code[ip], &mut state, kinds) {
             return None;
         }
         for (next, next_depth) in successors(code[ip], ip, depth[ip]) {
@@ -972,6 +1193,10 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
     }
     for &a in &lp.arrays {
         e.a.cmp8_imm(local_mem(a), TAG_ARR);
+        e.a.jcc(CC_NE, not_entered);
+    }
+    for &o in &lp.object_guards {
+        e.a.cmp8_imm(local_mem(o), TAG_OBJ);
         e.a.jcc(CC_NE, not_entered);
     }
     for &(i, home) in &lp.locals {
@@ -1380,12 +1605,30 @@ impl Emitter<'_, '_> {
             Op::False => self.load_number(0.0, d),
             // A function's `this` and callee have no register, and the code of a function starts
             // from nothing, so these take no code.
+            Op::Pop if self.lp.function.is_none() && self.mark(ip, d - 1) == Mark::Owned => {
+                let exit = self.side_exit(ip, d);
+                let m = self.operand_mem(d - 1);
+                self.check_last(m, exit);
+                self.count_down(m);
+            }
             Op::Pop | Op::Undef | Op::GetUpval(_) => {}
+            Op::Dup if self.lp.function.is_none() && self.mark(ip, d - 1) == Mark::Owned => {
+                let (from, to) = (self.operand_mem(d - 1), self.operand_mem(d));
+                self.copy_value(from, to);
+                self.count_up(to);
+            }
+            Op::Dup
+                if self.lp.function.is_none() && matches!(self.mark(ip, d - 1), Mark::View(_)) => {}
             Op::Dup => {
                 self.a.movapd_rr(self.reg(d), x);
                 let (from, to) = (self.tag_cell(d - 1), self.tag_cell(d));
                 self.a.movzx_load8(RAX, from);
                 self.a.mov_store8(to, RAX);
+            }
+            Op::Swap if self.lp.function.is_none() && !has_register(&self.mark(ip, d - 1)) => {
+                // Operands without registers trade their slots, whose values are dead unless they are owned.
+                let (top, under) = (self.operand_mem(d - 1), self.operand_mem(d - 2));
+                self.swap_values(top, under);
             }
             Op::Swap => {
                 self.a.movapd_rr(0, x);
@@ -1399,8 +1642,26 @@ impl Emitter<'_, '_> {
                 self.a.mov_store8(under, RAX);
             }
             // An array is read in its slot by the `push` that takes it (see `Op::Call`), so it has no register.
+            Op::GetLocal(i) if self.lp.objects.contains(&i) => {}
             Op::GetLocal(i) if self.lp.arrays.contains(&i) => {}
             Op::GetLocal(i) => self.read_local(i, self.reg(d)),
+            Op::PopToLocal(i) if self.lp.objects.contains(&i) => {
+                // The value is moved from the operand, or copied from the object local it views, and the local's
+                // old value is released. Every check comes before any count changes, so a side exit leaves them
+                // as they were.
+                let exit = self.side_exit(ip, d);
+                let dst = local_mem(i);
+                let (src, owned) = match self.mark(ip, d - 1) {
+                    Mark::View(s) => (local_mem(s), false),
+                    _ => (self.operand_mem(d - 1), true),
+                };
+                self.check_last(dst, exit);
+                if !owned {
+                    self.count_up(src);
+                }
+                self.count_down(dst);
+                self.copy_value(src, dst);
+            }
             Op::SetLocal(i) | Op::PopToLocal(i) => self.write_local(i, x),
             Op::AddToLocal(i) => self.update_local(i, SSE_ADD, x),
             Op::IncLocal(i) => self.step_counter(i, SSE_ADD, 1, ip),
@@ -1537,6 +1798,18 @@ impl Emitter<'_, '_> {
                 self.a.pop_reg(RBP);
                 self.a.ret();
             }
+            Op::GetIndexLocal(a) if self.lp.object_reads.contains(&ip) => {
+                // The element must be an object. It is copied to the operand, and the copy counts one more reference.
+                let exit = self.side_exit(ip, d);
+                let key = self.reg(d - 1);
+                self.a.mov_load(R8, local_mem(a).at(8));
+                self.elem_addr(key, exit);
+                self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_OBJ);
+                self.a.jcc(CC_NE, exit);
+                let to = self.operand_mem(d - 1);
+                self.copy_value(Mem { base: RDX, disp: 0 }, to);
+                self.count_up(to);
+            }
             Op::GetIndexLocal(a) => {
                 let exit = self.side_exit(ip, d);
                 let (key, tag) = (self.reg(d - 1), self.tag_cell(d - 1));
@@ -1567,7 +1840,91 @@ impl Emitter<'_, '_> {
                 self.elem_write(key, value, boolean, exit);
                 self.a.movapd_rr(row, value);
             }
+            Op::GetGlobal(k) => {
+                // A global is read in place, as the generic code reads it (see `find_global`). It must be an object,
+                // which the operand takes a reference to.
+                let exit = self.side_exit(ip, d);
+                let name = &self.proto.names[k as usize] as *const std::rc::Rc<str> as usize;
+                let hint =
+                    &self.proto.global_hints[k as usize] as *const std::cell::Cell<u32> as usize;
+                let layout =
+                    entry_layout().expect("the planner admits a global only with a known layout");
+                find_global(&mut *self.a, name, hint, layout, exit);
+                let value = Mem {
+                    base: RDX,
+                    disp: layout.value,
+                };
+                self.a.cmp8_imm(value, TAG_OBJ);
+                self.a.jcc(CC_NE, exit);
+                let to = self.operand_mem(d);
+                self.copy_value(value, to);
+                self.count_up(to);
+            }
+            Op::GetLocalProp(s, n) if self.lp.objects.contains(&s) => {
+                self.prop_read(ip, d, self.reg(d), local_mem(s), n);
+            }
+            Op::GetLocalProp(s, n) if is_length(self.proto, n) => {
+                // The length of the array in local `s`, which the loop checked on entry to be an array.
+                let layout =
+                    arr_layout().expect("the planner admits a length only with a known layout");
+                self.a.mov_load(RCX, local_mem(s).at(8));
+                self.a.add64_imm32(RCX, layout.vec);
+                self.a.mov_load(
+                    RSI,
+                    Mem {
+                        base: RCX,
+                        disp: layout.len,
+                    },
+                );
+                self.a.cvtsi2sd(self.reg(d), RSI);
+            }
             Op::GetLocalProp(s, _) => self.push_probe(ip, d, s),
+            Op::GetProp(n) if self.lp.function.is_none() && self.mark(ip, d - 1) == Mark::Owned => {
+                // The `sqrt` of an object: the property must be the built-in. The object gives up its reference after
+                // every check, so a side exit leaves it as it was.
+                let exit = self.side_exit(ip, d);
+                let obj = self.operand_mem(d - 1);
+                let site = self.prop_site(n);
+                find_prop(&mut *self.a, obj, site, exit);
+                self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_NATIVE);
+                self.a.jcc(CC_NE, exit);
+                self.a.mov_load(RCX, Mem { base: RDX, disp: 8 });
+                self.a.mov_imm64(RAX, sqrt_address());
+                self.a.cmp_rr64(RCX, RAX);
+                self.a.jcc(CC_NE, exit);
+                self.check_last(obj, exit);
+                self.count_down(obj);
+            }
+            Op::GetProp(n) => {
+                let Mark::View(s) = self.mark(ip, d - 1) else {
+                    unreachable!("the planner admits a property read only of a view (see `step`)")
+                };
+                self.prop_read(ip, d, self.reg(d - 1), local_mem(s), n);
+            }
+            Op::SetProp(n) => {
+                // The object is a view, and the value is a number that replaces a number that the property holds.
+                let Mark::View(s) = self.mark(ip, d - 2) else {
+                    unreachable!("the planner admits a property write only to a view (see `step`)")
+                };
+                let exit = self.side_exit(ip, d);
+                let site = self.prop_site(n);
+                find_prop(&mut *self.a, local_mem(s), site, exit);
+                self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
+                self.a.jcc(CC_NE, exit);
+                self.a
+                    .movsd_store(Mem { base: RDX, disp: 8 }, self.reg(d - 1));
+                self.a.movapd_rr(self.reg(d - 2), self.reg(d - 1));
+            }
+            Op::Call(1) if self.lp.function.is_none() && self.mark(ip, d - 3) == Mark::Sqrt => {
+                // The object is released after its checks, as the other side exits leave the counts alone until then.
+                let exit = self.side_exit(ip, d);
+                if self.mark(ip, d - 2) == Mark::Owned {
+                    let this = self.operand_mem(d - 2);
+                    self.check_last(this, exit);
+                    self.count_down(this);
+                }
+                self.a.sse(SSE_SQRT, self.reg(d - 3), self.reg(d - 1));
+            }
             Op::Call(_) if self.lp.function.is_none() => self.push_call(ip, d),
             Op::Call(argc) => self.call(d, argc as i32),
             _ => unreachable!("the planners admit only the operations above"),
@@ -1828,6 +2185,16 @@ impl Emitter<'_, '_> {
                 Mark::Push(_) | Mark::Array(_) => {
                     unreachable!("a receiver is never on the stack at a side exit (see `step`)")
                 }
+                Mark::View(s) => {
+                    self.copy_value(local_mem(s), slot);
+                    self.count_up(slot);
+                }
+                Mark::Owned => {}
+                Mark::Sqrt => {
+                    self.a.mov8_imm(slot, TAG_NATIVE);
+                    self.a.mov_imm64(RAX, sqrt_address());
+                    self.a.mov_store(slot.at(8), RAX);
+                }
                 _ => {
                     self.a.mov8_imm(slot, TAG_NUM);
                     self.a.movsd_store(slot.at(8), x);
@@ -1923,6 +2290,88 @@ impl Emitter<'_, '_> {
 
     /// The register that holds the number `bits`: its hoisted register, or `scratch`, which is loaded
     /// with it.
+    /// The value slot of operand `k`, in the value stack, where an owned operand is kept (see `Mark::Owned`).
+    fn operand_mem(&self, k: i32) -> Mem {
+        local_mem((self.proto.nlocals as i32 + k) as u32)
+    }
+
+    /// Copies the 16-byte value at `src` to `dst`, without counting it.
+    fn copy_value(&mut self, src: Mem, dst: Mem) {
+        self.a.mov_load(RAX, src);
+        self.a.mov_load(RCX, src.at(8));
+        self.a.mov_store(dst, RAX);
+        self.a.mov_store(dst.at(8), RCX);
+    }
+
+    /// Counts one more reference to the value at `m`, when it owns one.
+    fn count_up(&mut self, m: Mem) {
+        let plain = self.a.label();
+        self.a.movzx_load8(R9, m);
+        self.a.mov_imm32(R10, OWNING);
+        self.a.bt(R10, R9);
+        self.a.jcc(CC_AE, plain);
+        self.a.mov_load(R11, m.at(8));
+        self.a.add64_mem_imm8(Mem { base: R11, disp: 0 }, 1);
+        self.a.bind(plain);
+    }
+
+    /// Jumps to `exit` when the value at `m` owns the last reference, which releasing it would free.
+    fn check_last(&mut self, m: Mem, exit: Label) {
+        let plain = self.a.label();
+        self.a.movzx_load8(R9, m);
+        self.a.mov_imm32(R10, OWNING);
+        self.a.bt(R10, R9);
+        self.a.jcc(CC_AE, plain);
+        self.a.mov_load(R11, m.at(8));
+        self.a.cmp64_mem_imm8(Mem { base: R11, disp: 0 }, 1);
+        self.a.jcc(CC_BE, exit);
+        self.a.bind(plain);
+    }
+
+    /// Releases the reference of the value at `m`, when it owns one. It must not be the last one (see `check_last`).
+    fn count_down(&mut self, m: Mem) {
+        let plain = self.a.label();
+        self.a.movzx_load8(R9, m);
+        self.a.mov_imm32(R10, OWNING);
+        self.a.bt(R10, R9);
+        self.a.jcc(CC_AE, plain);
+        self.a.mov_load(R11, m.at(8));
+        self.a.add64_mem_imm8(Mem { base: R11, disp: 0 }, -1);
+        self.a.bind(plain);
+    }
+
+    /// Swaps the 16-byte values in two slots.
+    fn swap_values(&mut self, x: Mem, y: Mem) {
+        self.a.mov_load(RAX, x);
+        self.a.mov_load(RCX, x.at(8));
+        self.a.mov_load(RSI, y);
+        self.a.mov_load(RDI, y.at(8));
+        self.a.mov_store(x, RSI);
+        self.a.mov_store(x.at(8), RDI);
+        self.a.mov_store(y, RAX);
+        self.a.mov_store(y.at(8), RCX);
+    }
+
+    /// The property site of name `n`: its hint and the layout of properties.
+    fn prop_site(&self, n: u32) -> PropSite {
+        PropSite {
+            hint: &self.proto.hints[n as usize] as *const PropHint as usize,
+            layout: prop_layout().expect("the planner admits a property only with a known layout"),
+        }
+    }
+
+    /// Reads the number that property `n` of the object at `obj` holds into xmm `dst`. A property that is not a number,
+    /// or an object that the hint does not find, exits at `ip`, which the generic code runs, with `d` operands on the
+    /// stack.
+    fn prop_read(&mut self, ip: usize, d: i32, dst: u8, obj: Mem, n: u32) {
+        let exit = self.side_exit(ip, d);
+        let site = self.prop_site(n);
+        find_prop(&mut *self.a, obj, site, exit);
+        self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
+        self.a.jcc(CC_NE, exit);
+        self.a.movsd_load(dst, Mem { base: RDX, disp: 8 });
+    }
+
     fn constant(&mut self, bits: u64, scratch: u8) -> u8 {
         let lp = self.lp;
         match lp.consts.iter().find(|&&(b, _)| b == bits) {

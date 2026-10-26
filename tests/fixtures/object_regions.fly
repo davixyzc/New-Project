@@ -1,0 +1,72 @@
+// Loops that read and write properties of objects held in locals. Each case leaves the loop's region in a
+// different way, or stays in it, and the output must match the generic code and Node.
+function bodiesOf(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) out.push({ x: i, y: i * 0.5, v: 0, m: 1 + (i % 4) });
+  return out;
+}
+
+// Numeric updates through two object locals, the way an n-body step does it.
+const bodies = bodiesOf(12);
+for (let k = 0; k < 15; k++) {
+  for (let i = 0; i < bodies.length; i++) {
+    const a = bodies[i];
+    for (let j = 0; j < bodies.length; j++) {
+      if (i === j) continue;
+      const b = bodies[j];
+      const dx = b.x - a.x;
+      a.v += dx * b.m * 0.01;
+    }
+  }
+}
+let sum = 0;
+for (let i = 0; i < bodies.length; i++) sum += bodies[i].v;
+console.log(sum.toFixed(6));
+
+// A property that holds a string in the middle of the loop: the loop leaves at that read.
+const mixed = [{ n: 1 }, { n: 2 }, { n: "three" }, { n: 4 }];
+let acc = 0;
+for (let i = 0; i < mixed.length; i++) {
+  const o = mixed[i];
+  acc += o.n;
+}
+console.log(acc);
+
+// The loop overwrites the elements it reads. The object a local still holds is not freed.
+const items = [{ v: 1 }, { v: 2 }, { v: 3 }];
+let s = 0;
+for (let i = 0; i < items.length; i++) {
+  const it = items[i];
+  items[i] = 7;
+  s += it.v;
+}
+console.log(s, items[0], items[2]);
+
+// Objects with different shapes: the hint misses for some of them.
+const shapes = [{ v: 1, m: 2 }, { m: 3, v: 4 }, { w: 0, v: 5, m: 6 }];
+let t = 0;
+for (let i = 0; i < 9; i++) {
+  const o = shapes[i % 3];
+  t += o.v * o.m;
+  o.v += 1;
+}
+console.log(t, shapes[0].v, shapes[1].v, shapes[2].v);
+
+// A local that takes another object local's object, and one that takes an element.
+let p = bodies[0];
+let q = bodies[1];
+for (let k = 0; k < 10; k++) {
+  p = q;
+  q = bodies[k % bodies.length];
+  p.v += q.m;
+}
+console.log(p.v, q.v, bodies[0].v);
+
+// A loop that reads an object local before writing it, on its first pass.
+let first = bodies[2];
+let reads = 0;
+for (let k = 0; k < 6; k++) {
+  reads += first.m;
+  first = bodies[k];
+}
+console.log(reads, first.x);

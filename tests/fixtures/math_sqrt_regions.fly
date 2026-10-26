@@ -1,0 +1,42 @@
+// `Math.sqrt` inside loops that work on objects. The built-in is read in place, and a program that replaces it, or
+// gives a negative argument, must still get what the generic code gives.
+const pts = [];
+for (let i = 0; i < 40; i++) pts.push({ x: i - 10, y: 3 * i, r: 0 });
+
+let total = 0;
+for (let k = 0; k < 3; k++) {
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    const d = p.x * p.x + p.y * p.y;
+    p.r = Math.sqrt(d);
+    total += p.r;
+  }
+}
+console.log(total.toFixed(6), pts[0].r, pts[39].r);
+
+// A negative argument gives NaN, and the loop keeps going.
+let nans = 0;
+for (let i = 0; i < pts.length; i++) {
+  const v = Math.sqrt(pts[i].x);
+  if (v === v) total += 1;
+  else nans += 1;
+}
+console.log(nans, total.toFixed(3));
+
+// The built-in is replaced in the middle of the program: the loop must call the new one.
+let before = 0;
+for (let i = 0; i < 5; i++) before += Math.sqrt(i * i);
+const saved = Math.sqrt;
+Math.sqrt = function (x) { return x + 100; };
+let after = 0;
+for (let i = 0; i < 5; i++) after += Math.sqrt(i * i);
+Math.sqrt = saved;
+let restored = 0;
+for (let i = 0; i < 5; i++) restored += Math.sqrt(i * i);
+console.log(before, after, restored);
+
+// An object's own `sqrt` is not the built-in.
+const calc = { sqrt: function (x) { return x * 10; }, n: 0 };
+let own = 0;
+for (let i = 0; i < 4; i++) own += calc.sqrt(i);
+console.log(own);

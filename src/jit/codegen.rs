@@ -33,18 +33,123 @@ pub(super) const TAG_NUM: u8 = 3;
 const TAG_STR: u8 = 4;
 pub(super) const TAG_ARR: u8 = 5;
 const TAG_CELL: u8 = 9;
-const TAG_OBJ: u8 = 6;
+pub(super) const TAG_OBJ: u8 = 6;
 const TAG_FUNC: u8 = 7;
-const TAG_NATIVE: u8 = 8;
+pub(super) const TAG_NATIVE: u8 = 8;
 /// Bit `n` is set when tag `n` owns a reference (see `Value::owns_ref`).
-const OWNING: u32 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 9);
+pub(super) const OWNING: u32 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 9);
 
 /// A property access in the code: the hint that names the shape and the position of the property, and the layout of
 /// the properties (see `prop_layout`). Native code reads and writes the property in place when the hint finds it.
 #[derive(Clone, Copy)]
-struct PropSite {
-    hint: usize,
-    layout: PropLayout,
+pub(super) struct PropSite {
+    pub(super) hint: usize,
+    pub(super) layout: PropLayout,
+}
+
+/// Leaves in RDX the entry of global `name`, when the slot that `hint` holds has that name (see `GetGlobal`). Any
+/// other slot jumps to `miss`, before anything has changed.
+pub(super) fn find_global(a: &mut Asm, name: usize, hint: usize, layout: EntryLayout, miss: Label) {
+    // The slots are a `Vec` inside the VM, which RBX points at.
+    a.lea(
+        RCX,
+        Mem {
+            base: RBX,
+            disp: globals_slots_offset(),
+        },
+    );
+    a.mov_load(
+        RSI,
+        Mem {
+            base: RCX,
+            disp: layout.len,
+        },
+    );
+    a.mov_load(
+        RDX,
+        Mem {
+            base: RCX,
+            disp: layout.buf,
+        },
+    );
+    a.mov_imm64(RAX, hint as u64);
+    a.mov32_load(RAX, Mem { base: RAX, disp: 0 });
+    a.cmp_rr64(RAX, RSI);
+    a.jcc(CC_AE, miss);
+    a.imul64_imm(RAX, RAX, layout.entry);
+    a.add64(RDX, RAX);
+    a.mov_imm64(RAX, name as u64);
+    for word in [0, 8] {
+        a.mov_load(
+            RSI,
+            Mem {
+                base: RAX,
+                disp: word,
+            },
+        );
+        a.mov_load(
+            RDI,
+            Mem {
+                base: RDX,
+                disp: layout.key + word,
+            },
+        );
+        a.cmp_rr64(RSI, RDI);
+        a.jcc(CC_NE, miss);
+    }
+}
+
+/// Leaves in RDX the value of the property that `site` names in the object at `obj`, when that object is a plain one
+/// with the shape the hint holds (see `PropHint`). Any other object jumps to `miss`, before anything has changed.
+pub(super) fn find_prop(a: &mut Asm, obj: Mem, site: PropSite, miss: Label) {
+    let PropSite { hint, layout } = site;
+    a.cmp8_imm(obj, TAG_OBJ);
+    a.jcc(CC_NE, miss);
+    a.mov_load(RCX, obj.at(8));
+    // The shape of the object must be the one that the hint holds.
+    a.mov_load(
+        RAX,
+        Mem {
+            base: RCX,
+            disp: layout.shape,
+        },
+    );
+    a.mov_imm64(R8, hint as u64);
+    a.mov_load(
+        RSI,
+        Mem {
+            base: R8,
+            disp: std::mem::offset_of!(PropHint, shape) as i32,
+        },
+    );
+    a.cmp_rr64(RAX, RSI);
+    a.jcc(CC_NE, miss);
+    // The position that the hint holds must be inside the values.
+    a.mov32_load(
+        RAX,
+        Mem {
+            base: R8,
+            disp: std::mem::offset_of!(PropHint, index) as i32,
+        },
+    );
+    a.mov_load(
+        RSI,
+        Mem {
+            base: RCX,
+            disp: layout.values + layout.len,
+        },
+    );
+    a.cmp_rr64(RAX, RSI);
+    a.jcc(CC_AE, miss);
+    a.mov_load(
+        RDX,
+        Mem {
+            base: RCX,
+            disp: layout.values + layout.buf,
+        },
+    );
+    a.shl64_imm(RAX, 4);
+    a.add64(RDX, RAX);
 }
 
 /// Where native code finds the parts of the VM it reads and writes: the frame stack and the value stack, both
@@ -1334,53 +1439,7 @@ impl<'a> Gen<'a> {
     /// a plain one with the shape that the hint holds (see `PropHint`). Any other object jumps to `miss`, before anything
     /// has changed.
     fn prop_entry(&mut self, obj: Mem, site: PropSite, miss: Label) {
-        let PropSite { hint, layout } = site;
-        self.check_tag(obj, TAG_OBJ, miss);
-        self.a.mov_load(RCX, obj.at(8));
-        // The shape of the object must be the one that the hint holds.
-        self.a.mov_load(
-            RAX,
-            Mem {
-                base: RCX,
-                disp: layout.shape,
-            },
-        );
-        self.a.mov_imm64(R8, hint as u64);
-        self.a.mov_load(
-            RSI,
-            Mem {
-                base: R8,
-                disp: std::mem::offset_of!(PropHint, shape) as i32,
-            },
-        );
-        self.a.cmp_rr64(RAX, RSI);
-        self.a.jcc(CC_NE, miss);
-        // The position that the hint holds must be inside the values.
-        self.a.mov32_load(
-            RAX,
-            Mem {
-                base: R8,
-                disp: std::mem::offset_of!(PropHint, index) as i32,
-            },
-        );
-        self.a.mov_load(
-            RSI,
-            Mem {
-                base: RCX,
-                disp: layout.values + layout.len,
-            },
-        );
-        self.a.cmp_rr64(RAX, RSI);
-        self.a.jcc(CC_AE, miss);
-        self.a.mov_load(
-            RDX,
-            Mem {
-                base: RCX,
-                disp: layout.values + layout.buf,
-            },
-        );
-        self.a.shl64_imm(RAX, 4);
-        self.a.add64(RDX, RAX);
+        find_prop(&mut self.a, obj, site, miss);
     }
 
     /// `a % b` on whole numbers, which `value::js_mod` gives by the same integer division. The dividend must be a whole
@@ -1524,53 +1583,7 @@ impl<'a> Gen<'a> {
         miss: Label,
         done: Label,
     ) {
-        // The slots are a `Vec` inside the VM, which RBX points at.
-        self.a.lea(
-            RCX,
-            Mem {
-                base: RBX,
-                disp: globals_slots_offset(),
-            },
-        );
-        self.a.mov_load(
-            RSI,
-            Mem {
-                base: RCX,
-                disp: layout.len,
-            },
-        );
-        self.a.mov_load(
-            RDX,
-            Mem {
-                base: RCX,
-                disp: layout.buf,
-            },
-        );
-        self.a.mov_imm64(RAX, hint as u64);
-        self.a.mov32_load(RAX, Mem { base: RAX, disp: 0 });
-        self.a.cmp_rr64(RAX, RSI);
-        self.a.jcc(CC_AE, miss);
-        self.a.imul64_imm(RAX, RAX, layout.entry);
-        self.a.add64(RDX, RAX);
-        self.a.mov_imm64(RAX, name as u64);
-        for word in [0, 8] {
-            self.a.mov_load(
-                RSI,
-                Mem {
-                    base: RAX,
-                    disp: word,
-                },
-            );
-            self.a.mov_load(
-                RDI,
-                Mem {
-                    base: RDX,
-                    disp: layout.key + word,
-                },
-            );
-            self.a.cmp_rr64(RSI, RDI);
-            self.a.jcc(CC_NE, miss);
-        }
+        find_global(&mut self.a, name, hint, layout, miss);
         self.load_clone(Mem {
             base: RDX,
             disp: layout.value,
