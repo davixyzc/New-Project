@@ -1,0 +1,24 @@
+// Math.sqrt from compiled code: numbers in place, and every other callee, argument, or receiver the generic way.
+let s = 0;
+for (let i = 0; i < 2000; i++) s += Math.sqrt(i);
+console.log("sum", s.toFixed(6));
+const specials = [0, -0, 4, 2, -1, Infinity, -Infinity, NaN, 1e300, 5e-324];
+console.log(specials.map((x) => Math.sqrt(x)).map((v) => (Object.is(v, -0) ? "-0" : String(v))).join(" "));
+console.log(Math.sqrt("9"), Math.sqrt(undefined), Math.sqrt(null), Math.sqrt(true));
+const f = Math.sqrt;
+let g = 0;
+for (let i = 0; i < 50; i++) g += f(i * i);
+console.log("alias", g);
+const M = { sqrt: Math.sqrt };
+let h = 0;
+for (let i = 0; i < 50; i++) h += M.sqrt(i);
+console.log("method", h.toFixed(4));
+const saved = Math.sqrt;
+Math.sqrt = function (x) { return x * 100; };
+let u = 0;
+for (let i = 0; i < 20; i++) u += Math.sqrt(i);
+Math.sqrt = saved;
+console.log("replaced", u, Math.sqrt(81));
+let t = 0;
+for (let i = 0; i < 300; i++) t += Math.sqrt(i % 2 === 0 ? i : "16");
+console.log("mixed", t.toFixed(4));

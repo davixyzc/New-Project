@@ -1000,6 +1000,24 @@ impl<'a> Gen<'a> {
             let char_code = crate::builtins::string::char_code_at_def() as *const _ as usize as u64;
             let string = crate::builtins::global::string_def() as *const _ as usize as u64;
             self.check_tag(callee, TAG_NATIVE, closure_path);
+            // `Math.sqrt` of a number is computed here. The callee is the built-in, and the `this` (the `Math` object)
+            // is released, so it must have another reference. The root replaces the callee.
+            let not_sqrt = self.a.label();
+            let sqrt = crate::builtins::global::sqrt_def() as *const _ as usize as u64;
+            let (this, arg) = (self.temp(d - 2), self.temp(d - 1));
+            self.a.mov_load(RAX, callee.at(8));
+            self.a.mov_imm64(RCX, sqrt);
+            self.a.cmp_rr64(RAX, RCX);
+            self.a.jcc(CC_NE, not_sqrt);
+            self.check_tag(arg, TAG_NUM, not_sqrt);
+            self.check_release(this, not_sqrt);
+            self.release_owned(this);
+            self.a.movsd_load(0, arg.at(8));
+            self.a.sse(SSE_SQRT, 0, 0);
+            self.a.mov8_imm(callee, TAG_NUM);
+            self.a.movsd_store(callee.at(8), 0);
+            self.a.jmp(done);
+            self.a.bind(not_sqrt);
             let push_helper = rt::push_call as *const () as usize;
             let char_code_helper = rt::char_code_call as *const () as usize;
             let string_helper = rt::string_call as *const () as usize;

@@ -618,6 +618,13 @@ fn string(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 /// The built-in `String`, which native code recognises by identity.
+/// The `Math.sqrt` built-in, which native code runs in place of the call (see `jit::codegen`).
+pub fn sqrt_def() -> &'static NativeDef {
+    MATH.iter()
+        .find(|f| f.name == "sqrt")
+        .expect("Math.sqrt is a built-in")
+}
+
 pub fn string_def() -> &'static NativeDef {
     FUNCTIONS
         .iter()

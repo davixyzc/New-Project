@@ -38,6 +38,7 @@ pub const SSE_ADD: u8 = 0x58;
 pub const SSE_MUL: u8 = 0x59;
 pub const SSE_SUB: u8 = 0x5C;
 pub const SSE_DIV: u8 = 0x5E;
+pub const SSE_SQRT: u8 = 0x51;
 
 /// A memory operand, `[base + disp]`.
 #[derive(Clone, Copy)]
