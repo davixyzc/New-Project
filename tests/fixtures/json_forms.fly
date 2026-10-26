@@ -1,0 +1,6 @@
+// JSON.stringify and JSON.parse: escapes, nesting, indentation, key order and omitted values.
+const data = [{ id: 1, name: "a\"b\\c\nd\te\u0001", tags: ["x", "y"], score: 1.5, ok: true, no: null, gone: undefined, f() {} }, [1, [2, [3]]], "é✓", -0, 1e21, NaN, [undefined, null]];
+console.log(JSON.stringify(data));
+console.log(JSON.stringify({ a: [], b: {}, c: { d: undefined }, e: "" }, null, 2));
+console.log(JSON.stringify({ z: 1, 2: "two", 1: "one", y: [1, 2] }, null, "--"));
+console.log(JSON.parse('{"k":[1,2.5,-3e2,"s\\n",true,false,null,{"n":{}}]}').k.length, JSON.stringify(JSON.parse('[{"a":"b\\"c"}]')));

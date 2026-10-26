@@ -1,7 +1,7 @@
 //! The `JSON` object: `JSON.stringify` and `JSON.parse`.
 
 use crate::builtins::{arg, table_object};
-use crate::value::{key_order, num_to_string, obj_set, to_str, NativeDef, Value};
+use crate::value::{key_order, obj_set, push_number, to_str, NativeDef, Value};
 use crate::vm::Vm;
 
 pub static METHODS: &[NativeDef] = &[
@@ -30,7 +30,7 @@ fn stringify(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> 
     };
     let mut out = String::new();
     match write_value(&arg(args, 0), &indent, 0, &mut out) {
-        Ok(true) => Ok(Value::str(&out)),
+        Ok(true) => Ok(Value::from_string(out)),
         Ok(false) => Ok(Value::Undef),
         Err(msg) => Err(vm.make_error("TypeError", msg)),
     }
@@ -50,14 +50,12 @@ fn write_value(
         Value::Undef | Value::Func(_) | Value::Native(_) | Value::Cell(_) => return Ok(false),
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Num(n) => out.push_str(&if n.is_finite() {
-            num_to_string(*n)
-        } else {
-            "null".to_string()
-        }),
+        Value::Num(n) if n.is_finite() => push_number(out, *n),
+        Value::Num(_) => out.push_str("null"),
         Value::Str(s) => quote(s, out),
         Value::Arr(a) => {
-            let items = a.borrow().clone();
+            // Writing never runs user code, so the array is read in place.
+            let items = a.borrow();
             if items.is_empty() {
                 out.push_str("[]");
                 return Ok(true);
@@ -76,35 +74,40 @@ fn write_value(
             out.push(']');
         }
         Value::Obj(o) => {
-            let props = o.borrow().clone();
-            let mut parts = Vec::new();
-            for i in key_order(&props) {
-                let (k, val) = &props[i];
-                let mut text = String::new();
-                if write_value(val, indent, depth + 1, &mut text)? {
-                    let mut key = String::new();
-                    quote(k, &mut key);
-                    let sep = if indent.is_empty() { ":" } else { ": " };
-                    parts.push(format!("{}{}{}", key, sep, text));
-                }
-            }
-            if parts.is_empty() {
+            let props = o.borrow();
+            let shown: Vec<usize> = key_order(&props)
+                .into_iter()
+                .filter(|&i| shows(&props[i].1))
+                .collect();
+            if shown.is_empty() {
                 out.push_str("{}");
                 return Ok(true);
             }
+            let sep = if indent.is_empty() { ":" } else { ": " };
             out.push('{');
-            for (i, part) in parts.iter().enumerate() {
-                if i > 0 {
+            for (n, &i) in shown.iter().enumerate() {
+                if n > 0 {
                     out.push(',');
                 }
+                let (k, val) = &props[i];
                 newline(indent, depth + 1, out);
-                out.push_str(part);
+                quote(k, out);
+                out.push_str(sep);
+                write_value(val, indent, depth + 1, out)?;
             }
             newline(indent, depth, out);
             out.push('}');
         }
     }
     Ok(true)
+}
+
+/// Whether JSON writes `v`. The values it leaves out are omitted from an object, and written as `null` in an array.
+fn shows(v: &Value) -> bool {
+    !matches!(
+        v,
+        Value::Undef | Value::Func(_) | Value::Native(_) | Value::Cell(_)
+    )
 }
 
 fn newline(indent: &str, depth: usize, out: &mut String) {
@@ -118,15 +121,20 @@ fn newline(indent: &str, depth: usize, out: &mut String) {
 
 fn quote(s: &str, out: &mut String) {
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    // Most strings need no escape, so they are copied whole.
+    if !s.chars().any(|c| c < ' ' || c == '"' || c == '\\') {
+        out.push_str(s);
+    } else {
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
         }
     }
     out.push('"');
@@ -177,7 +185,7 @@ impl Parser {
         match self.peek() {
             Some('{') => self.object(),
             Some('[') => self.array(),
-            Some('"') => Ok(Value::str(&self.string()?)),
+            Some('"') => Ok(Value::from_string(self.string()?)),
             Some('t') => self.word("true", Value::Bool(true)),
             Some('f') => self.word("false", Value::Bool(false)),
             Some('n') => self.word("null", Value::Null),

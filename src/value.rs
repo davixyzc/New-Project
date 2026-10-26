@@ -900,6 +900,15 @@ fn append_text(s: &mut String, v: &Value) {
     }
 }
 
+/// Appends the JavaScript text of a finite number. An integer is written without a temporary string.
+pub fn push_number(out: &mut String, n: f64) {
+    if n.fract() == 0.0 && n.abs() < 9.0e15 {
+        push_int(out, n as i64);
+    } else {
+        out.push_str(&num_to_string(n));
+    }
+}
+
 /// The decimal digits of `v`, with a minus sign when it is negative, written at the end of `buf`.
 fn int_text(v: i64, buf: &mut [u8; 21]) -> &str {
     let mut at = buf.len();
