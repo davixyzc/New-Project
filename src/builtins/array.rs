@@ -128,6 +128,11 @@ pub fn method(name: &str) -> Option<&'static NativeDef> {
     crate::builtins::sorted_lookup(METHODS, &METHOD_INDEX, name)
 }
 
+/// `method`, which starts from the position in `hint` (see `sorted_lookup_hinted`).
+pub fn method_hinted(name: &str, hint: &std::cell::Cell<u32>) -> Option<&'static NativeDef> {
+    crate::builtins::sorted_lookup_hinted(METHODS, &METHOD_INDEX, name, hint)
+}
+
 fn array_of(vm: &mut Vm, this: &Value) -> Result<ArrRef, Value> {
     match this {
         Value::Arr(a) => Ok(a.clone()),

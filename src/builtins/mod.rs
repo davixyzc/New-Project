@@ -52,15 +52,43 @@ pub fn sorted_lookup(
     index: &'static std::sync::OnceLock<Vec<&'static NativeDef>>,
     name: &str,
 ) -> Option<&'static NativeDef> {
-    let sorted = index.get_or_init(|| {
-        let mut defs: Vec<&'static NativeDef> = table.iter().collect();
-        defs.sort_by_key(|d| d.name);
-        defs
-    });
+    let sorted = sorted_index(table, index);
     sorted
         .binary_search_by_key(&name, |d| d.name)
         .ok()
         .map(|i| sorted[i])
+}
+
+/// `sorted_lookup`, which first tries the position in `hint`. A lookup stores the position it found there, so the next
+/// lookup of the same name at the same access compares one name. The position is checked against `name` before it is
+/// used, so a stale hint only costs the search.
+pub fn sorted_lookup_hinted(
+    table: &'static [NativeDef],
+    index: &'static std::sync::OnceLock<Vec<&'static NativeDef>>,
+    name: &str,
+    hint: &std::cell::Cell<u32>,
+) -> Option<&'static NativeDef> {
+    let sorted = sorted_index(table, index);
+    if let Some(&def) = sorted.get(hint.get() as usize) {
+        if def.name == name {
+            return Some(def);
+        }
+    }
+    let i = sorted.binary_search_by_key(&name, |d| d.name).ok()?;
+    hint.set(i as u32);
+    Some(sorted[i])
+}
+
+/// The table sorted by name, which is built the first time it is searched.
+fn sorted_index(
+    table: &'static [NativeDef],
+    index: &'static std::sync::OnceLock<Vec<&'static NativeDef>>,
+) -> &'static [&'static NativeDef] {
+    index.get_or_init(|| {
+        let mut defs: Vec<&'static NativeDef> = table.iter().collect();
+        defs.sort_by_key(|d| d.name);
+        defs
+    })
 }
 
 /// An object whose properties are the functions of a static table.

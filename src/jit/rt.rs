@@ -328,11 +328,11 @@ pub unsafe extern "C" fn get_prop_into(
             Lookup::Getter(_) => false,
         },
         Value::Arr(a) => {
-            ptr::write(dst, array_prop(a, &*name));
+            ptr::write(dst, array_prop(a, &*name, &*hint));
             true
         }
         Value::Str(s) => {
-            ptr::write(dst, string_prop(s, &*name));
+            ptr::write(dst, string_prop(s, &*name, &*hint));
             true
         }
         _ => false,
@@ -355,8 +355,8 @@ pub unsafe extern "C" fn get_prop_top(
             Lookup::Missing => Value::Undef,
             Lookup::Getter(_) => return false,
         },
-        Value::Arr(a) => array_prop(a, &*name),
-        Value::Str(s) => string_prop(s, &*name),
+        Value::Arr(a) => array_prop(a, &*name, &*hint),
+        Value::Str(s) => string_prop(s, &*name, &*hint),
         _ => return false,
     };
     *slot = v;
@@ -625,22 +625,22 @@ pub unsafe extern "C" fn set_index2_local(
 }
 
 /// The property `name` of a string: its length, or one of its methods.
-fn string_prop(s: &JsStr, name: &str) -> Value {
+fn string_prop(s: &JsStr, name: &str, hint: &Cell<u32>) -> Value {
     if name == "length" {
         Value::Num(s.char_count() as f64)
     } else {
-        builtins::string::method(name)
+        builtins::string::method_hinted(name, hint)
             .map(Value::Native)
             .unwrap_or(Value::Undef)
     }
 }
 
 /// The property `name` of an array: its length, or one of its methods.
-fn array_prop(a: &ArrRef, name: &str) -> Value {
+fn array_prop(a: &ArrRef, name: &str, hint: &Cell<u32>) -> Value {
     if name == "length" {
         Value::Num(a.borrow().len() as f64)
     } else {
-        builtins::array::method(name)
+        builtins::array::method_hinted(name, hint)
             .or_else(|| builtins::global::object_method(name))
             .map(Value::Native)
             .unwrap_or(Value::Undef)
