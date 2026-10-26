@@ -900,24 +900,30 @@ fn append_text(s: &mut String, v: &Value) {
     }
 }
 
-/// Appends the decimal digits of `v`.
-fn push_int(s: &mut String, v: i64) {
-    let mut digits = [0u8; 20];
-    let mut at = digits.len();
+/// The decimal digits of `v`, with a minus sign when it is negative, written at the end of `buf`.
+fn int_text(v: i64, buf: &mut [u8; 21]) -> &str {
+    let mut at = buf.len();
     let mut rest = v.unsigned_abs();
     loop {
         at -= 1;
-        digits[at] = b'0' + (rest % 10) as u8;
+        buf[at] = b'0' + (rest % 10) as u8;
         rest /= 10;
         if rest == 0 {
             break;
         }
     }
     if v < 0 {
-        s.push('-');
+        at -= 1;
+        buf[at] = b'-';
     }
-    // The digits are ASCII, so they are valid UTF-8.
-    s.push_str(std::str::from_utf8(&digits[at..]).unwrap_or("0"));
+    // SAFETY: the bytes are ASCII digits and a minus sign, so they are valid UTF-8.
+    unsafe { std::str::from_utf8_unchecked(&buf[at..]) }
+}
+
+/// Appends the decimal digits of `v`.
+fn push_int(s: &mut String, v: i64) {
+    let mut digits = [0u8; 21];
+    s.push_str(int_text(v, &mut digits));
 }
 
 /// The longest text the string operations build, in bytes. It is V8's limit, which V8 counts in characters.
@@ -946,6 +952,10 @@ pub fn concat_owned(old: Value, rhs: Value) -> Value {
             let buf = Rc::get_mut(&mut s).unwrap();
             match &rhs {
                 Value::Str(r) => buf.push_str(r),
+                Value::Num(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => {
+                    let mut digits = [0u8; 21];
+                    buf.push_str(int_text(*n as i64, &mut digits));
+                }
                 other => buf.push_str(&to_str(other)),
             }
             Value::Str(s)

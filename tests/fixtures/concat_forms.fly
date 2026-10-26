@@ -1,0 +1,18 @@
+// `+` with a string on one side: numbers, special values, objects and in-place extension of a temporary.
+function label(i, tag) {
+  return "row " + i + tag + ";" + (i + 1) + -0 + undefined + null + true;
+}
+let out = "";
+for (let i = 0; i < 6; i++) out = out + label(i, "-") + "|";
+console.log(out.length, out);
+const base = "x";
+const t = base + "y" + 7;
+console.log(base, t, 1 + 2 + "3", "4" + 1 + 2, 5 + "");
+console.log("a" + 1.5, "b" + -2.25, "c" + 1e21, "d" + NaN, "e" + Infinity, "f" + 9007199254740993);
+console.log("g" + [1, 2, 3], "h" + {}, "i" + [], "j" + (-7), "k" + 0.1 + 0.2);
+let s = 0;
+for (let i = 0; i < 4; i++) s = s + i;
+console.log(s + "!", "" + s);
+let acc = "";
+for (let i = 0; i < 5; i++) acc += i * 2;
+console.log(acc, acc.length);

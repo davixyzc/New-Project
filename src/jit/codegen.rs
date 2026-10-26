@@ -386,6 +386,8 @@ enum Slow {
     Op,
     /// A call of a value helper with these arguments.
     Direct(usize, Vec<Arg>),
+    /// The concatenation helper, and the instruction's helper when that declines.
+    Concat,
 }
 
 /// What the fast path of an instruction needs.
@@ -398,6 +400,8 @@ enum Fast {
     Guarded,
     /// The checks branch to a value helper, with these arguments, when they fail.
     Direct(usize, Vec<Arg>),
+    /// The checks branch to the concatenation helper, and then to the instruction's helper when it declines.
+    Concat,
 }
 
 struct Gen<'a> {
@@ -820,6 +824,7 @@ impl<'a> Gen<'a> {
                         Fast::Generic => self.op_helper(ip, d),
                         Fast::Pure => {}
                         Fast::Guarded => self.slow.push((slow, ip, Slow::Op)),
+                        Fast::Concat => self.slow.push((slow, ip, Slow::Concat)),
                         Fast::Direct(func, args) => {
                             self.slow.push((slow, ip, Slow::Direct(func, args)))
                         }
@@ -837,6 +842,16 @@ impl<'a> Gen<'a> {
                     self.op_helper(ip, d);
                 }
                 Slow::Direct(func, args) => self.direct_call(func, &args),
+                Slow::Concat => {
+                    let d = self.depth[ip];
+                    let (x, y) = (self.temp(d - 2), self.temp(d - 1));
+                    let next = self.ops[ip + 1];
+                    let concat = rt::concat_top as *const () as usize;
+                    self.direct_call(concat, &[Arg::Addr(x), Arg::Addr(y)]);
+                    self.a.test8(RAX, RAX);
+                    self.a.jcc(CC_NE, next);
+                    self.op_helper(ip, d);
+                }
             }
             let next = self.ops[ip + 1];
             self.a.jmp(next);
@@ -1147,7 +1162,12 @@ impl<'a> Gen<'a> {
                 self.a.movsd_load(1, y.at(8));
                 self.a.sse(sse, 0, 1);
                 self.store_num(x, 0);
-                Fast::Guarded
+                // Only addition has another meaning, which is the concatenation of strings.
+                if op == Op::Add {
+                    Fast::Concat
+                } else {
+                    Fast::Guarded
+                }
             }
             Op::StrictEq | Op::StrictNe | Op::Lt | Op::Le | Op::Gt | Op::Ge => {
                 let (x, y) = (self.temp(d - 2), self.temp(d - 1));

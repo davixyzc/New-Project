@@ -8,7 +8,8 @@ use std::rc::Rc;
 use crate::builtins;
 use crate::bytecode::Proto;
 use crate::value::{
-    find_setter, lookup_hinted, obj_put, obj_put_hinted, ArrRef, JsStr, Lookup, Value,
+    concat_owned, find_setter, joins_too_long, lookup_hinted, obj_put, obj_put_hinted, ArrRef, JsStr, Lookup,
+    Value,
 };
 use crate::vm::Vm;
 
@@ -68,6 +69,30 @@ unsafe fn finish(vm: &mut Vm, result: Result<usize, Value>, next: usize) -> Help
         status,
         base: vm.stack.as_mut_ptr().add(base),
     }
+}
+
+/// `a + b` where one of them is a string and both are primitives: `a` is replaced by the concatenation, and `b` is
+/// dead afterwards. Anything else writes nothing and returns false. An object converts through user code, so the
+/// instruction's own path runs it.
+///
+/// # Safety
+/// `a` and `b` must point at valid values that the instruction pops.
+pub unsafe extern "C" fn concat_top(a: *mut Value, b: *const Value) -> bool {
+    let primitive = |v: &Value| {
+        matches!(
+            v,
+            Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Undef | Value::Null
+        )
+    };
+    let (x, y) = (&*a, &*b);
+    let textual = matches!(x, Value::Str(_)) || matches!(y, Value::Str(_));
+    if !textual || !primitive(x) || !primitive(y) || joins_too_long(x, y) {
+        return false;
+    }
+    let left = ptr::read(a);
+    let right = ptr::read(b);
+    ptr::write(a, concat_owned(left, right));
+    true
 }
 
 /// `x % y` for numbers: the remainder with the sign of `x`, which is JavaScript's `%`. Native code
@@ -402,7 +427,8 @@ pub unsafe extern "C" fn mod_top(a: *mut Value, b: *const Value) -> bool {
         return false;
     };
     let rem = crate::value::js_mod(*x, *y);
-    *a = Value::Num(rem);
+    // `a` holds a number, which owns nothing, so it is overwritten without a drop.
+    ptr::write(a, Value::Num(rem));
     true
 }
 
@@ -488,7 +514,8 @@ pub unsafe extern "C" fn get_index_local(obj: *const Value, key: *mut Value) -> 
             .map(crate::value::char_value),
         _ => return false,
     };
-    *key = element.unwrap_or(Value::Undef);
+    // `key` holds a number, which owns nothing, so it is overwritten without a drop.
+    ptr::write(key, element.unwrap_or(Value::Undef));
     true
 }
 
@@ -518,7 +545,8 @@ pub unsafe extern "C" fn get_index2_local(
     let element = crate::vm::index_of(*n2).and_then(|i| cells.get(i).cloned());
     drop(cells);
     drop(items);
-    *k1 = element.unwrap_or(Value::Undef);
+    // `k1` holds a number, which owns nothing, so it is overwritten without a drop.
+    ptr::write(k1, element.unwrap_or(Value::Undef));
     true
 }
 
