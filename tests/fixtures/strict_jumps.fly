@@ -1,0 +1,57 @@
+// `===` and `!==` as conditions: in `if`, `while`, `do`, `for` and `&&`/`||` tests, and in `switch` cases, for every
+// kind of value: NaN, -0, strings by their contents, objects by identity, and numbers and booleans apart.
+const o = { v: 1 }, p = { v: 1 };
+const values = [0, -0, 1, NaN, true, false, undefined, null, "", "1", o, p, o.v];
+let out = "";
+for (let i = 0; i < values.length; i++) {
+  for (let j = 0; j < values.length; j++) {
+    if (values[i] === values[j]) out += "=";
+    if (values[i] !== values[j]) out += "!";
+    out += values[i] === values[j] ? "t" : "f";
+  }
+  out += "|";
+}
+console.log(out);
+let steps = 0;
+let k = 0;
+while (k !== 5) { k++; steps++; }
+do { k--; steps++; } while (k !== 2);
+console.log(steps, k);
+const pairs = [[1, 1], [NaN, NaN], [-0, 0], ["a", "a"], ["a", "b"], [null, undefined], [true, 1], [o, o], [o, p]];
+let hits = 0;
+for (const [x, y] of pairs) {
+  if (x === y && x !== null) hits += 1;
+  if (x !== y || x === null) hits += 10;
+}
+console.log(hits);
+// Numbers in a loop, which the loop regions run: equal, NaN, and a number against a boolean.
+let eqCount = 0, neCount = 0, mixed = 0;
+for (let i = 0; i < 300; i++) {
+  const a = i % 7, b = i % 5;
+  if (a === b) eqCount += 1;
+  if (a !== b && i !== 150) neCount += 1;
+  if (a === NaN) mixed += 100;
+  if (a === (i % 2 === 0)) mixed += 1;
+}
+console.log(eqCount, neCount, mixed);
+for (const v of [0, 1, 2, "2", NaN, null]) {
+  switch (v) {
+    case 0: console.log("zero"); break;
+    case 2: console.log("two"); break;
+    case "2": console.log("string two"); break;
+    case null: console.log("null"); break;
+    default: console.log("other", String(v));
+  }
+}
+function pick(x = 3, y = "d") { return (x === 3 && y !== "") ? x + y.length : -1; }
+console.log(pick(), pick(4), pick(undefined, ""));
+console.log(0 === -0 ? "same" : "diff", NaN !== NaN ? "nan-ne" : "nan-eq", "x" === "x" && "x" !== "y");
+// NaN and -0 held in locals of a loop region: NaN equals nothing, and -0 equals 0.
+let nan = 0 / 0, negZero = -0, zeroHits = 0, nanHits = 0;
+for (let i = 0; i < 100; i++) {
+  if (nan === nan) nanHits += 1;
+  if (nan !== nan) nanHits += 10;
+  if (negZero === i - i) zeroHits += 1;
+  if (i === 50) nanHits += 100;
+}
+console.log(nanHits, zeroHits);

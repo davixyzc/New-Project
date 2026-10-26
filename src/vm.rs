@@ -1186,6 +1186,20 @@ impl Vm {
         self.stack[n - 1] = v;
     }
 
+    /// Pops the two operands on top of the stack, and tells whether they are strictly equal.
+    fn pop_strict_equal(&mut self) -> bool {
+        match self.num_pair() {
+            Some((x, y)) => {
+                self.stack.truncate(self.stack.len() - 2);
+                x == y
+            }
+            None => {
+                let (a, b) = self.pop_pair();
+                strict_eq(&a, &b)
+            }
+        }
+    }
+
     fn pop_pair(&mut self) -> (Value, Value) {
         let b = self.pop();
         let a = self.pop();
@@ -2105,6 +2119,16 @@ impl Vm {
                     }
                 };
                 if !less {
+                    return Ok(t as usize);
+                }
+            }
+            Op::JumpIfStrictEq(t) => {
+                if self.pop_strict_equal() {
+                    return Ok(t as usize);
+                }
+            }
+            Op::JumpIfNotStrictEq(t) => {
+                if !self.pop_strict_equal() {
                     return Ok(t as usize);
                 }
             }

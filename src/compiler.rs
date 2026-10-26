@@ -443,6 +443,8 @@ impl Compiler {
             Op::JumpIfNotLe(_) => Op::JumpIfNotLe(target),
             Op::JumpIfNotGt(_) => Op::JumpIfNotGt(target),
             Op::JumpIfNotGe(_) => Op::JumpIfNotGe(target),
+            Op::JumpIfStrictEq(_) => Op::JumpIfStrictEq(target),
+            Op::JumpIfNotStrictEq(_) => Op::JumpIfNotStrictEq(target),
             Op::JumpIfLtLK(s, k, _) => Op::JumpIfLtLK(s, k, target),
             Op::JumpIfLtLL(a, b, _) => Op::JumpIfLtLL(a, b, target),
             Op::JumpIfNotLtLK(s, k, _) => Op::JumpIfNotLtLK(s, k, target),
@@ -1081,8 +1083,7 @@ impl Compiler {
                 Some(t) => {
                     self.get_slot(value);
                     self.expr(t)?;
-                    self.emit(Op::StrictEq);
-                    to_body.push(Some(self.emit(Op::JumpIfTrue(0))));
+                    to_body.push(Some(self.emit(Op::JumpIfStrictEq(0))));
                 }
                 None => to_body.push(None),
             }
@@ -1616,6 +1617,8 @@ impl Compiler {
                 "<=" => Some(Op::JumpIfNotLe(0)),
                 ">" => Some(Op::JumpIfNotGt(0)),
                 ">=" => Some(Op::JumpIfNotGe(0)),
+                "===" => Some(Op::JumpIfNotStrictEq(0)),
+                "!==" => Some(Op::JumpIfStrictEq(0)),
                 _ => None,
             };
             if let Some(jump) = fused {
@@ -1660,6 +1663,17 @@ impl Compiler {
                 ">=" => Some(Op::JumpIfNotGe(0)),
                 _ => None,
             };
+            // An equality jumps on its true result directly.
+            let equal = match *op {
+                "===" => Some(Op::JumpIfStrictEq(0)),
+                "!==" => Some(Op::JumpIfNotStrictEq(0)),
+                _ => None,
+            };
+            if let Some(jump) = equal {
+                self.expr(a)?;
+                self.expr(b)?;
+                return Ok(self.emit(jump));
+            }
             if let Some(skip) = not_true {
                 self.expr(a)?;
                 self.expr(b)?;

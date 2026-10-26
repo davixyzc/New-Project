@@ -166,7 +166,12 @@ pub(super) fn successors(op: Op, ip: usize, d: i32) -> Vec<(usize, i32)> {
     match op {
         Op::Jump(t) => vec![(at(t), d)],
         Op::JumpIfFalse(t) | Op::JumpIfTrue(t) => vec![(at(t), d - 1), (next, d - 1)],
-        Op::JumpIfNotLt(t) | Op::JumpIfNotLe(t) | Op::JumpIfNotGt(t) | Op::JumpIfNotGe(t) => {
+        Op::JumpIfNotLt(t)
+        | Op::JumpIfNotLe(t)
+        | Op::JumpIfNotGt(t)
+        | Op::JumpIfNotGe(t)
+        | Op::JumpIfStrictEq(t)
+        | Op::JumpIfNotStrictEq(t) => {
             vec![(at(t), d - 2), (next, d - 2)]
         }
         Op::JumpIfLtLK(_, _, t)
@@ -276,6 +281,8 @@ pub(super) fn delta(op: Op) -> i32 {
         | Op::JumpIfNotLe(_)
         | Op::JumpIfNotGt(_)
         | Op::JumpIfNotGe(_)
+        | Op::JumpIfStrictEq(_)
+        | Op::JumpIfNotStrictEq(_)
         | Op::JumpIfLtLK(..)
         | Op::JumpIfLtLL(..)
         | Op::JumpIfNotLtLK(..)
@@ -297,6 +304,8 @@ fn jump_target(op: Op) -> Option<u32> {
         | Op::JumpIfNotLe(t)
         | Op::JumpIfNotGt(t)
         | Op::JumpIfNotGe(t)
+        | Op::JumpIfStrictEq(t)
+        | Op::JumpIfNotStrictEq(t)
         | Op::JumpIfLtLK(_, _, t)
         | Op::JumpIfLtLL(_, _, t)
         | Op::JumpIfNotLtLK(_, _, t)
@@ -609,6 +618,71 @@ impl<'a> Gen<'a> {
             self.a.xor32_imm8(RAX, 1);
         }
         self.store_bool(dst);
+    }
+
+    /// Leaves in RAX whether the values at `x` and `y`, which the instruction consumes, are strictly equal: 1 when they
+    /// are and 0 when not. A reference that either holds is released on the way. A string, and a last reference, take
+    /// `slow`, before anything has changed, so that the instruction runs in full.
+    fn strict_eq_flag(&mut self, x: Mem, y: Mem, slow: Label) {
+        let (same, numbers, bools, equal, unequal, done) = (
+            self.a.label(),
+            self.a.label(),
+            self.a.label(),
+            self.a.label(),
+            self.a.label(),
+            self.a.label(),
+        );
+        self.a.movzx_load8(RAX, x);
+        self.a.movzx_load8(RCX, y);
+        self.a.cmp_rr64(RAX, RCX);
+        self.a.jcc(CC_E, same);
+        // Values of different tags are not equal. A reference that either holds is released, after the checks.
+        self.check_release(x, slow);
+        self.check_release(y, slow);
+        self.release_owned(x);
+        self.release_owned(y);
+        self.a.jmp(unequal);
+        self.a.bind(same);
+        self.a.cmp64_imm8(RAX, TAG_NUM);
+        self.a.jcc(CC_E, numbers);
+        // Two strings are compared by their contents in the instruction's helper.
+        self.a.cmp64_imm8(RAX, TAG_STR);
+        self.a.jcc(CC_E, slow);
+        self.a.cmp64_imm8(RAX, TAG_BOOL);
+        self.a.jcc(CC_E, bools);
+        self.a.cmp64_imm8(RAX, TAG_NULL);
+        self.a.jcc(CC_BE, equal);
+        // Other references are equal when they point at the same allocation.
+        self.check_release(x, slow);
+        self.check_release(y, slow);
+        self.a.mov_load(RCX, x.at(8));
+        self.a.mov_load(RDX, y.at(8));
+        self.a.cmp_rr64(RCX, RDX);
+        self.a.setcc(CC_E, RAX);
+        self.release_owned(x);
+        self.release_owned(y);
+        self.a.jmp(done);
+        self.a.bind(bools);
+        self.a.movzx_load8(RCX, x.at(1));
+        self.a.movzx_load8(RDX, y.at(1));
+        self.a.cmp_rr64(RCX, RDX);
+        self.a.setcc(CC_E, RAX);
+        self.a.jmp(done);
+        self.a.bind(numbers);
+        self.a.movsd_load(0, x.at(8));
+        self.a.movsd_load(1, y.at(8));
+        // An unordered (NaN) comparison sets ZF and PF, so equality also checks the parity flag.
+        self.a.ucomisd(0, 1);
+        self.a.setcc(CC_E, RAX);
+        self.a.setcc(CC_NP, RCX);
+        self.a.and8(RAX, RCX);
+        self.a.jmp(done);
+        self.a.bind(equal);
+        self.a.mov_imm32(RAX, 1);
+        self.a.jmp(done);
+        self.a.bind(unequal);
+        self.a.mov_imm32(RAX, 0);
+        self.a.bind(done);
     }
 
     /// Stores the boolean `value` at `dst`, without a register.
@@ -2619,6 +2693,19 @@ impl<'a> Gen<'a> {
                 let cc = match op {
                     Op::JumpIfFalse(_) => CC_E,
                     _ => CC_NE,
+                };
+                let target = self.target(t);
+                self.a.jcc(cc, target);
+                Fast::Guarded
+            }
+            Op::JumpIfStrictEq(t) | Op::JumpIfNotStrictEq(t) => {
+                let (x, y) = (self.temp(d - 2), self.temp(d - 1));
+                self.strict_eq_flag(x, y, slow);
+                self.a.test64(RAX, RAX);
+                let cc = if matches!(op, Op::JumpIfStrictEq(_)) {
+                    CC_NE
+                } else {
+                    CC_E
                 };
                 let target = self.target(t);
                 self.a.jcc(cc, target);

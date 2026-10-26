@@ -456,7 +456,12 @@ fn function_step(
         Op::JumpIfFalse(_) | Op::JumpIfTrue(_) if top_truthy() => {
             s.pop();
         }
-        Op::JumpIfNotLt(_) | Op::JumpIfNotLe(_) | Op::JumpIfNotGt(_) | Op::JumpIfNotGe(_)
+        Op::JumpIfNotLt(_)
+        | Op::JumpIfNotLe(_)
+        | Op::JumpIfNotGt(_)
+        | Op::JumpIfNotGe(_)
+        | Op::JumpIfStrictEq(_)
+        | Op::JumpIfNotStrictEq(_)
             if top_numbers(2) =>
         {
             s.truncate(s.len() - 2);
@@ -599,6 +604,7 @@ fn allowed(proto: &Proto, op: Op) -> bool {
         | Op::Not => true,
         Op::Jump(_) | Op::JumpIfFalse(_) | Op::JumpIfTrue(_) => true,
         Op::JumpIfNotLt(_) | Op::JumpIfNotLe(_) | Op::JumpIfNotGt(_) | Op::JumpIfNotGe(_) => true,
+        Op::JumpIfStrictEq(_) | Op::JumpIfNotStrictEq(_) => true,
         Op::JumpIfLtLL(..) | Op::JumpIfNotLtLL(..) => true,
         Op::True | Op::False | Op::AndJump(_) | Op::OrJump(_) => true,
         // The element code needs the layout of arrays, which the generic code needs too (see `arr_layout`).
@@ -774,6 +780,11 @@ fn step(proto: &Proto, op: Op, state: &mut Vec<Mark>, arrays: &[bool]) -> bool {
                 return false;
             }
         }
+        // Only numbers are compared, since a boolean is held as 0.0 or 1.0 and would equal the number 1.
+        Op::JumpIfStrictEq(_) | Op::JumpIfNotStrictEq(_) => match pop_kinds(state, 2) {
+            Some(kinds) if kinds.iter().all(number) => {}
+            _ => return false,
+        },
         Op::GetIndexLocal(a) | Op::GetIndex2Local(a) => {
             let keys = if matches!(op, Op::GetIndex2Local(_)) {
                 2
@@ -1474,6 +1485,19 @@ impl Emitter<'_, '_> {
             Op::JumpIfNotLe(t) => {
                 self.a.ucomisd(x, y);
                 self.jump_if(t, CC_B);
+            }
+            // Equal numbers set ZF and not PF, since an unordered (NaN) comparison sets both.
+            Op::JumpIfStrictEq(t) => {
+                self.a.ucomisd(x, y);
+                let not_equal = self.a.label();
+                self.a.jcc(CC_P, not_equal);
+                self.jump_if(t, CC_E);
+                self.a.bind(not_equal);
+            }
+            Op::JumpIfNotStrictEq(t) => {
+                self.a.ucomisd(x, y);
+                self.jump_if(t, CC_P);
+                self.jump_if(t, CC_NE);
             }
             Op::JumpIfNotGt(t) => {
                 self.a.ucomisd(y, x);

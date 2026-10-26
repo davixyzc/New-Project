@@ -113,6 +113,10 @@ pub enum Op {
     JumpIfNotLe(u32),
     JumpIfNotGt(u32),
     JumpIfNotGe(u32),
+    /// Fused strict equality and jump: pops two operands and jumps when they are strictly equal, or, for
+    /// `JumpIfNotStrictEq`, when they are not.
+    JumpIfStrictEq(u32),
+    JumpIfNotStrictEq(u32),
     /// `local < constant` (operands: slot, constant index, target) and `local < local`
     /// (operands: slot, slot, target), each jumping when the test is true.
     JumpIfLtLK(u32, u32, u32),

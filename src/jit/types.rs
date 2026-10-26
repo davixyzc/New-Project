@@ -81,6 +81,8 @@ fn transfer(proto: &Proto, op: Op, d: i32, before: &[bool]) -> Vec<bool> {
         | Op::JumpIfNotLe(_)
         | Op::JumpIfNotGt(_)
         | Op::JumpIfNotGe(_)
+        | Op::JumpIfStrictEq(_)
+        | Op::JumpIfNotStrictEq(_)
         | Op::JumpIfLtLK(..)
         | Op::JumpIfLtLL(..)
         | Op::JumpIfNotLtLK(..)
