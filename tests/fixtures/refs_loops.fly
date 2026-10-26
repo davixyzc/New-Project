@@ -1,0 +1,41 @@
+// Object, array, string and closure references held by locals, operands and `this` in loops, copied, kept and dropped.
+function make(i) {
+  return { id: i, tag: "t" + i, get() { return this.id; } };
+}
+const keep = [];
+let total = 0;
+for (let i = 0; i < 300; i++) {
+  const o = make(i);
+  const again = o;
+  total += o.get() + again.id;
+  if (i % 50 === 0) keep.push(o);
+}
+console.log(total, keep.length, keep[5].tag, keep[5] === keep[5]);
+const adders = [];
+for (let i = 0; i < 100; i++) {
+  const o = { v: i };
+  adders.push(() => o.v + i);
+}
+let sum = 0;
+for (let k = 0; k < adders.length; k++) sum += adders[k]();
+console.log(sum);
+const counter = { n: 0, inc() { this.n++; return this; } };
+let c = counter;
+for (let i = 0; i < 200; i++) c = c.inc();
+console.log(counter.n, c === counter);
+let s = "";
+const parts = [];
+for (let i = 0; i < 100; i++) {
+  const t = "x" + i;
+  parts.push(t);
+  s = t;
+}
+console.log(s, parts.length, parts[99]);
+let a1 = [1, 2];
+const hold = a1;
+for (let i = 0; i < 10; i++) a1 = [i, hold.length];
+console.log(a1, hold);
+const nested = [{ inner: [1, { deep: "d" }] }];
+let deep = "";
+for (let i = 0; i < 50; i++) deep = nested[0].inner[1].deep + i;
+console.log(deep, nested[0].inner.length);

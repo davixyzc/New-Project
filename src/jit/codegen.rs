@@ -1930,11 +1930,12 @@ impl<'a> Gen<'a> {
                 Fast::Direct(drop, vec![Arg::Addr(top)])
             }
             Op::GetLocal(i) => {
+                // A value that owns a reference gains one here, as a clone does, so no helper is called.
                 let (src, dst) = (self.local(i), self.temp(d));
-                self.check_plain(src, slow);
-                self.copy(src, dst);
-                let clone = rt::clone_into as *const () as usize;
-                Fast::Direct(clone, vec![Arg::Addr(src), Arg::Addr(dst)])
+                self.load_clone(src);
+                self.a.mov_store(dst, RAX);
+                self.a.mov_store(dst.at(8), RCX);
+                Fast::Pure
             }
             Op::SetLocal(i) => {
                 // Copies the top value, so both it and the old local must own nothing.
@@ -2321,18 +2322,18 @@ impl<'a> Gen<'a> {
             Op::This if !self.proto.is_arrow => {
                 // `this` sits just below the arguments of the call, in the slot before the frame's first local.
                 let (src, dst) = (self.slot(-1), self.temp(d));
-                self.check_plain(src, slow);
-                self.copy(src, dst);
-                let clone = rt::clone_into as *const () as usize;
-                Fast::Direct(clone, vec![Arg::Addr(src), Arg::Addr(dst)])
+                self.load_clone(src);
+                self.a.mov_store(dst, RAX);
+                self.a.mov_store(dst.at(8), RCX);
+                Fast::Pure
             }
             Op::Dup => {
-                // Copies the top value. A plain value is copied here, and any other is cloned by a helper.
+                // Copies the top value, and counts the reference that a value which owns one gains.
                 let (src, dst) = (self.temp(d - 1), self.temp(d));
-                self.check_plain(src, slow);
-                self.copy(src, dst);
-                let clone = rt::clone_into as *const () as usize;
-                Fast::Direct(clone, vec![Arg::Addr(src), Arg::Addr(dst)])
+                self.load_clone(src);
+                self.a.mov_store(dst, RAX);
+                self.a.mov_store(dst.at(8), RCX);
+                Fast::Pure
             }
             Op::Mod => {
                 // Replaces two numbers by their remainder. Whole numbers that `int_mod` divides are divided here, and
