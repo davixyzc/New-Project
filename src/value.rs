@@ -534,6 +534,60 @@ pub fn obj_put_hinted(obj: &ObjRef, key: &Rc<str>, v: Value, hint: &Cell<u32>) {
     }
 }
 
+/// Where the properties of an object sit in memory, for native code that reads and writes one in place (see
+/// `jit::codegen`). `items` is from the allocation of the object to the `Vec` of its properties, `buf` and `len` are the
+/// pointer and the length within that `Vec`, and `entry`, `key` and `value` are the size of a property and the offsets of
+/// its key and its value.
+#[derive(Clone, Copy)]
+pub(crate) struct PropLayout {
+    pub items: i32,
+    pub buf: i32,
+    pub len: i32,
+    pub entry: i32,
+    pub key: i32,
+    pub value: i32,
+}
+
+/// The layout of the properties, when native code can rely on it. It is found once, by probing the layout that Rust
+/// gives these types. None when a probe does not find what native code expects, and then the helpers read the
+/// properties alone.
+pub(crate) fn prop_layout() -> Option<PropLayout> {
+    static LAYOUT: std::sync::OnceLock<Option<PropLayout>> = std::sync::OnceLock::new();
+    *LAYOUT.get_or_init(probe_prop_layout)
+}
+
+fn probe_prop_layout() -> Option<PropLayout> {
+    use std::mem::{offset_of, size_of};
+    if !crate::jit::rc_layout_ok() || size_of::<Vec<(Rc<str>, Value)>>() != 3 * size_of::<usize>() {
+        return None;
+    }
+    // The properties of an object sit in a `RefCell`, whose value Rust does not place at a fixed offset.
+    let cell = RefCell::new(Props::default());
+    let cell_value = cell.as_ptr() as usize - &cell as *const _ as usize;
+    // A `Vec` of three properties with room for five. Of its three words, the buffer pointer and the length are
+    // found by their values.
+    let mut items: Vec<(Rc<str>, Value)> = Vec::with_capacity(5);
+    for _ in 0..3 {
+        items.push((Rc::from(""), Value::Undef));
+    }
+    // SAFETY: a `Vec` is the three words that the size check above confirms, so each of them is read as a `usize`.
+    let words: [usize; 3] = unsafe { std::mem::transmute_copy(&items) };
+    let word_of = |want: usize| {
+        words
+            .iter()
+            .position(|&w| w == want)
+            .map(|i| (i * size_of::<usize>()) as i32)
+    };
+    Some(PropLayout {
+        items: crate::jit::RC_VALUE + cell_value as i32 + offset_of!(Props, items) as i32,
+        buf: word_of(items.as_ptr() as usize)?,
+        len: word_of(3)?,
+        entry: size_of::<(Rc<str>, Value)>() as i32,
+        key: offset_of!((Rc<str>, Value), 0) as i32,
+        value: offset_of!((Rc<str>, Value), 1) as i32,
+    })
+}
+
 /// A hasher for names, which are short: a rotate and a multiply per byte. The default hasher is built for long keys
 /// and is slow on short ones, and a built-in such as `Math` is looked up by name each time it is used.
 #[derive(Default)]

@@ -1,0 +1,13 @@
+// Overwrites of properties whose old values are shared (a few are kept alive) or unshared (most are dropped).
+const hold = { p: null, q: null };
+const alive = [];
+let sum = 0;
+for (let i = 0; i < 20000; i++) {
+  const v = { id: i, next: null };
+  hold.p = v;
+  hold.q = { id: -i };
+  if (i % 2 === 0 && alive.length < 10) alive.push(v);
+  sum += hold.p.id + hold.q.id;
+  v.next = hold.q;
+}
+console.log("sum", sum, alive.length, alive[9].id, hold.p.id, hold.q.id);

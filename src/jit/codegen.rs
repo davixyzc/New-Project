@@ -19,7 +19,7 @@ use super::rt::{self, STATUS_JUMP};
 use super::types::{number_slots, Numbers};
 use super::x64::*;
 use crate::bytecode::{Op, Proto};
-use crate::value::Value;
+use crate::value::{prop_layout, PropLayout, Value};
 
 /// Tags of `Value`, the discriminants `#[repr(u8)]` gives its variants.
 const TAG_UNDEF: u8 = 0;
@@ -28,10 +28,20 @@ pub(super) const TAG_BOOL: u8 = 2;
 pub(super) const TAG_NUM: u8 = 3;
 const TAG_STR: u8 = 4;
 const TAG_ARR: u8 = 5;
+const TAG_OBJ: u8 = 6;
 const TAG_FUNC: u8 = 7;
 const TAG_NATIVE: u8 = 8;
 /// Bit `n` is set when tag `n` owns a reference (see `Value::owns_ref`).
 const OWNING: u32 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 9);
+
+/// A property access in the code: the name, the cell of the position hint for it, and the layout of the properties (see
+/// `prop_layout`). Native code reads and writes the property in place when the hint finds it.
+#[derive(Clone, Copy)]
+struct PropSite {
+    name: usize,
+    hint: usize,
+    layout: PropLayout,
+}
 
 /// Where native code finds the parts of the VM it reads and writes: the frame stack and the value stack, both
 /// `repr(C)` (see `vm`), and the fields of a frame. Each offset is from the start of the VM, or of the frame.
@@ -1057,6 +1067,213 @@ impl<'a> Gen<'a> {
     }
 
     /// Returns from the function, through its helper, which pops the frame.
+    /// Adds `delta` to the count of references that the allocation at `ptr` starts with (see `rc_layout_ok`). R8 is the
+    /// scratch register.
+    fn add_count(&mut self, ptr: u8, delta: i8) {
+        self.a.mov_load(R8, Mem { base: ptr, disp: 0 });
+        self.a.add64_imm8(R8, delta);
+        self.a.mov_store(Mem { base: ptr, disp: 0 }, R8);
+    }
+
+    /// Leaves in RDX the entry of the property `name` of the object at `obj`, when the object is a plain one and the
+    /// property is at the position that `hint` holds, as `Props::position_hinted` finds it. The key is compared by both
+    /// words of its `Rc<str>`, which are equal exactly when the keys share an allocation. Any other object jumps to
+    /// `miss`, before anything has changed.
+    fn prop_entry(&mut self, obj: Mem, site: PropSite, miss: Label) {
+        let PropSite { name, hint, layout } = site;
+        self.check_tag(obj, TAG_OBJ, miss);
+        self.a.mov_load(RCX, obj.at(8));
+        self.a.add64_imm32(RCX, layout.items);
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: RCX,
+                disp: layout.len,
+            },
+        );
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: RCX,
+                disp: layout.buf,
+            },
+        );
+        self.a.mov_imm64(RAX, hint as u64);
+        self.a.mov32_load(RAX, Mem { base: RAX, disp: 0 });
+        self.a.cmp_rr64(RAX, RSI);
+        self.a.jcc(CC_AE, miss);
+        self.a.imul64_imm(RAX, RAX, layout.entry);
+        self.a.add64(RDX, RAX);
+        self.a.mov_imm64(RAX, name as u64);
+        for word in [0, 8] {
+            self.a.mov_load(
+                RSI,
+                Mem {
+                    base: RAX,
+                    disp: word,
+                },
+            );
+            self.a.mov_load(
+                RDI,
+                Mem {
+                    base: RDX,
+                    disp: layout.key + word,
+                },
+            );
+            self.a.cmp_rr64(RSI, RDI);
+            self.a.jcc(CC_NE, miss);
+        }
+    }
+
+    /// Copies the value of the property that `prop_entry` finds into `dst`, and jumps to `done`. A `consumed` object is
+    /// the one that the instruction replaces, so its reference is released here, and it must not be the last one (the
+    /// helper frees an object that the last reference leaves).
+    fn get_prop_native(
+        &mut self,
+        obj: Mem,
+        dst: Mem,
+        site: PropSite,
+        consumed: bool,
+        miss: Label,
+        done: Label,
+    ) {
+        self.prop_entry(obj, site, miss);
+        let layout = site.layout;
+        if consumed {
+            self.a.mov_load(RCX, obj.at(8));
+            self.a.mov_load(R8, Mem { base: RCX, disp: 0 });
+            self.a.cmp64_imm8(R8, 1);
+            self.a.jcc(CC_BE, miss);
+        }
+        // The copy holds a reference of its own, if the value owns one.
+        let plain = self.a.label();
+        self.a.movzx_load8(
+            R9,
+            Mem {
+                base: RDX,
+                disp: layout.value,
+            },
+        );
+        self.a.mov_imm32(R10, OWNING);
+        self.a.bt(R10, R9);
+        self.a.jcc(CC_AE, plain);
+        self.a.mov_load(
+            R11,
+            Mem {
+                base: RDX,
+                disp: layout.value + 8,
+            },
+        );
+        self.add_count(R11, 1);
+        self.a.bind(plain);
+        self.a.mov_load(
+            RAX,
+            Mem {
+                base: RDX,
+                disp: layout.value,
+            },
+        );
+        self.a.mov_load(
+            RCX,
+            Mem {
+                base: RDX,
+                disp: layout.value + 8,
+            },
+        );
+        if consumed {
+            self.a.mov_load(R11, obj.at(8));
+            self.add_count(R11, -1);
+        }
+        self.a.mov_store(dst, RAX);
+        self.a.mov_store(dst.at(8), RCX);
+        self.a.jmp(done);
+    }
+
+    /// Stores the value at `val` into the property that `prop_entry` finds in the object at `obj`, and leaves the value
+    /// in the object's slot, as `set_prop_top` does. The property keeps a copy of the value, and its old value is
+    /// released. The references released (the object's, and the old value's if it owns one) must not be the last one, so
+    /// any other case jumps to `miss` before anything has changed.
+    fn set_prop_native(&mut self, obj: Mem, val: Mem, site: PropSite, miss: Label, done: Label) {
+        self.prop_entry(obj, site, miss);
+        let layout = site.layout;
+        self.a.mov_imm32(R10, OWNING);
+        self.a.mov_load(RCX, obj.at(8));
+        self.a.mov_load(R8, Mem { base: RCX, disp: 0 });
+        self.a.cmp64_imm8(R8, 1);
+        self.a.jcc(CC_BE, miss);
+        let old_plain = self.a.label();
+        self.a.movzx_load8(
+            R9,
+            Mem {
+                base: RDX,
+                disp: layout.value,
+            },
+        );
+        self.a.bt(R10, R9);
+        self.a.jcc(CC_AE, old_plain);
+        self.a.mov_load(
+            R11,
+            Mem {
+                base: RDX,
+                disp: layout.value + 8,
+            },
+        );
+        self.a.mov_load(R8, Mem { base: R11, disp: 0 });
+        self.a.cmp64_imm8(R8, 1);
+        self.a.jcc(CC_BE, miss);
+        self.a.bind(old_plain);
+        // The property takes a copy of the value, which counts one more reference if the value owns one.
+        self.a.mov_load(RAX, val);
+        self.a.mov_load(RCX, val.at(8));
+        let new_plain = self.a.label();
+        self.a.movzx_load8(R9, val);
+        self.a.bt(R10, R9);
+        self.a.jcc(CC_AE, new_plain);
+        self.a.mov_rr(R11, RCX);
+        self.add_count(R11, 1);
+        self.a.bind(new_plain);
+        // The old value is released, which counts one reference down.
+        let released = self.a.label();
+        self.a.movzx_load8(
+            R9,
+            Mem {
+                base: RDX,
+                disp: layout.value,
+            },
+        );
+        self.a.bt(R10, R9);
+        self.a.jcc(CC_AE, released);
+        self.a.mov_load(
+            R11,
+            Mem {
+                base: RDX,
+                disp: layout.value + 8,
+            },
+        );
+        self.add_count(R11, -1);
+        self.a.bind(released);
+        self.a.mov_store(
+            Mem {
+                base: RDX,
+                disp: layout.value,
+            },
+            RAX,
+        );
+        self.a.mov_store(
+            Mem {
+                base: RDX,
+                disp: layout.value + 8,
+            },
+            RCX,
+        );
+        // The object's reference is released, and the object's slot takes the value that `val` gave up.
+        self.a.mov_load(R11, obj.at(8));
+        self.add_count(R11, -1);
+        self.a.mov_store(obj, RAX);
+        self.a.mov_store(obj.at(8), RCX);
+        self.a.jmp(done);
+    }
+
     /// Returns from the function without `rt::ret` when that helper would only pop the frame and move the result
     /// down. The frame must be a plain one (not a constructor, not a callback's, with no `try`), and another frame
     /// must lie below it. The slots the frame drops give up their references first: a reference that is not the last
@@ -1416,6 +1633,13 @@ impl<'a> Gen<'a> {
                 let get = rt::get_prop_top as *const () as usize;
                 let args = [Arg::Addr(top), Arg::Imm(name as u64), Arg::Imm(hint as u64)];
                 let (lookup, done) = (self.a.label(), self.a.label());
+                if let Some(layout) = prop_layout() {
+                    // A property of a plain object is read in place, when the hint finds it (see `get_prop_native`).
+                    let native_miss = self.a.label();
+                    let site = PropSite { name, hint, layout };
+                    self.get_prop_native(top, top, site, true, native_miss, done);
+                    self.a.bind(native_miss);
+                }
                 if &*self.proto.names[i as usize] == "length" {
                     // The length of a string is read here, in place. Any other value takes the lookup.
                     self.check_tag(top, TAG_STR, lookup);
@@ -1462,6 +1686,13 @@ impl<'a> Gen<'a> {
                     Arg::Imm(hint as u64),
                 ];
                 let (lookup, done) = (self.a.label(), self.a.label());
+                if let Some(layout) = prop_layout() {
+                    // A property of a plain object is read in place, when the hint finds it (see `get_prop_native`).
+                    let native_miss = self.a.label();
+                    let site = PropSite { name, hint, layout };
+                    self.get_prop_native(src, dst, site, false, native_miss, done);
+                    self.a.bind(native_miss);
+                }
                 if &*self.proto.names[n as usize] == "push" {
                     // The `push` of an array is the built-in, so it is written here, without a lookup.
                     self.check_tag(src, TAG_ARR, lookup);
@@ -1574,6 +1805,14 @@ impl<'a> Gen<'a> {
                 let hint = &self.proto.hints[i as usize] as *const Cell<u32> as usize;
                 let (obj, val) = (self.temp(d - 2), self.temp(d - 1));
                 let set = rt::set_prop_top as *const () as usize;
+                let done = self.a.label();
+                if let Some(layout) = prop_layout() {
+                    // A property of a plain object is stored in place, when the hint finds it (see `set_prop_native`).
+                    let native_miss = self.a.label();
+                    let site = PropSite { name, hint, layout };
+                    self.set_prop_native(obj, val, site, native_miss, done);
+                    self.a.bind(native_miss);
+                }
                 let args = [
                     Arg::Addr(obj),
                     Arg::Imm(name as u64),
@@ -1583,6 +1822,7 @@ impl<'a> Gen<'a> {
                 self.direct_call(set, &args);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
+                self.a.bind(done);
                 Fast::Guarded
             }
             Op::This if !self.proto.is_arrow => {

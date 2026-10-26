@@ -1,0 +1,84 @@
+// Property reads and writes from compiled code: the inline hit path, its misses, and the reference counts it moves.
+const o = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+let hot = 0;
+for (let i = 0; i < 2000; i++) { hot += o.e; o.a = i; hot += o.a; }
+console.log("hot", hot, o.a, o.e);
+
+const shapes = [{ x: 1, y: 2 }, { y: 3, x: 4 }, { z: 0, x: 5, y: 6 }, { x: 7 }];
+let poly = 0;
+for (let r = 0; r < 500; r++) for (let i = 0; i < shapes.length; i++) poly += shapes[i].x;
+console.log("poly", poly);
+
+const missing = { k: 1 };
+let misses = 0;
+for (let i = 0; i < 300; i++) if (missing.nope === undefined) misses++;
+console.log("missing", misses, missing.k);
+
+class P { constructor(v) { this.v = v; } get1() { return this.v; } }
+const p = new P(3);
+let viaProto = 0;
+for (let i = 0; i < 1000; i++) viaProto += p.get1() + p.v;
+console.log("proto", viaProto);
+
+class G { constructor() { this._x = 1; } get x() { return this._x * 2; } set x(v) { this._x = v; } }
+const g = new G();
+let acc = 0;
+for (let i = 0; i < 100; i++) { g.x = i; acc += g.x; }
+console.log("accessor", acc, g._x);
+
+const d = { a: 1, b: 2, c: 3 };
+delete d.b;
+d.b = 9;
+let dsum = 0;
+for (let i = 0; i < 50; i++) dsum += d.a + d.b + d.c;
+console.log("delete", dsum, d.a, d.b, d.c);
+
+const big = {};
+for (let i = 0; i < 20; i++) big["k" + i] = i;
+let bigSum = 0;
+for (let r = 0; r < 100; r++) bigSum += big.k19 + big.k0 + big.k10;
+console.log("big", bigSum);
+
+const n = { v: 1 };
+n.self = n;
+let selfSum = 0;
+for (let i = 0; i < 100; i++) selfSum += n.self.self.v;
+console.log("self", selfSum);
+
+let temp = 0;
+for (let i = 0; i < 1000; i++) temp += ({ q: i }).q;
+console.log("temp", temp);
+
+const holder = { p: null };
+const keep = [];
+for (let i = 0; i < 1000; i++) {
+  const item = { id: i };
+  holder.p = item;
+  if (i % 100 === 0) keep.push(item);
+}
+console.log("holder", holder.p.id, keep.length, keep[9].id);
+
+const a1 = { v: 1 };
+const alias = [a1];
+const h = { r: a1 };
+for (let i = 0; i < 10; i++) h.r = { v: i };
+console.log("alias", alias[0].v, h.r.v);
+
+const arr = [{ v: 1 }, { v: 2 }];
+let arrSum = 0;
+for (let i = 0; i < 400; i++) { arr[i % 2].v = arr[i % 2].v + 1; arrSum += arr[i % 2].v; }
+console.log("arr", arrSum, arr[0].v, arr[1].v);
+
+console.log("lengths", [1, 2, 3].length, "abc".length);
+const m = new Map();
+m.set(1, "a");
+m.set(2, "b");
+console.log("map", m.size);
+
+try { const nn = null; nn.x; } catch (e) { console.log("null", e instanceof TypeError); }
+
+const cnt = { n: 0 };
+function bump() { cnt.n = cnt.n + 1; return cnt.n; }
+let bumps = 0;
+for (let i = 0; i < 300; i++) bumps = bump();
+console.log("closure", bumps, cnt.n);
