@@ -782,6 +782,19 @@ pub(crate) struct ArrLayout {
     pub cap: i32,
 }
 
+/// The offset from the allocation of an `Rc<RefCell<Value>>` (a captured variable) to the value that it holds, when
+/// native code can rely on it. It is found once, as `prop_layout` is.
+pub(crate) fn cell_value_offset() -> Option<i32> {
+    static OFFSET: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        if !crate::jit::rc_layout_ok() {
+            return None;
+        }
+        let cell = RefCell::new(Value::Undef);
+        Some(crate::jit::RC_VALUE + (cell.as_ptr() as usize - &cell as *const _ as usize) as i32)
+    })
+}
+
 /// The layout of the elements of an array, when native code can rely on it. It is found once, as `prop_layout` is.
 pub(crate) fn arr_layout() -> Option<ArrLayout> {
     static LAYOUT: std::sync::OnceLock<Option<ArrLayout>> = std::sync::OnceLock::new();

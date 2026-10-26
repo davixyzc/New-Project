@@ -20,7 +20,8 @@ use super::types::{number_slots, Numbers};
 use super::x64::*;
 use crate::bytecode::{Op, Proto};
 use crate::value::{
-    arr_layout, entry_layout, prop_layout, ArrLayout, EntryLayout, PropHint, PropLayout, Value,
+    arr_layout, cell_value_offset, entry_layout, prop_layout, ArrLayout, EntryLayout, PropHint,
+    PropLayout, Value,
 };
 use crate::vm::{globals_slots_offset, MAX_ARRAY_GROW};
 
@@ -1959,7 +1960,71 @@ impl<'a> Gen<'a> {
             Op::GetUpval(i) => {
                 let dst = self.temp(d);
                 let upval = rt::upval_into as *const () as usize;
+                let (Some(layout), Some(cell_value)) = (arr_layout(), cell_value_offset()) else {
+                    self.direct_call(upval, &[Arg::Vm, Arg::Imm(u64::from(i)), Arg::Addr(dst)]);
+                    return Fast::Pure;
+                };
+                // The running closure is the top frame's, and its upvalues are a `Vec` of cells, which hold the values.
+                let l = vm_layout();
+                let upvals = std::mem::offset_of!(crate::value::Closure, upvals) as i32;
+                let (slow, done) = (self.a.label(), self.a.label());
+                self.a.mov_load(
+                    R10,
+                    Mem {
+                        base: RBX,
+                        disp: l.frames_len,
+                    },
+                );
+                self.a.imul64_imm(R11, R10, l.frame_size);
+                self.a.mov_load(
+                    RCX,
+                    Mem {
+                        base: RBX,
+                        disp: l.frames_buf,
+                    },
+                );
+                self.a.add64(R11, RCX);
+                self.a.mov_load(
+                    RCX,
+                    Mem {
+                        base: R11,
+                        disp: l.f_closure - l.frame_size,
+                    },
+                );
+                self.a.mov_load(
+                    RSI,
+                    Mem {
+                        base: RCX,
+                        disp: upvals + layout.len,
+                    },
+                );
+                self.a.cmp64_imm32(RSI, i as i32);
+                self.a.jcc(CC_BE, slow);
+                self.a.mov_load(
+                    RDX,
+                    Mem {
+                        base: RCX,
+                        disp: upvals + layout.buf,
+                    },
+                );
+                self.a.mov_load(
+                    RDX,
+                    Mem {
+                        base: RDX,
+                        disp: 8 * i as i32,
+                    },
+                );
+                // The cell's allocation holds the value, which is copied and counted as a clone counts it.
+                self.load_clone(Mem {
+                    base: RDX,
+                    disp: cell_value,
+                });
+                self.a.mov_store(dst, RAX);
+                self.a.mov_store(dst.at(8), RCX);
+                self.a.jmp(done);
+                self.a.bind(slow);
                 self.direct_call(upval, &[Arg::Vm, Arg::Imm(u64::from(i)), Arg::Addr(dst)]);
+                self.a.bind(done);
                 Fast::Pure
             }
             Op::Closure(i) => {
