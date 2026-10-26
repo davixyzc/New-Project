@@ -1,0 +1,25 @@
+// Loop tests at the end of a loop, with the orderings `<=`, `>` and `>=`, NaN, `&&` and `!`, which run as fused jumps.
+let k = 0;
+do { k++; } while (k <= NaN);
+console.log(k);
+let j = 0;
+for (; j <= 3; j++) {}
+console.log(j);
+let n = 0;
+do { n++; } while (n > 2 && n < 6);
+console.log(n);
+let c = 0;
+for (let i = 0; i < 9 && c >= 0; i++) c += 1;
+console.log(c);
+let t = 5, s = 0;
+do { s += t; t--; } while (t >= 1);
+console.log(s, t);
+let w = 0, q = 1;
+do { w++; q *= 2; } while (q <= 1000 && w < 50);
+console.log(w, q);
+let g = 10, steps = 0;
+for (; g > 0.5; g /= 2) steps++;
+console.log(steps);
+let m = 3;
+do { m--; } while (!(m <= 0));
+console.log(m);

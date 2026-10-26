@@ -1,0 +1,12 @@
+// `&&` and `||` used as values in loops: the operand that decides the value is kept, the other one is dropped, and
+// a boolean that a `push` stores keeps its type.
+let hits = 0, total = 0;
+for (let i = 0; i < 50; i++) {
+  const v = (i % 3 === 0 || (i % 5 === 0 && i > 20)) ? 1 : 0;
+  hits += v;
+  total += (i % 2 === 1 && i) || 0;
+}
+console.log(hits, total);
+const flags = [];
+for (let i = 0; i < 20; i++) flags.push(i > 5 && i < 15 || i === 19);
+console.log(flags.length, flags[0], flags[6], flags[14], flags[15], flags[19]);

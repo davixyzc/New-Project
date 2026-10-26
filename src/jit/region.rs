@@ -490,11 +490,12 @@ fn function_step(
     Some(s)
 }
 
-/// Whether the number the test at `ip` leaves is consumed by the jump after it.
+/// Whether the number the test at `ip` leaves is consumed by the jump after it. A `&&` or `||` tests its operand the
+/// same way, and keeps it as the value of the expression when it jumps (see `operand_marks`).
 fn consumed(code: &[Op], ip: usize) -> bool {
     matches!(
         code.get(ip + 1),
-        Some(Op::JumpIfFalse(_) | Op::JumpIfTrue(_))
+        Some(Op::JumpIfFalse(_) | Op::JumpIfTrue(_) | Op::AndJump(_) | Op::OrJump(_))
     )
 }
 

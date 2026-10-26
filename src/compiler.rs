@@ -1650,6 +1650,23 @@ impl Compiler {
                     }
                 }
             }
+            // The comparison jumps on its false result past the jump that is taken when it is true. A NaN operand makes
+            // every ordering false, as the fused jump on false does.
+            let not_true = match *op {
+                "<" => Some(Op::JumpIfNotLt(0)),
+                "<=" => Some(Op::JumpIfNotLe(0)),
+                ">" => Some(Op::JumpIfNotGt(0)),
+                ">=" => Some(Op::JumpIfNotGe(0)),
+                _ => None,
+            };
+            if let Some(skip) = not_true {
+                self.expr(a)?;
+                self.expr(b)?;
+                let past = self.emit(skip);
+                let back = self.emit(Op::Jump(0));
+                self.patch(past);
+                return Ok(back);
+            }
         }
         self.expr(cond)?;
         Ok(self.emit(Op::JumpIfTrue(0)))
