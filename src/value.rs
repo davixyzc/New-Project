@@ -909,17 +909,32 @@ pub fn push_number(out: &mut String, n: f64) {
     }
 }
 
+/// The two digits of each number from 00 to 99, so that an integer is written two digits at a time.
+const DIGIT_PAIRS: [[u8; 2]; 100] = {
+    let mut pairs = [[0u8; 2]; 100];
+    let mut i = 0;
+    while i < 100 {
+        pairs[i] = [b'0' + (i / 10) as u8, b'0' + (i % 10) as u8];
+        i += 1;
+    }
+    pairs
+};
+
 /// The decimal digits of `v`, with a minus sign when it is negative, written at the end of `buf`.
 fn int_text(v: i64, buf: &mut [u8; 21]) -> &str {
     let mut at = buf.len();
     let mut rest = v.unsigned_abs();
-    loop {
+    while rest >= 100 {
+        at -= 2;
+        buf[at..at + 2].copy_from_slice(&DIGIT_PAIRS[(rest % 100) as usize]);
+        rest /= 100;
+    }
+    if rest >= 10 {
+        at -= 2;
+        buf[at..at + 2].copy_from_slice(&DIGIT_PAIRS[rest as usize]);
+    } else {
         at -= 1;
-        buf[at] = b'0' + (rest % 10) as u8;
-        rest /= 10;
-        if rest == 0 {
-            break;
-        }
+        buf[at] = b'0' + rest as u8;
     }
     if v < 0 {
         at -= 1;
@@ -975,15 +990,12 @@ pub fn concat_owned(old: Value, rhs: Value) -> Value {
 
 /// `%` with an integer fast path, because the floating-point remainder is slow.
 pub fn js_mod(a: f64, b: f64) -> f64 {
-    // Casts avoid the libm call that `fract` needs on baseline x86-64.
+    // Casts avoid the libm call that `fract` needs on baseline x86-64. Below 2^63 the operands are exact in i64, and
+    // so is the remainder, which is also exact as a float: fmod's result always is. The bound keeps `i64::MIN % -1`
+    // out.
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
     let (ai, bi) = (a as i64, b as i64);
-    const LIMIT: u64 = 1 << 53;
-    if ai as f64 == a
-        && bi as f64 == b
-        && bi != 0
-        && ai.unsigned_abs() < LIMIT
-        && bi.unsigned_abs() < LIMIT
-    {
+    if ai as f64 == a && bi as f64 == b && bi != 0 && a.abs() < LIMIT && b.abs() < LIMIT {
         let r = ai % bi;
         // A zero remainder takes the sign of the dividend, so `-4 % 2` is -0.
         if r == 0 && a.is_sign_negative() {

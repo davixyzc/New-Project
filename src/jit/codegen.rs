@@ -26,6 +26,7 @@ const TAG_UNDEF: u8 = 0;
 const TAG_NULL: u8 = 1;
 pub(super) const TAG_BOOL: u8 = 2;
 pub(super) const TAG_NUM: u8 = 3;
+const TAG_STR: u8 = 4;
 const TAG_ARR: u8 = 5;
 const TAG_NATIVE: u8 = 8;
 /// Bit `n` is set when tag `n` owns a reference (see `Value::owns_ref`).
@@ -673,26 +674,61 @@ impl<'a> Gen<'a> {
         self.after_helper(None);
     }
 
+    /// One step of a call with one argument. When the callee is the built-in at `def`, `helper` runs the call in
+    /// place, and the call is done when it returns true. A helper that declines takes `generic`. Any other callee
+    /// goes on to `next`.
+    fn builtin_call1(
+        &mut self,
+        callee: Mem,
+        def: u64,
+        helper: usize,
+        next: Label,
+        generic: Label,
+        done: Label,
+    ) {
+        self.a.mov_load(RAX, callee.at(8));
+        self.a.mov_imm64(RCX, def);
+        self.a.cmp_rr64(RAX, RCX);
+        self.a.jcc(CC_NE, next);
+        self.a.lea(RDI, callee);
+        self.a.mov_imm64(RAX, helper as u64);
+        self.a.call_reg(RAX);
+        // The helper clobbers the xmm registers that hold cached locals, so they are reloaded before any use.
+        self.reload_all();
+        self.a.test8(RAX, RAX);
+        self.a.jcc(CC_NE, done);
+        self.a.jmp(generic);
+    }
+
     /// A plain call. `rt::call_plain` pushes the callee's frame when it can, and then native code
     /// runs the callee's code itself. Otherwise the call has already run when the helper returns.
     fn plain_call(&mut self, ip: usize, d: i32, argc: u32) {
         let (generic, done) = (self.a.label(), self.a.label());
         if argc == 1 {
-            // A call of the built-in `push` on an array runs in place (see `rt::push_call`). Any other
-            // callee takes the generic path below, and so does an array push that the helper declines.
+            // Some built-ins run in place when called with one argument: `push` on an array (`rt::push_call`),
+            // `charCodeAt` on a string (`rt::char_code_call`) and `String` on a number (`rt::string_call`). Any
+            // other callee takes the generic path below, and so does a call that a helper declines.
             let callee = self.temp(d - 3);
+            let (not_push, not_char_code) = (self.a.label(), self.a.label());
             let push = crate::builtins::array::push_def() as *const _ as usize as u64;
+            let char_code = crate::builtins::string::char_code_at_def() as *const _ as usize as u64;
+            let string = crate::builtins::global::string_def() as *const _ as usize as u64;
             self.check_tag(callee, TAG_NATIVE, generic);
-            self.a.mov_load(RAX, callee.at(8));
-            self.a.mov_imm64(RCX, push);
-            self.a.cmp_rr64(RAX, RCX);
-            self.a.jcc(CC_NE, generic);
-            self.a.lea(RDI, callee);
-            self.a
-                .mov_imm64(RAX, rt::push_call as *const () as usize as u64);
-            self.a.call_reg(RAX);
-            self.a.test8(RAX, RAX);
-            self.a.jcc(CC_NE, done);
+            let push_helper = rt::push_call as *const () as usize;
+            let char_code_helper = rt::char_code_call as *const () as usize;
+            let string_helper = rt::string_call as *const () as usize;
+            self.builtin_call1(callee, push, push_helper, not_push, generic, done);
+            self.a.bind(not_push);
+            self.builtin_call1(
+                callee,
+                char_code,
+                char_code_helper,
+                not_char_code,
+                generic,
+                done,
+            );
+            self.a.bind(not_char_code);
+            self.builtin_call1(callee, string, string_helper, generic, generic, done);
         }
         self.a.bind(generic);
         self.a.mov_rr(RDI, RBX);
@@ -939,9 +975,22 @@ impl<'a> Gen<'a> {
                 let top = self.temp(d - 1);
                 let get = rt::get_prop_top as *const () as usize;
                 let args = [Arg::Addr(top), Arg::Imm(name as u64), Arg::Imm(hint as u64)];
+                let (lookup, done) = (self.a.label(), self.a.label());
+                if &*self.proto.names[i as usize] == "length" {
+                    // The length of a string is read here, in place. Any other value takes the lookup.
+                    self.check_tag(top, TAG_STR, lookup);
+                    self.a.lea(RDI, top);
+                    self.a
+                        .mov_imm64(RAX, rt::str_length_top as *const () as usize as u64);
+                    self.a.call_reg(RAX);
+                    self.reload_all();
+                    self.a.jmp(done);
+                }
+                self.a.bind(lookup);
                 self.direct_call(get, &args);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
+                self.a.bind(done);
                 Fast::Guarded
             }
             Op::NewObject(n) => {
@@ -979,6 +1028,16 @@ impl<'a> Gen<'a> {
                     let push = crate::builtins::array::push_def() as *const _ as usize as u64;
                     self.a.mov8_imm(dst, TAG_NATIVE);
                     self.a.mov_imm64(RAX, push);
+                    self.a.mov_store(dst.at(8), RAX);
+                    self.a.jmp(done);
+                }
+                if &*self.proto.names[n as usize] == "charCodeAt" {
+                    // The `charCodeAt` of a string is the built-in, so it is written here, without a lookup.
+                    self.check_tag(src, TAG_STR, lookup);
+                    let char_code =
+                        crate::builtins::string::char_code_at_def() as *const _ as usize as u64;
+                    self.a.mov8_imm(dst, TAG_NATIVE);
+                    self.a.mov_imm64(RAX, char_code);
                     self.a.mov_store(dst.at(8), RAX);
                     self.a.jmp(done);
                 }
@@ -1126,6 +1185,20 @@ impl<'a> Gen<'a> {
                 self.load_num(i, 0);
                 self.a.movsd_load(1, rhs.at(8));
                 self.a.sse(SSE_ADD, 0, 1);
+                self.store_payload(i, 0);
+                Fast::Guarded
+            }
+            Op::ConcatLocal(i) => {
+                // `x += e` on numbers adds in place, and its result is the value left on the stack. The local
+                // must hold a number itself, not a cell, since the payload is written into it.
+                let (old, rhs, x) = (self.temp(d - 2), self.temp(d - 1), self.local(i));
+                self.check_tag(old, TAG_NUM, slow);
+                self.check_tag(rhs, TAG_NUM, slow);
+                self.check_tag(x, TAG_NUM, slow);
+                self.a.movsd_load(0, old.at(8));
+                self.a.movsd_load(1, rhs.at(8));
+                self.a.sse(SSE_ADD, 0, 1);
+                self.store_num(old, 0);
                 self.store_payload(i, 0);
                 Fast::Guarded
             }

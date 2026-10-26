@@ -587,10 +587,10 @@ fn every(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 /// Stable merge sort with a fallible comparator. Returns the number that orders `a` relative to `b`.
-fn merge_sort(
-    items: Vec<Value>,
-    cmp: &mut dyn FnMut(&Value, &Value) -> Result<f64, Value>,
-) -> Result<Vec<Value>, Value> {
+fn merge_sort<T: Clone>(
+    items: Vec<T>,
+    cmp: &mut impl FnMut(&T, &T) -> Result<f64, Value>,
+) -> Result<Vec<T>, Value> {
     if items.len() <= 1 {
         return Ok(items);
     }
@@ -601,7 +601,8 @@ fn merge_sort(
     let mut out = Vec::with_capacity(left.len() + right.len());
     let (mut i, mut j) = (0, 0);
     while i < left.len() && j < right.len() {
-        if cmp(&left[i], &right[j])? <= 0.0 {
+        // NaN counts as +0, as SortCompare says, so the left item stays first.
+        if !(cmp(&left[i], &right[j])? > 0.0) {
             out.push(left[i].clone());
             i += 1;
         } else {
@@ -612,6 +613,17 @@ fn merge_sort(
     out.extend_from_slice(&left[i..]);
     out.extend_from_slice(&right[j..]);
     Ok(out)
+}
+
+/// The values as plain numbers, when every one of them is a number.
+fn all_numbers(items: &[Value]) -> Option<Vec<f64>> {
+    items
+        .iter()
+        .map(|v| match v {
+            Value::Num(n) => Some(*n),
+            _ => None,
+        })
+        .collect()
 }
 
 fn sort(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -637,15 +649,26 @@ fn sort(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
         let numbers = comparator
             .as_ref()
             .and_then(|f| crate::jit::numeric_entry(f));
-        let sorted = merge_sort(items, &mut |x: &Value, y: &Value| {
-            if let (Some(entry), Value::Num(p), Value::Num(q)) = (&numbers, x, y) {
-                if let Some(r) = entry.call(&[*p, *q]) {
-                    return Ok(to_num(&r));
+        let sorted: Result<Vec<Value>, Value> = match (&numbers, all_numbers(&items)) {
+            // Only numbers, under a numeric comparator: the sort works on plain f64 values.
+            (Some(entry), Some(nums)) => merge_sort(nums, &mut |p: &f64, q: &f64| {
+                if let Some(r) = entry.compare(*p, *q) {
+                    return Ok(r);
                 }
-            }
-            let r = cb.call(vm, [x.clone(), y.clone()])?;
-            Ok(to_num(&r))
-        });
+                let r = cb.call(vm, [Value::Num(*p), Value::Num(*q)])?;
+                Ok(to_num(&r))
+            })
+            .map(|nums| nums.into_iter().map(Value::Num).collect()),
+            _ => merge_sort(items, &mut |x: &Value, y: &Value| {
+                if let (Some(entry), Value::Num(p), Value::Num(q)) = (&numbers, x, y) {
+                    if let Some(r) = entry.call(&[*p, *q]) {
+                        return Ok(to_num(&r));
+                    }
+                }
+                let r = cb.call(vm, [x.clone(), y.clone()])?;
+                Ok(to_num(&r))
+            }),
+        };
         cb.finish(vm);
         sorted?
     };

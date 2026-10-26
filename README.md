@@ -173,6 +173,12 @@ Para chegar a 2× ou mais nessas cargas, o código nativo precisa ler elementos 
 - **JSON sem cópias**: `JSON.stringify` lê arrays e objetos onde estão, escreve cada membro direto na saída e formata números sem `String` temporária, e `JSON.parse` entrega as strings sem copiá-las. Pelo `callgrind`, `json` foi de 1533 M para 1040 M instruções (−32%).
 - **`sort` com comparador numérico**: quando o comparador é compilado para números e os itens também são, o `sort` chama a função nativa direto, sem o caminho de callback a cada comparação. Pelo `callgrind`, `sort_cmp` foi de 1148 M para 807 M instruções (−30%).
 - **Globais por índice**: cada global guarda o slot onde o nome foi achado, e a próxima leitura ou escrita confere esse slot antes de procurar. Nenhum global é removido, então um slot nunca muda de nome. Pelo `callgrind`, quatro milhões de leituras de `Infinity` e `NaN` foram de 725 M para 405 M instruções (−44%). Um `console.log` em loop perdeu 5% das instruções, e `nbody_objects`, 3%. Em tempo de parede, a leitura de globais ficou 32% mais rápida, e `console_lines`, cerca de 7%.
+- **Ordenação sobre `f64`**: quando todos os itens são números e o comparador roda como código de número, o `sort` ordena um vetor de `f64`, sem criar um `Value` por comparação. Um comparador que devolve NaN conta como +0, como manda a especificação. Pelo `callgrind`, `sort_cmp` foi de 807 M para 364 M instruções (−55%), também porque o `%` de inteiros até 2^63 deixou de chamar o `fmod`.
+- **Métodos embutidos no código nativo**: `charCodeAt` em string, `String(n)` com número e `.length` de string rodam direto, sem a chamada geral, como o `push` de arrays. Pelo `callgrind`, `char_codes` foi de 766 M para 392 M instruções (−49%).
+- **`x += e` com números no código nativo**: antes, cada `t += String(n).length` caía no interpretador. Agora a soma é feita no código nativo, e só strings e células seguem o caminho geral. `num_to_string` foi de 997 M para 458 M instruções (−54%).
+- **Inteiros com dois dígitos por passo**: a formatação de inteiros divide por 100 e não por 10. Caiu de cerca de 123 para 43 instruções por número.
+
+Numa rodada completa feita depois dessas mudanças, 12 de 24 programas ficaram à frente de Node e Bun. A tabela acima é da rodada anterior, e nesta máquina as medidas de tempo variam bastante de uma execução para outra.
 
 ## Arquitetura
 

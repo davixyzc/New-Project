@@ -617,6 +617,14 @@ fn string(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::from_string(text))
 }
 
+/// The built-in `String`, which native code recognises by identity.
+pub fn string_def() -> &'static NativeDef {
+    FUNCTIONS
+        .iter()
+        .find(|f| f.name == "String")
+        .expect("String is a global function")
+}
+
 fn boolean(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Bool(args.first().is_some_and(truthy)))
 }

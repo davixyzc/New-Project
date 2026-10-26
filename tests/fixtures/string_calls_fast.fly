@@ -1,0 +1,17 @@
+// String(n) e .length em caminhos rápidos: números de todos os tamanhos, outros tipos, textos e um String sombreado.
+const sizes = [0, 7, 10, 99, 100, 101, 999, 1000, 12345, 1000000, 9007199254740991, -1, -100, -12345];
+for (const n of sizes) console.log(String(n), String(n).length);
+console.log(String(-0), String(1e21), String(0.5), String(NaN), String(true), String(null));
+
+let total = 0;
+for (let i = 0; i < 1000; i++) total += String(i * 3).length;
+console.log(total);
+
+const word = "héllo";
+console.log(word.length, "".length, (word + "!").length, [1, 2, 3].length, { length: 7 }.length);
+
+let s = "";
+for (let i = 0; i < 5; i++) s += String(i);
+console.log(s, s.length);
+
+console.log(((String) => String(5))((x) => "custom" + x));

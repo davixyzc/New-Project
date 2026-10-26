@@ -225,11 +225,22 @@ fn char_at_method(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Va
 
 fn char_code_at(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_str(&this);
-    let i = index_arg(&arg(args, 0));
-    Ok(Value::Num(
-        i.and_then(|i| char_at(&s, i))
-            .map_or(f64::NAN, |c| c as u32 as f64),
-    ))
+    Ok(Value::Num(char_code(&s, to_num(&arg(args, 0)))))
+}
+
+/// `s.charCodeAt(i)` for a number `i`: the code unit at `i`, or NaN when there is none.
+pub fn char_code(s: &JsStr, i: f64) -> f64 {
+    index_arg(&Value::Num(i))
+        .and_then(|i| char_at(s, i))
+        .map_or(f64::NAN, |c| c as u32 as f64)
+}
+
+/// The built-in `charCodeAt`, which native code recognises by identity.
+pub fn char_code_at_def() -> &'static NativeDef {
+    METHODS
+        .iter()
+        .find(|m| m.name == "charCodeAt")
+        .expect("charCodeAt is a string method")
 }
 
 fn index_of(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {

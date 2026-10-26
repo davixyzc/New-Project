@@ -1,0 +1,17 @@
+// charCodeAt em string: índices fora da faixa, negativos, fracionários, textuais, sem argumento e em laços.
+const s = "héllo, mundo";
+console.log(s.charCodeAt(0), s.charCodeAt(1), s.charCodeAt(11), s.charCodeAt(12));
+console.log(s.charCodeAt(-1), s.charCodeAt(1.9), s.charCodeAt("3"), s.charCodeAt());
+
+let total = 0;
+for (let i = 0; i < s.length + 2; i++) total += s.charCodeAt(i) || 0;
+console.log(total);
+
+const word = "abc";
+let acc = "";
+for (let i = 0; i < 3; i++) acc += word.charCodeAt(i) + ",";
+console.log(acc);
+
+let h = 0;
+for (let i = 0; i < 50; i++) h = (h * 31 + word.charCodeAt(i % 3)) % 1000000007;
+console.log(h);

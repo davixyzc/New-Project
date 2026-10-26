@@ -198,6 +198,18 @@ impl Numeric<'_> {
         self.spec.call(args).map(Number::value)
     }
 
+    /// `call` for a comparator: two numbers in, the result as a number out. The sort loop gets plain numbers, so
+    /// it builds no value per comparison.
+    pub(crate) fn compare(&self, a: f64, b: f64) -> Option<f64> {
+        if self.spec.nparams != 2 {
+            return None;
+        }
+        Some(match self.spec.call(&[a, b])? {
+            Number::Num(n) => n,
+            Number::Bool(flag) => f64::from(u8::from(flag)),
+        })
+    }
+
     /// Maps the elements of `items` from `start` on through the function, appending the results to `out`.
     /// Returns how many elements ran. A batch stops at the first element that is not a number, and the
     /// interpreter runs the rest, starting with that element.

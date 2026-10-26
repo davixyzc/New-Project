@@ -269,6 +269,56 @@ pub unsafe extern "C" fn push_call(callee: *mut Value) -> bool {
     true
 }
 
+/// Runs `s.charCodeAt(i)` for native code, when the callee at `callee` is the built-in `charCodeAt`, `this`, the
+/// slot above it, is a string and the argument is a number. The receiver is released and the result replaces the
+/// callee. Returns false, and changes nothing, otherwise.
+///
+/// # Safety
+/// `callee` must point at three valid values. The receiver and argument slots are dead afterwards.
+pub unsafe extern "C" fn char_code_call(callee: *mut Value) -> bool {
+    let (this, arg) = (callee.add(1), callee.add(2));
+    let code = match (&*this, &*arg) {
+        (Value::Str(s), Value::Num(i)) => builtins::string::char_code(s, *i),
+        _ => return false,
+    };
+    // The receiver is released here, as the slot is dead afterwards. A number owns nothing.
+    ptr::drop_in_place(this);
+    ptr::write(callee, Value::Num(code));
+    true
+}
+
+/// Runs `String(n)` for native code, when the callee at `callee` is the built-in `String` and the argument is a
+/// number. The receiver of a plain call is `undefined`, and it is released anyway. The result replaces the callee.
+/// Returns false, and changes nothing, otherwise.
+///
+/// # Safety
+/// `callee` must point at three valid values. The receiver and argument slots are dead afterwards.
+pub unsafe extern "C" fn string_call(callee: *mut Value) -> bool {
+    let (this, arg) = (callee.add(1), callee.add(2));
+    let Value::Num(n) = &*arg else {
+        return false;
+    };
+    let text = crate::value::num_to_string(*n);
+    ptr::drop_in_place(this);
+    ptr::write(callee, Value::from_string(text));
+    true
+}
+
+/// `s.length` for native code, when the value at `top` is a string: the string is replaced by its length in
+/// characters. Anything else writes nothing and returns false.
+///
+/// # Safety
+/// `top` must point at a valid value that the instruction pops.
+pub unsafe extern "C" fn str_length_top(top: *mut Value) -> bool {
+    let Value::Str(s) = &*top else {
+        return false;
+    };
+    let len = s.char_count() as f64;
+    ptr::drop_in_place(top);
+    ptr::write(top, Value::Num(len));
+    true
+}
+
 /// Moves the value at `src` into `dst`, dropping what `dst` held. `src` is dead afterwards.
 ///
 /// # Safety
