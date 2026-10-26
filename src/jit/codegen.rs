@@ -1126,6 +1126,41 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// `a % b` on whole numbers, which `value::js_mod` gives by the same integer division. The dividend must be a whole
+    /// number in 32 bits with its sign bit clear (so -0 is refused too), and the divisor a positive whole number in 32
+    /// bits. Then the remainder replaces `a` and the code jumps to `done`. Any other pair jumps to `miss`, before
+    /// anything has changed.
+    fn int_mod(&mut self, a: Mem, b: Mem, miss: Label, done: Label) {
+        self.check_tag(a, TAG_NUM, miss);
+        self.check_tag(b, TAG_NUM, miss);
+        self.a.mov_load(RAX, a.at(8));
+        self.a.test64(RAX, RAX);
+        self.a.jcc(CC_S, miss);
+        self.a.movsd_load(0, a.at(8));
+        self.a.cvttsd2si(RCX, 0);
+        self.a.cvtsi2sd(1, RCX);
+        self.a.ucomisd(0, 1);
+        self.a.jcc(CC_NE, miss);
+        self.a.jcc(CC_P, miss);
+        self.a.movsd_load(0, b.at(8));
+        self.a.cvttsd2si(R8, 0);
+        self.a.cvtsi2sd(1, R8);
+        self.a.ucomisd(0, 1);
+        self.a.jcc(CC_NE, miss);
+        self.a.jcc(CC_P, miss);
+        // The divisor is positive: zero and the negative numbers share the flags of a test of its sign.
+        self.a.test32(R8, R8);
+        self.a.jcc(CC_E, miss);
+        self.a.jcc(CC_L, miss);
+        self.a.mov_rr(RAX, RCX);
+        self.a.mov_imm32(RDX, 0);
+        self.a.idiv32(R8);
+        self.a.cvtsi2sd(0, RDX);
+        self.a.mov8_imm(a, TAG_NUM);
+        self.a.movsd_store(a.at(8), 0);
+        self.a.jmp(done);
+    }
+
     /// Copies the value at `src` into RAX and RCX, and counts one more reference to it if it owns one. RDX is kept.
     fn load_clone(&mut self, src: Mem) {
         let plain = self.a.label();
@@ -2127,12 +2162,17 @@ impl<'a> Gen<'a> {
                 Fast::Direct(clone, vec![Arg::Addr(src), Arg::Addr(dst)])
             }
             Op::Mod => {
-                // Replaces two numbers by their remainder. Other operands take the slow path.
+                // Replaces two numbers by their remainder. Whole numbers that `int_mod` divides are divided here, and
+                // other operands take the helper, then the slow path if it declines.
                 let (a, b) = (self.temp(d - 2), self.temp(d - 1));
                 let rem = rt::mod_top as *const () as usize;
+                let (done, helper) = (self.a.label(), self.a.label());
+                self.int_mod(a, b, helper, done);
+                self.a.bind(helper);
                 self.direct_call(rem, &[Arg::Addr(a), Arg::Addr(b)]);
                 self.a.test8(RAX, RAX);
                 self.a.jcc(CC_E, slow);
+                self.a.bind(done);
                 Fast::Guarded
             }
             Op::GetBoxed(i) => {

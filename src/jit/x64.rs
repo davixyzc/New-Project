@@ -27,6 +27,7 @@ pub const CC_E: u8 = 0x4;
 pub const CC_NE: u8 = 0x5;
 pub const CC_BE: u8 = 0x6;
 pub const CC_A: u8 = 0x7;
+pub const CC_S: u8 = 0x8;
 pub const CC_P: u8 = 0xA;
 pub const CC_NP: u8 = 0xB;
 pub const CC_L: u8 = 0xC;
@@ -247,6 +248,11 @@ impl Asm {
     }
 
     // ----- integers and flags -----------------------------------------------
+
+    /// `idiv r32`: divides EDX:EAX by `r`, leaving the quotient in EAX and the remainder in EDX.
+    pub fn idiv32(&mut self, r: u8) {
+        self.op(None, false, &[0xF7], 7, Rm::Reg(r));
+    }
 
     /// `movsxd dst, src32`: sign-extends a 32-bit register into 64 bits.
     pub fn movsxd(&mut self, dst: u8, src: u8) {

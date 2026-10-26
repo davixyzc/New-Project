@@ -1,0 +1,15 @@
+// The remainder operator on whole, fractional, negative, special, and large numbers, in loops and at once.
+const vals = [0, -0, 1, 7, 10, 255, 2147483647, 2147483648, -1, -7, 3.5, 7.25, NaN, Infinity, -Infinity, 1e15, 9007199254740993, 5e-324];
+const divs = [1, 2, 3, 7, -2, 0, -0, 0.5, 2147483647, 4294967296, Infinity, NaN];
+let out = [];
+for (const a of vals) for (const b of divs) out.push(a % b);
+console.log(out.map((v) => (Object.is(v, -0) ? "-0" : String(v))).join(" "));
+let s = 0, n = 0;
+for (let i = 0; i < 2000; i++) { s += (i * 7 + 3) % (i % 13 + 1); n += (-i) % 5; }
+console.log("loop", s, n);
+const H = 120;
+let g = 0;
+for (let y = -3; y < 130; y++) g += (y + H) % H;
+console.log("global", g, (-1 + H) % H, (H - 1) % H);
+const z = -0;
+console.log("negzero", Object.is(z % 5, -0), Object.is(0 % 5, 0), Object.is(-4 % 2, -0));
