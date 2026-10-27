@@ -44,11 +44,22 @@ const FN_MAX_DEPTH: i32 = 13;
 pub(super) const MAX_ARGS: usize = 6;
 /// The bytes of a loop region's frame, below the saved `r13`: room to save the xmm registers a call
 /// clobbers, and a size that keeps rsp 16-byte aligned at those calls.
-const FRAME: i32 = 152;
+const FRAME: i32 = 280;
+/// Where the integer shadows of a loop's whole locals start, above the saved xmm registers that `call_mod` spills and
+/// the tag cells. Each shadow takes 8 bytes (see `shadow_mem`).
+const SHADOW_BASE: i32 = 144;
 /// Where the tag of an element operand is kept, one byte per depth. `call_mod` saves its registers below this.
 const TAG_CELLS: i32 = 136;
-/// The largest magnitude an integer copy of a local may have. It stays exact, and fits an imm32.
-const INT_LIMIT: i32 = i32::MAX;
+/// The operands at depths below this are integers in a register each (see `int_reg`). A deeper operand is a number.
+const INT_DEPTH: i32 = 2;
+/// The most whole locals a loop keeps an integer shadow of, one frame slot each from `SHADOW_BASE` up (see
+/// `shadow_mem`).
+const MAX_SHADOWS: usize = 16;
+/// The bound of a whole number: an integer `v` in a register or a shadow has `-INT_BOUND <= v < INT_BOUND`. Such
+/// integers add exactly, since a loop has fewer than 4096 additions in a chain, and 4096 * 2^40 stays below 2^53.
+const INT_BOUND: i64 = 1 << 40;
+/// The most additions a loop may have for its integers to stay exact (see `INT_BOUND`).
+const MAX_ADDITIONS: usize = 4096;
 /// The stack that a function region may use, below the stack its wrapper was called on.
 const STACK_BUDGET: i32 = 1 << 20;
 /// What a loop region returns when a guard fails, which means the loop did not run.
@@ -109,12 +120,10 @@ pub(super) struct Region {
     consts: Vec<(u64, u8)>,
     /// The locals that a guard checks on entry: the loop reads them before any number is stored.
     guards: Vec<u32>,
-    /// A local that the loop only steps by one, and that a `%` by an integer reads. Its integer copy is
-    /// kept in r13, which makes that `%` skip the conversion and the exactness check of its number.
-    int_local: Option<u32>,
-    /// The divisor of the remainder that native code keeps in r15 for the integer copy, which steps
-    /// up by one, and is taken by this one divisor (see `step_counter`).
-    rem: Option<u32>,
+    /// The whole locals the loop uses, each with an integer shadow in the frame, in this order (see `shadow_mem`). A
+    /// shadow holds the local's value as an integer, which the loop's integer operations read. The number in the
+    /// local's home stays current, so the generic code and an exit see it.
+    shadows: Vec<u32>,
     /// The locals that hold arrays. A loop reads and writes their elements in place, so they have no register,
     /// and the loop checks on entry that they hold an array.
     arrays: Vec<u32>,
@@ -255,13 +264,6 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         }
     }
     let mut uses = vec![0u64; proto.nlocals as usize];
-    let mut other_writes = vec![false; proto.nlocals as usize];
-    let mut mod_uses = vec![0u32; proto.nlocals as usize];
-    // The divisor of the first `local % c` on each local, and whether a later one differs or the local is
-    // decremented, which keeps a remainder from stepping with it.
-    let mut mod_divisor = vec![0u32; proto.nlocals as usize];
-    let mut mod_mixed = vec![false; proto.nlocals as usize];
-    let mut decremented = vec![false; proto.nlocals as usize];
     let mut reads = Vec::new();
     let mut deepest = 0;
     // The constants the region uses, by their bits, with the weight of their uses.
@@ -320,24 +322,6 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         for i in local_uses(op) {
             uses[i as usize] = uses[i as usize].saturating_add(weight);
         }
-        match op {
-            Op::SetLocal(i) | Op::PopToLocal(i) | Op::AddToLocal(i) => {
-                other_writes[i as usize] = true
-            }
-            Op::DecLocal(i) => decremented[i as usize] = true,
-            Op::ModLK(s, k) => {
-                if let Some(c) = int_divisor(number(proto, k)) {
-                    mod_uses[s as usize] += 1;
-                    let seen = &mut mod_divisor[s as usize];
-                    if *seen == 0 {
-                        *seen = c;
-                    } else if *seen != c {
-                        mod_mixed[s as usize] = true;
-                    }
-                }
-            }
-            _ => {}
-        }
         reads.extend(
             reads_of(op)
                 .into_iter()
@@ -347,30 +331,6 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
     }
     if entries.iter().any(|&e| depth[e] != 0) {
         return None;
-    }
-    // The integer copy needs its steps to leave the operands empty, since they leave the region.
-    let int_local = (0..proto.nlocals)
-        .filter(|&i| mod_uses[i as usize] > 0 && !other_writes[i as usize])
-        .max_by_key(|&i| mod_uses[i as usize])
-        .filter(|&i| {
-            (header..=last).all(|ip| {
-                !matches!(code[ip], Op::IncLocal(j) | Op::DecLocal(j) if j == i)
-                    || depth[ip + 1] == 0
-            })
-        });
-    let rem = int_local.and_then(|i| {
-        let u = i as usize;
-        (!mod_mixed[u] && !decremented[u]).then_some(mod_divisor[u])
-    });
-    if let Some(i) = int_local {
-        for ip in header..=last {
-            if depth[ip] >= 0 && matches!(code[ip], Op::IncLocal(j) | Op::DecLocal(j) if j == i) {
-                // A step that leaves the integer copy's range leaves the region after the step.
-                if !exits.contains(&(ip + 1)) {
-                    exits.push(ip + 1);
-                }
-            }
-        }
     }
     let mut order: Vec<u32> = (0..proto.nlocals)
         .filter(|&i| uses[i as usize] > 0 && !arrays[i as usize] && !objects[i as usize])
@@ -385,13 +345,6 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
             None => (i, Home::Mem(local_mem(i).at(8))),
         })
         .collect();
-    // The integer copy lives in a register, so its local must have one.
-    let int_local = int_local.filter(|&i| {
-        locals
-            .iter()
-            .any(|&(l, h)| l == i && matches!(h, Home::Reg(_)))
-    });
-    let rem = if int_local.is_some() { rem } else { None };
     // Constants take registers from the top down, which must not reach the operand registers. The most used ones
     // take them, and the others load into a scratch register where they are used.
     let free = 16usize.saturating_sub(TEMP_BASE as usize + deepest as usize);
@@ -432,8 +385,24 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
     let math = math_reads(proto, depth, header, last)?;
     // A local holds whole numbers while every store to it stores one, as the marks of the stack show. The marks depend on
     // the locals, so the set only narrows until the marks agree with it.
+    // Without integers, a loop that adds too often could leave the bound, so it keeps its locals as numbers.
+    let additions = (header..=last)
+        .filter(|&ip| {
+            depth[ip] >= 0
+                && matches!(
+                    code[ip],
+                    Op::Add
+                        | Op::Sub
+                        | Op::AddLK(..)
+                        | Op::SubLK(..)
+                        | Op::AddToLocal(_)
+                        | Op::IncLocal(_)
+                        | Op::DecLocal(_)
+                )
+        })
+        .count();
     let mut whole: Vec<bool> = (0..proto.nlocals)
-        .map(|i| !arrays[i as usize] && !objects[i as usize])
+        .map(|i| !arrays[i as usize] && !objects[i as usize] && additions <= MAX_ADDITIONS)
         .collect();
     let marks = loop {
         let kinds = Kinds {
@@ -467,24 +436,59 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
                 }
             }
         }
+        // Each whole local the loop uses has an integer shadow in the frame, which has room for `MAX_SHADOWS` of them.
+        // The least used locals beyond that are narrowed to numbers.
+        let excess: Vec<u32> = order
+            .iter()
+            .copied()
+            .filter(|&i| whole[i as usize])
+            .skip(MAX_SHADOWS)
+            .collect();
+        for i in excess {
+            whole[i as usize] = false;
+            narrowed = true;
+        }
         if !narrowed {
             break marks;
         }
     };
-    // A whole local that the loop uses, and that a path carries in from before the loop, is checked on entry from every
-    // entry. A local the loop does not use keeps whatever it holds, so it needs no check: an array that it holds would
-    // only send the loop to the generic code.
-    let whole_guards: Vec<u32> = (0..proto.nlocals)
-        .filter(|&i| {
-            whole[i as usize]
-                && locals.iter().any(|&(l, _)| l == i)
-                && entries.iter().any(|&e| live[i as usize][e])
-        })
+    let shadows: Vec<u32> = order
+        .iter()
+        .copied()
+        .filter(|&i| whole[i as usize])
+        .collect();
+    // A shadow that a path carries in from before the loop is read on entry, so it is checked on entry from every
+    // entry, and loaded from the local's number. A shadow that the loop writes before it reads needs no check.
+    let whole_guards: Vec<u32> = shadows
+        .iter()
+        .copied()
+        .filter(|&i| entries.iter().any(|&e| live[i as usize][e]))
         .collect();
     // A store of an element leaves the loop at the store when the element is a boolean, so the store is a resume point.
     for ip in header..=last {
         if matches!(code[ip], Op::SetLocal(i) | Op::PopToLocal(i) if !objects[i as usize])
             && marks[ip - header].last() == Some(&Mark::Elem)
+            && !resumes.contains(&ip)
+        {
+            resumes.push(ip);
+        }
+    }
+    // An integer operation leaves the loop at itself when it leaves the bound, or when its operands need the number form, so
+    // it is a resume point too.
+    for ip in header..=last {
+        if matches!(
+            code[ip],
+            Op::Mul
+                | Op::MulLK(..)
+                | Op::Neg
+                | Op::Mod
+                | Op::ModLK(..)
+                | Op::IncLocal(_)
+                | Op::DecLocal(_)
+                | Op::AddToLocal(_)
+                | Op::PopToLocal(_)
+                | Op::SetLocal(_)
+        ) && depth[ip] >= 0
             && !resumes.contains(&ip)
         {
             resumes.push(ip);
@@ -498,8 +502,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         locals,
         consts,
         guards,
-        int_local,
-        rem,
+        shadows,
         arrays: (0..proto.nlocals).filter(|&i| arrays[i as usize]).collect(),
         objects: (0..proto.nlocals)
             .filter(|&i| objects[i as usize])
@@ -569,8 +572,7 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
         locals,
         consts: Vec::new(),
         guards: Vec::new(),
-        int_local: None,
-        rem: None,
+        shadows: Vec::new(),
         arrays: Vec::new(),
         objects: Vec::new(),
         object_guards: Vec::new(),
@@ -952,10 +954,30 @@ fn has_register(m: &Mark) -> bool {
     matches!(m, Mark::Num | Mark::Int | Mark::Bool | Mark::Elem)
 }
 
-/// Whether constant `k` is a whole number, which its register holds as an integral value.
+/// The integer divisor of the `%` at `ip`: the instruction before it pushes an integer constant that the reciprocal
+/// takes, and no other instruction jumps to `ip`, so the divisor is the one before it (see `Emitter::magic_divisor`).
+fn mod_divisor(proto: &Proto, ip: usize) -> Option<u32> {
+    let k = match proto.code.get(ip.checked_sub(1)?)? {
+        Op::Const(k) => *k,
+        _ => return None,
+    };
+    let c = match proto.consts.get(k as usize)? {
+        Value::Num(c) => *c,
+        _ => return None,
+    };
+    let n = int_divisor(c)?;
+    let jumped = proto
+        .code
+        .iter()
+        .enumerate()
+        .any(|(j, &op)| j != ip - 1 && successors(op, j, 0).iter().any(|&(t, _)| t == ip));
+    (!jumped).then_some(n)
+}
+
+/// Whether constant `k` is a whole number an integer holds: it is integral, within `INT_BOUND`, and not -0.
 fn whole_const(proto: &Proto, k: u32) -> bool {
     let c = number(proto, k);
-    c.is_finite() && c.fract() == 0.0
+    c.fract() == 0.0 && c.abs() < INT_BOUND as f64 && !(c == 0.0 && c.is_sign_negative())
 }
 
 /// The address of the built-in `sqrt`, which a loop compares a property with (see `Mark::Sqrt`).
@@ -1252,7 +1274,13 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
             if !plain(i) {
                 return false;
             }
-            let whole = kinds.whole[i as usize] && whole_const(proto, k);
+            // A remainder is whole only by a divisor that its integer form takes (see `mod_divisor`).
+            let divides = match proto.consts.get(k as usize) {
+                _ if !matches!(op, Op::ModLK(..)) => true,
+                Some(Value::Num(c)) => int_divisor(*c).is_some(),
+                _ => false,
+            };
+            let whole = kinds.whole[i as usize] && whole_const(proto, k) && divides;
             state.push(if whole { Mark::Int } else { Mark::Num });
         }
         Op::JumpIfLtLL(p, q, _) | Op::JumpIfNotLtLL(p, q, _) => {
@@ -1264,8 +1292,15 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
             let Some(operands) = pop_kinds(state, 2) else {
                 return false;
             };
-            // A sum, difference, product or remainder of whole numbers is whole. A quotient is not.
-            let whole = op != Op::Div && operands.iter().all(|m| *m == Mark::Int);
+            // A sum, difference, product or remainder of whole numbers is whole. A quotient is not, and a remainder
+            // is only whole by a divisor that its integer form takes (see `mod_divisor`).
+            let whole = match op {
+                Op::Div => false,
+                Op::Mod => {
+                    mod_divisor(proto, ip).is_some() && operands.iter().all(|m| *m == Mark::Int)
+                }
+                _ => operands.iter().all(|m| *m == Mark::Int),
+            };
             state.push(if whole { Mark::Int } else { Mark::Num });
         }
         Op::Neg => {
@@ -1370,6 +1405,12 @@ fn operand_marks(
         let mut state = entered.clone();
         if !step(proto, ip, code[ip], &mut state, kinds) {
             return None;
+        }
+        // An integer operand has a register, and only the operands at the first depths have one.
+        for (k, m) in state.iter_mut().enumerate() {
+            if k as i32 >= INT_DEPTH && *m == Mark::Int {
+                *m = Mark::Num;
+            }
         }
         for (next, next_depth) in successors(code[ip], ip, depth[ip]) {
             if !inside(next) {
@@ -1517,22 +1558,6 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
         e.a.cmp8_imm(local_mem(i), TAG_NUM);
         e.a.jcc(CC_NE, not_entered);
     }
-    // A whole local holds an integral number on entry, or a value that the uses of whole numbers refuse, which truncates to
-    // the most negative int: one out of the 32-bit range, or NaN. Any other value leaves the loop to the generic code.
-    for &i in &lp.whole_guards {
-        e.a.cmp8_imm(local_mem(i), TAG_NUM);
-        e.a.jcc(CC_NE, not_entered);
-        e.a.movsd_load(0, local_mem(i).at(8));
-        let checked = e.a.label();
-        e.a.cvttsd2si(RAX, 0);
-        e.a.cmp32_imm32(RAX, i32::MIN);
-        e.a.jcc(CC_E, checked);
-        e.a.cvtsi2sd(1, RAX);
-        e.a.ucomisd(1, 0);
-        e.a.jcc(CC_NE, not_entered);
-        e.a.jcc(CC_P, not_entered);
-        e.a.bind(checked);
-    }
     for &a in &lp.arrays {
         e.a.cmp8_imm(local_mem(a), TAG_ARR);
         e.a.jcc(CC_NE, not_entered);
@@ -1572,43 +1597,10 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
             e.a.movsd_load(x, local_mem(i).at(8));
         }
     }
-    if let Some(i) = lp.int_local {
-        // The integer copy is taken when the number is an integer, which is not -0, within range.
-        let x = match e.home(i) {
-            Home::Reg(x) => x,
-            Home::Mem(_) => unreachable!("a loop keeps its locals in registers"),
-        };
-        let ok = e.a.label();
-        e.a.cvttsd2si(RAX, x);
-        e.a.movsxd(R13, RAX);
-        e.a.cvtsi2sd(0, RAX);
-        e.a.ucomisd(0, x);
-        e.a.jcc(CC_NE, not_entered);
-        e.a.jcc(CC_P, not_entered);
-        e.a.test64(R13, R13);
-        e.a.jcc(CC_NE, ok);
-        e.a.movmskpd(RAX, x);
-        e.a.mov_imm32(RCX, 1);
-        e.a.test32(RAX, RCX);
-        e.a.jcc(CC_NE, not_entered);
-        e.a.bind(ok);
-        e.a.cmp64_imm32(R13, INT_LIMIT);
-        e.a.jcc(CC_G, not_entered);
-        e.a.cmp64_imm32(R13, -INT_LIMIT);
-        e.a.jcc(CC_L, not_entered);
-        if let Some(c) = lp.rem {
-            // The remainder is only kept for a copy that is not negative, so it starts from the copy here.
-            e.a.test64(R13, R13);
-            e.a.jcc(CC_L, not_entered);
-            let (m, s) = magic(c);
-            e.a.mov_rr(R8, R13);
-            e.a.mov_imm64(R10, m);
-            e.a.imul64(R8, R10);
-            e.a.shr64_imm(R8, s);
-            e.a.imul64_imm(R8, R8, c as i32);
-            e.a.mov_rr(R15, R13);
-            e.a.sub64(R15, R8);
-        }
+    // A shadow that a path reads on entry takes the local's whole number, which must lie within the bound and not be -0.
+    // Any other value leaves the loop to the generic code, which runs it.
+    for &i in &lp.whole_guards {
+        e.load_shadow(i, not_entered);
     }
     for &(bits, x) in &lp.consts {
         e.a.mov_imm64(RAX, bits);
@@ -2049,7 +2041,228 @@ impl Emitter<'_, '_> {
     }
 
     /// Emits `op` at instruction `ip`, which runs with `d` operands on the stack.
+    /// Writes the integer operands below depth `d` into their xmm registers, for an instruction that reads numbers.
+    fn materialize(&mut self, ip: usize, d: i32) {
+        for k in 0..d.min(INT_DEPTH) {
+            if self.int_at(ip, k) {
+                self.a.cvtsi2sd64(self.reg(k), self.int_reg(k));
+            }
+        }
+    }
+
+    /// `a * b` into `dst`, for the integers `a` and `b`, where `dst` may be `a`. The product must stay within the bound and
+    /// must not be -0, which an integer cannot hold, so the product leaves to `exit` otherwise.
+    fn int_mul(&mut self, dst: u8, a: u8, b: u8, exit: Label) {
+        self.a.mov_rr(RAX, a);
+        self.a.imul64(RAX, b);
+        self.a.jcc(CC_O, exit);
+        let nonzero = self.a.label();
+        self.a.test64(RAX, RAX);
+        self.a.jcc(CC_NE, nonzero);
+        // A zero product is -0 when a factor is negative.
+        self.a.test64(a, a);
+        self.a.jcc(CC_L, exit);
+        self.a.test64(b, b);
+        self.a.jcc(CC_L, exit);
+        self.a.bind(nonzero);
+        self.check_bound(RAX, exit);
+        self.a.mov_rr(dst, RAX);
+    }
+
+    /// Emits the integer form of instruction `op` at `ip`, which has `d` operands, when its result or its operands are
+    /// integers (see `Mark::Int`). Returns false for the others, which take the number form.
+    fn int_op(&mut self, op: Op, d: i32, ip: usize) -> bool {
+        match op {
+            Op::Const(k) if self.int_out(ip, d) => {
+                // The next instruction takes a constant that it folds as an immediate, so nothing loads it.
+                if !self.folds_into(ip) {
+                    let value = number(self.proto, k) as i64;
+                    self.a.mov_imm64(self.int_reg(d), value as u64);
+                }
+            }
+            Op::GetLocal(i) if self.int_out(ip, d) => {
+                let shadow = self.shadow_mem(i);
+                self.a.mov_load(self.int_reg(d), shadow);
+            }
+            Op::Dup if self.int_out(ip, d) => {
+                self.a.mov_rr(self.int_reg(d), self.int_reg(d - 1));
+            }
+            Op::Add if self.int_out(ip, d - 2) => {
+                self.a.add64(self.int_reg(d - 2), self.int_reg(d - 1));
+            }
+            Op::Sub if self.int_out(ip, d - 2) => {
+                self.a.sub64(self.int_reg(d - 2), self.int_reg(d - 1));
+            }
+            Op::Mul if self.int_out(ip, d - 2) => {
+                let exit = self.side_exit(ip, d);
+                let (a, b) = (self.int_reg(d - 2), self.int_reg(d - 1));
+                self.int_mul(a, a, b, exit);
+            }
+            Op::Neg if self.int_out(ip, d - 1) => {
+                let exit = self.side_exit(ip, d);
+                let r = self.int_reg(d - 1);
+                // The negation of zero is -0, which an integer cannot hold.
+                self.a.test64(r, r);
+                self.a.jcc(CC_E, exit);
+                self.a.neg64(r);
+            }
+            Op::Mod if self.int_out(ip, d - 2) => {
+                let n = mod_divisor(self.proto, ip).expect("an integer remainder has its divisor");
+                let exit = self.side_exit(ip, d);
+                let r = self.int_reg(d - 2);
+                self.mod_int(r, n, exit);
+            }
+            Op::ModLK(i, k) if self.int_out(ip, d) => {
+                let n = int_divisor(number(self.proto, k))
+                    .expect("an integer remainder has its divisor");
+                let exit = self.side_exit(ip, d);
+                let (r, shadow) = (self.int_reg(d), self.shadow_mem(i));
+                self.a.mov_load(r, shadow);
+                self.mod_int(r, n, exit);
+            }
+            Op::AddLK(i, k) | Op::SubLK(i, k) if self.int_out(ip, d) => {
+                let (r, shadow) = (self.int_reg(d), self.shadow_mem(i));
+                self.a.mov_load(r, shadow);
+                self.a.mov_imm64(RCX, number(self.proto, k) as i64 as u64);
+                if matches!(op, Op::AddLK(..)) {
+                    self.a.add64(r, RCX);
+                } else {
+                    self.a.sub64(r, RCX);
+                }
+            }
+            Op::MulLK(i, k) if self.int_out(ip, d) => {
+                let exit = self.side_exit(ip, d);
+                let (r, shadow) = (self.int_reg(d), self.shadow_mem(i));
+                self.a.mov_load(r, shadow);
+                self.a.mov_imm64(RCX, number(self.proto, k) as i64 as u64);
+                self.int_mul(r, r, RCX, exit);
+            }
+            // The fused comparisons take integers in the two operands, the lower one under the upper one.
+            Op::JumpIfNotLt(t)
+            | Op::JumpIfNotLe(t)
+            | Op::JumpIfNotGt(t)
+            | Op::JumpIfNotGe(t)
+            | Op::JumpIfStrictEq(t)
+            | Op::JumpIfNotStrictEq(t)
+                if self.int_at(ip, d - 2) && self.int_at(ip, d - 1) =>
+            {
+                // An upper constant that `folds_into` takes as an immediate is compared as one.
+                let folded = ip > 0 && self.folds_into(ip - 1);
+                if folded {
+                    let Op::Const(k) = self.proto.code[ip - 1] else {
+                        unreachable!("only a constant is folded into a comparison")
+                    };
+                    let value = number(self.proto, k) as i32;
+                    self.a.cmp64_imm32(self.int_reg(d - 2), value);
+                } else {
+                    self.a.cmp_rr64(self.int_reg(d - 2), self.int_reg(d - 1));
+                }
+                // Each jump is taken when its comparison of the lower operand with the upper one is false.
+                let cc = match op {
+                    Op::JumpIfNotLt(_) => CC_GE,
+                    Op::JumpIfNotLe(_) => CC_G,
+                    Op::JumpIfNotGt(_) => CC_LE,
+                    Op::JumpIfNotGe(_) => CC_L,
+                    Op::JumpIfStrictEq(_) => CC_E,
+                    _ => CC_NE,
+                };
+                self.jump_if(t, cc);
+            }
+            // A whole local against a whole constant compares as integers, which the constant takes as an immediate when it fits.
+            Op::JumpIfLtLK(i, k, t) | Op::JumpIfNotLtLK(i, k, t)
+                if self.lp.shadows.contains(&i) && whole_const(self.proto, k) =>
+            {
+                let shadow = self.shadow_mem(i);
+                self.a.mov_load(RAX, shadow);
+                self.a.mov_imm64(RCX, number(self.proto, k) as i64 as u64);
+                self.a.cmp_rr64(RAX, RCX);
+                self.jump_if(
+                    t,
+                    if matches!(op, Op::JumpIfLtLK(..)) {
+                        CC_L
+                    } else {
+                        CC_GE
+                    },
+                );
+            }
+            Op::JumpIfLtLL(p, q, t) | Op::JumpIfNotLtLL(p, q, t)
+                if self.lp.shadows.contains(&p) && self.lp.shadows.contains(&q) =>
+            {
+                let (sp, sq) = (self.shadow_mem(p), self.shadow_mem(q));
+                self.a.mov_load(RAX, sp);
+                self.a.mov_load(RCX, sq);
+                self.a.cmp_rr64(RAX, RCX);
+                self.jump_if(
+                    t,
+                    if matches!(op, Op::JumpIfLtLL(..)) {
+                        CC_L
+                    } else {
+                        CC_GE
+                    },
+                );
+            }
+            Op::PopToLocal(i) | Op::SetLocal(i)
+                if self.lp.shadows.contains(&i) && self.int_at(ip, d - 1) =>
+            {
+                let exit = self.side_exit(ip, d);
+                let r = self.int_reg(d - 1);
+                if !self.bounded_top(ip) {
+                    self.check_bound(r, exit);
+                }
+                self.write_int_local(i, r);
+            }
+            Op::AddToLocal(i) if self.lp.shadows.contains(&i) && self.int_at(ip, d - 1) => {
+                let exit = self.side_exit(ip, d);
+                let (r, shadow) = (self.int_reg(d - 1), self.shadow_mem(i));
+                self.a.mov_load(RAX, shadow);
+                self.a.add64(RAX, r);
+                self.check_bound(RAX, exit);
+                self.write_int_local(i, RAX);
+            }
+            // The integers trade registers with their slots, as the operands trade their xmm registers.
+            Op::Swap if self.int_at(ip, d - 1) || self.int_at(ip, d - 2) => {
+                self.materialize(ip, d);
+                let (x, y) = (self.reg(d - 1), self.reg(d - 2));
+                self.a.movapd_rr(0, x);
+                self.a.movapd_rr(x, y);
+                self.a.movapd_rr(y, 0);
+                // The tags of the two operands trade places too.
+                let (top, under) = (self.tag_cell(d - 1), self.tag_cell(d - 2));
+                self.a.movzx_load8(RAX, top);
+                self.a.movzx_load8(RCX, under);
+                self.a.mov_store8(top, RCX);
+                self.a.mov_store8(under, RAX);
+                let (a, b) = (self.int_reg(d - 2), self.int_reg(d - 1));
+                self.a.mov_rr(RAX, a);
+                self.a.mov_rr(a, b);
+                self.a.mov_rr(b, RAX);
+            }
+            Op::Pop if self.int_at(ip, d - 1) => {}
+            Op::GetIndexLocal(a)
+                if self.int_at(ip, d - 1) && !self.lp.object_reads.contains(&ip) =>
+            {
+                let exit = self.side_exit(ip, d);
+                let tag = self.tag_cell(d - 1);
+                self.a.mov_load(R8, local_mem(a).at(8));
+                self.elem_read_int(self.int_reg(d - 1), self.reg(d - 1), tag, exit);
+            }
+            Op::GetIndex2Local(a) if self.int_at(ip, d - 2) && self.int_at(ip, d - 1) => {
+                let exit = self.side_exit(ip, d);
+                let tag = self.tag_cell(d - 2);
+                self.a.mov_load(R8, local_mem(a).at(8));
+                self.elem_row_int(self.int_reg(d - 2), exit);
+                self.elem_read_int(self.int_reg(d - 1), self.reg(d - 2), tag, exit);
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn op(&mut self, op: Op, d: i32, ip: usize) {
+        if self.int_op(op, d, ip) {
+            return;
+        }
+        self.materialize(ip, d);
         let (x, y) = (self.reg(d - 1), self.reg(d - 2));
         match op {
             Op::Const(k) => self.load_number(number(self.proto, k), d),
@@ -2750,8 +2963,86 @@ impl Emitter<'_, '_> {
             .expect("every local of the region has a home")
     }
 
-    /// Copies local `i` into xmm `dst`.
+    /// The general register of the integer operand at depth `k`, which is below `INT_DEPTH`.
+    fn int_reg(&self, k: i32) -> u8 {
+        [R13, R15][k as usize]
+    }
+
+    /// Whether the operand at depth `k` before instruction `ip` is an integer, which lives in `int_reg(k)`.
+    fn int_at(&self, ip: usize, k: i32) -> bool {
+        self.mark(ip, k) == Mark::Int
+    }
+
+    /// Whether the value that instruction `ip` leaves at depth `k` is an integer. The instruction after it knows the
+    /// kinds of the operands it leaves, so the marks before that one give the answer.
+    fn int_out(&self, ip: usize, k: i32) -> bool {
+        self.lp
+            .marks
+            .get(ip + 1 - self.lp.header)
+            .is_some_and(|m| m.get(k as usize) == Some(&Mark::Int))
+    }
+
+    /// The frame slot of the integer shadow of local `i`, which is in `lp.shadows`. The slots lie below the tag cells.
+    fn shadow_mem(&self, i: u32) -> Mem {
+        let j = self
+            .lp
+            .shadows
+            .iter()
+            .position(|&s| s == i)
+            .expect("a whole local the loop uses has a shadow");
+        Mem {
+            base: RSP,
+            disp: SHADOW_BASE + 8 * j as i32,
+        }
+    }
+
+    /// Loads the integer shadow of local `i` from its number, which the loop reads on entry. The number must be
+    /// integral, within `INT_BOUND`, and not -0. Otherwise the entry leaves to `not_entered`, before anything it
+    /// changes is read.
+    fn load_shadow(&mut self, i: u32, not_entered: Label) {
+        self.a.cmp8_imm(local_mem(i), TAG_NUM);
+        self.a.jcc(CC_NE, not_entered);
+        let src = match self.home(i) {
+            Home::Reg(x) => x,
+            Home::Mem(m) => {
+                self.a.movsd_load(0, m);
+                0
+            }
+        };
+        // The number truncates to an integer, which converts back to the same number when it is whole.
+        self.a.cvttsd2si64(RAX, src);
+        self.a.cvtsi2sd64(1, RAX);
+        self.a.ucomisd(1, src);
+        self.a.jcc(CC_NE, not_entered);
+        self.a.jcc(CC_P, not_entered);
+        // Within the bound, the integer survives a sign extension from 41 bits.
+        self.a.mov_rr(RCX, RAX);
+        self.a.shl64_imm(RCX, 23);
+        self.a.sar64_imm(RCX, 23);
+        self.a.cmp_rr64(RCX, RAX);
+        self.a.jcc(CC_NE, not_entered);
+        // A zero with its sign bit set is -0, which an integer cannot hold.
+        let ok = self.a.label();
+        self.a.test64(RAX, RAX);
+        self.a.jcc(CC_NE, ok);
+        self.a.movmskpd(RCX, src);
+        self.a.mov_imm32(R8, 1);
+        self.a.test32(RCX, R8);
+        self.a.jcc(CC_NE, not_entered);
+        self.a.bind(ok);
+        let shadow = self.shadow_mem(i);
+        self.a.mov_store(shadow, RAX);
+    }
+
+    /// Copies local `i` into xmm `dst`. A whole local is read from its integer, which is the current value inside a loop
+    /// (see `writeback`).
     fn read_local(&mut self, i: u32, dst: u8) {
+        if self.lp.shadows.contains(&i) {
+            let shadow = self.shadow_mem(i);
+            self.a.mov_load(RAX, shadow);
+            self.a.cvtsi2sd64(dst, RAX);
+            return;
+        }
         match self.home(i) {
             Home::Reg(x) => self.a.movapd_rr(dst, x),
             Home::Mem(m) => self.a.movsd_load(dst, m),
@@ -2760,6 +3051,10 @@ impl Emitter<'_, '_> {
 
     /// The register that holds local `i`: its own, or `scratch`, which is loaded with it.
     fn local_src(&mut self, i: u32, scratch: u8) -> u8 {
+        if self.lp.shadows.contains(&i) {
+            self.read_local(i, scratch);
+            return scratch;
+        }
         match self.home(i) {
             Home::Reg(x) => x,
             Home::Mem(m) => {
@@ -2769,8 +3064,12 @@ impl Emitter<'_, '_> {
         }
     }
 
-    /// Stores xmm `src` as local `i`.
+    /// Stores xmm `src` as local `i`. A whole local is only written from its integer (see `write_int_local`).
     fn write_local(&mut self, i: u32, src: u8) {
+        assert!(
+            !self.lp.shadows.contains(&i),
+            "a whole local is written from its integer"
+        );
         match self.home(i) {
             Home::Reg(x) => self.a.movapd_rr(x, src),
             Home::Mem(m) => {
@@ -2784,8 +3083,12 @@ impl Emitter<'_, '_> {
         }
     }
 
-    /// `local op= src`, by `sse`.
+    /// `local op= src`, by `sse`. A whole local is only updated as an integer (see `step_counter`).
     fn update_local(&mut self, i: u32, sse: u8, src: u8) {
+        assert!(
+            !self.lp.shadows.contains(&i),
+            "a whole local is updated as an integer"
+        );
         match self.home(i) {
             Home::Reg(x) => self.a.sse(sse, x, src),
             Home::Mem(m) => {
@@ -2852,6 +3155,15 @@ impl Emitter<'_, '_> {
 
     /// Writes the `d` operands back to the stack, each with the tag its kind has.
     fn spill(&mut self, ip: usize, d: i32) {
+        // The constant that the instruction at `ip` folds is on top, and no register holds it, so the exit loads it first.
+        if ip > 0 && d > 0 && self.folds_into(ip - 1) {
+            let Op::Const(k) = self.proto.code[ip - 1] else {
+                unreachable!("only a constant is folded into an instruction")
+            };
+            self.a
+                .mov_imm64(self.int_reg(d - 1), number(self.proto, k) as i64 as u64);
+        }
+        self.materialize(ip, d);
         for k in 0..d {
             let slot = local_mem((self.proto.nlocals as i32 + k) as u32);
             let x = self.reg(k);
@@ -2943,6 +3255,11 @@ impl Emitter<'_, '_> {
     /// `tag`. Any other element jumps to `exit`.
     fn elem_read(&mut self, key: u8, dst: u8, tag: Mem, whole: bool, exit: Label) {
         self.elem_addr(key, whole, exit);
+        self.read_elem(dst, tag, exit);
+    }
+
+    /// Loads the element at rdx (see `elem_addr`) into `dst`, and its tag into `tag` (see `elem_read`).
+    fn read_elem(&mut self, dst: u8, tag: Mem, exit: Label) {
         let (num, done) = (self.a.label(), self.a.label());
         self.a.movzx_load8(RAX, Mem { base: RDX, disp: 0 });
         self.a.cmp64_imm8(RAX, TAG_NUM);
@@ -2979,10 +3296,57 @@ impl Emitter<'_, '_> {
     /// Makes r8 the array that element `key` of the array in r8 holds. An element that is not an array jumps to `exit`.
     fn elem_row(&mut self, key: u8, whole: bool, exit: Label) {
         self.elem_addr(key, whole, exit);
+        self.row_of_elem(exit);
+    }
+
+    /// Makes r8 the array that the element at rdx holds (see `elem_row`).
+    fn row_of_elem(&mut self, exit: Label) {
         self.a.movzx_load8(RAX, Mem { base: RDX, disp: 0 });
         self.a.cmp64_imm8(RAX, TAG_ARR);
         self.a.jcc(CC_NE, exit);
         self.a.mov_load(R8, Mem { base: RDX, disp: 8 });
+    }
+
+    /// Leaves the address of element `key` of the array in r8 in rdx, for the integer in the register `key`, which is
+    /// kept. The index is in rax. A key outside the array jumps to `exit`.
+    fn elem_addr_int(&mut self, key: u8, exit: Label) {
+        // `allowed` admits element operations only when the layout is known.
+        let layout =
+            arr_layout().expect("the planner admits array elements only with a known layout");
+        self.a.mov_rr(RAX, key);
+        // A negative key is huge as an unsigned number, so the bounds below refuse it too.
+        self.a.cmp64_imm32(RAX, MAX_ARRAY_GROW as i32);
+        self.a.jcc(CC_AE, exit);
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: R8,
+                disp: layout.vec + layout.len,
+            },
+        );
+        self.a.cmp_rr64(RAX, RSI);
+        self.a.jcc(CC_AE, exit);
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: R8,
+                disp: layout.vec + layout.buf,
+            },
+        );
+        self.a.shl64_imm(RAX, 4);
+        self.a.add64(RDX, RAX);
+    }
+
+    /// `elem_read` for the integer key in the register `key`.
+    fn elem_read_int(&mut self, key: u8, dst: u8, tag: Mem, exit: Label) {
+        self.elem_addr_int(key, exit);
+        self.read_elem(dst, tag, exit);
+    }
+
+    /// `elem_row` for the integer key in the register `key`.
+    fn elem_row_int(&mut self, key: u8, exit: Label) {
+        self.elem_addr_int(key, exit);
+        self.row_of_elem(exit);
     }
 
     /// The register that holds the number `bits`: its hoisted register, or `scratch`, which is loaded
@@ -3126,55 +3490,100 @@ impl Emitter<'_, '_> {
         }
     }
 
-    /// `local++` or `local--`, by `sse`, which `delta` (1 or -1) describes. The integer copy takes the
-    /// same step, and a step that takes it out of range leaves the loop after the step, at the next
-    /// instruction.
+    /// `local++` or `local--`, by `sse`, which `delta` (1 or -1) describes. A whole local steps as an integer, and a
+    /// step that leaves the bound takes the generic code at this instruction, which repeats the step on the number.
     fn step_counter(&mut self, i: u32, sse: u8, delta: i8, ip: usize) {
-        let one = self.constant(1f64.to_bits(), 1);
-        self.update_local(i, sse, one);
-        if self.lp.int_local == Some(i) {
-            self.a.add64_imm8(R13, delta);
-            if let Some(c) = self.lp.rem {
-                // The remainder steps with the copy: it goes up by one, and starts again at zero at c.
-                self.a.mov_imm32(RDX, 0);
-                self.a.add64_imm8(R15, 1);
-                self.a.cmp64_imm32(R15, c as i32);
-                self.a.cmov(CC_E, R15, RDX);
+        if !self.lp.shadows.contains(&i) {
+            let one = self.constant(1f64.to_bits(), 1);
+            self.update_local(i, sse, one);
+            return;
+        }
+        let exit = self.side_exit(ip, self.depth[ip]);
+        let shadow = self.shadow_mem(i);
+        self.a.mov_load(RAX, shadow);
+        self.a.add64_imm8(RAX, delta);
+        self.check_bound(RAX, exit);
+        self.write_int_local(i, RAX);
+    }
+
+    /// Writes the integer in `gpr` as whole local `i`. Its number is written at the next exit (see `writeback`).
+    fn write_int_local(&mut self, i: u32, gpr: u8) {
+        let shadow = self.shadow_mem(i);
+        self.a.mov_store(shadow, gpr);
+    }
+
+    /// Whether the constant at `p` is never loaded into a register, since the instruction after it takes it without one: as
+    /// the divisor of an integer remainder, or as the upper operand of a fused comparison of integers, as an immediate.
+    fn folds_into(&self, p: usize) -> bool {
+        let code = &self.proto.code;
+        let Some(&Op::Const(k)) = code.get(p) else {
+            return false;
+        };
+        let d0 = self.depth[p];
+        let jumped = self.lp.entries.contains(&(p + 1))
+            || code.iter().enumerate().any(|(j, &op)| {
+                j + 1 != p + 1 && successors(op, j, 0).iter().any(|&(t, _)| t == p + 1)
+            });
+        if jumped || p + 1 >= code.len() {
+            return false;
+        }
+        match code[p + 1] {
+            Op::Mod => mod_divisor(self.proto, p + 1).is_some() && self.int_out(p + 1, d0 - 1),
+            Op::JumpIfNotLt(_)
+            | Op::JumpIfNotLe(_)
+            | Op::JumpIfNotGt(_)
+            | Op::JumpIfNotGe(_)
+            | Op::JumpIfStrictEq(_)
+            | Op::JumpIfNotStrictEq(_) => {
+                let value = number(self.proto, k);
+                self.int_at(p + 1, d0 - 1)
+                    && self.int_at(p + 1, d0)
+                    && value.fract() == 0.0
+                    && value.abs() < 2f64.powi(31)
             }
-            let target = self.exit_label(ip + 1);
-            if delta > 0 {
-                self.a.cmp64_imm32(R13, INT_LIMIT);
-                self.a.jcc(CC_G, target);
-            } else {
-                self.a.cmp64_imm32(R13, -INT_LIMIT);
-                self.a.jcc(CC_L, target);
-            }
+            _ => false,
         }
     }
 
-    /// `r13 % c` into `dst`, for the integer copy of a local. The magnitude goes through the reciprocal
-    /// of `c`, and the sign bit of the copy becomes the sign of the result, so that a zero remainder of
-    /// a negative copy is -0.
-    fn mod_shadow(&mut self, c: u32, dst: u8) {
-        let (m, s) = magic(c);
-        self.a.mov_rr(RCX, R13);
-        self.a.mov_rr(R8, RCX);
-        self.a.neg64(R8);
-        self.a.cmovs(R8, RCX);
-        self.a.mov_rr(R9, R8);
+    /// Whether the value on top before instruction `ip` lies within `INT_BOUND` already: the instruction before `ip` pushed
+    /// it as a remainder, a constant or a local, and no other jump reaches `ip`, so that instruction is its producer.
+    fn bounded_top(&self, ip: usize) -> bool {
+        let code = &self.proto.code;
+        let pushed = ip > 0
+            && matches!(
+                code[ip - 1],
+                Op::Mod | Op::ModLK(..) | Op::Const(_) | Op::GetLocal(_)
+            );
+        let jumped = self.lp.entries.contains(&ip)
+            || code
+                .iter()
+                .enumerate()
+                .any(|(j, &op)| j + 1 != ip && successors(op, j, 0).iter().any(|&(t, _)| t == ip));
+        pushed && !jumped
+    }
+
+    /// Leaves to `exit` unless the integer in `r` lies within `INT_BOUND`, which a sign extension from 41 bits shows.
+    fn check_bound(&mut self, r: u8, exit: Label) {
+        self.a.mov_rr(RCX, r);
+        self.a.shl64_imm(RCX, 23);
+        self.a.sar64_imm(RCX, 23);
+        self.a.cmp_rr64(RCX, r);
+        self.a.jcc(CC_NE, exit);
+    }
+
+    /// `r % n` in place, for the integer `r` and the integer divisor `n` (see `magic`). A dividend outside
+    /// `[0, 2^31)` leaves to `exit`, since a negative one takes the sign of the dividend, and a zero of it is -0.
+    fn mod_int(&mut self, r: u8, n: u32, exit: Label) {
+        let (m, s) = magic(n);
+        // Compared as unsigned numbers, so a negative dividend is out of range too.
+        self.a.cmp64_imm32(r, 0x7fff_ffff);
+        self.a.jcc(CC_A, exit);
+        self.a.mov_rr(RCX, r);
         self.a.mov_imm64(R10, m);
-        self.a.imul64(R8, R10);
-        self.a.shr64_imm(R8, s);
-        self.a.imul64_imm(R8, R8, c as i32);
-        self.a.sub64(R9, R8);
-        self.a.mov_rr(RDX, RCX);
-        self.a.shr64_imm(RDX, 63);
-        self.a.shl64_imm(RDX, 63);
-        self.a.movq_to_xmm(0, RDX);
-        // cvtsi2sd keeps the destination's old upper bits, so zeroing it first breaks a false dependency.
-        self.a.xorpd(dst, dst);
-        self.a.cvtsi2sd64(dst, R9);
-        self.a.xorpd(dst, 0);
+        self.a.imul64(RCX, R10);
+        self.a.shr64_imm(RCX, s);
+        self.a.imul64_imm(RCX, RCX, n as i32);
+        self.a.sub64(r, RCX);
     }
 
     /// `local op k` into `dst`.
@@ -3188,18 +3597,6 @@ impl Emitter<'_, '_> {
     /// an integer takes `js_mod`, which is the only path for a divisor that is not an integer.
     fn mod_constant(&mut self, i: u32, k: u32, dst: u8) {
         let c = number(self.proto, k);
-        if self.lp.int_local == Some(i) {
-            if let Some(n) = int_divisor(c) {
-                if self.lp.rem == Some(n) {
-                    // The remainder is kept in r15 for a copy that is not negative (see `step_counter`).
-                    self.a.xorpd(dst, dst);
-                    self.a.cvtsi2sd64(dst, R15);
-                } else {
-                    self.mod_shadow(n, dst);
-                }
-                return;
-            }
-        }
         let src = self.local_src(i, 1);
         let (slow, join) = (self.a.label(), self.a.label());
         match int_divisor(c) {
@@ -3298,23 +3695,26 @@ impl Emitter<'_, '_> {
     /// Stores every local's number back to its frame slot, and marks the slot as a number.
     fn writeback(&mut self) {
         let lp = self.lp;
+        // A whole local's number is current in its integer only, so its number is written from it. An xmm home takes
+        // the number, which the loop below writes out with the other locals in xmm.
+        for &i in &lp.shadows {
+            let shadow = self.shadow_mem(i);
+            self.a.mov_load(RAX, shadow);
+            match self.home(i) {
+                Home::Reg(x) => self.a.cvtsi2sd64(x, RAX),
+                Home::Mem(m) => {
+                    self.a.cvtsi2sd64(0, RAX);
+                    self.a.movsd_store(m, 0);
+                    self.a.mov8_imm(m.at(-8), TAG_NUM);
+                }
+            }
+        }
         for &(i, home) in &lp.locals {
             if let Home::Reg(x) = home {
                 self.a.mov8_imm(local_mem(i), TAG_NUM);
                 self.a.movsd_store(local_mem(i).at(8), x);
             }
         }
-    }
-
-    /// The stub that leaves a loop at instruction `t`, which is one of its exits.
-    fn exit_label(&self, t: usize) -> Label {
-        let k = self
-            .lp
-            .exits
-            .iter()
-            .position(|&e| e == t)
-            .expect("every exit is planned");
-        self.exits[k]
     }
 
     /// The label of instruction `t`: its code inside the region, or the stub that leaves a loop.
@@ -3473,23 +3873,19 @@ mod tests {
         );
         let lp = plan_at(&p, 5).expect("the loop is planned");
         assert_eq!(lp.entries, vec![5, 8]);
-        // The step of `i` leaves the loop at 8 when its integer copy goes out of range.
-        assert_eq!(lp.exits, vec![9, 8]);
-        assert_eq!(lp.int_local, Some(1));
+        assert_eq!(lp.exits, vec![9]);
+        // The whole locals the loop uses each have a shadow, the most used first.
+        assert_eq!(lp.shadows, vec![1, 0]);
         assert!(matches!(
             lp.locals[..],
             [(1, Home::Reg(2)), (0, Home::Reg(3))]
         ));
-        // The loop's constants are 1.0 and 20.0, and they take the top registers.
-        assert_eq!(lp.consts, vec![(1f64.to_bits(), 15), (20f64.to_bits(), 14)]);
         assert!(lp.guards.is_empty());
-        // The remainder by 7 is kept in r15, and steps with the counter.
-        assert_eq!(lp.rem, Some(7));
     }
 
     #[test]
-    fn a_remainder_is_not_kept_for_two_divisors_or_a_counter_that_steps_down() {
-        // The same loop, with `i % 5` as well, which takes the copy by another divisor.
+    fn a_counter_that_steps_down_keeps_its_shadow() {
+        // The same loop, with `i % 5` as well, and the counter stepping down.
         let two = proto(
             vec![
                 Op::Const(0),
@@ -3514,7 +3910,10 @@ mod tests {
             2,
             0,
         );
-        assert_eq!(plan_at(&two, 5).expect("the loop is planned").rem, None);
+        assert!(plan_at(&two, 5)
+            .expect("the loop is planned")
+            .shadows
+            .contains(&1));
         // The same loop, with the counter stepping down.
         let down = proto(
             vec![
@@ -3533,7 +3932,10 @@ mod tests {
             2,
             0,
         );
-        assert_eq!(plan_at(&down, 5).expect("the loop is planned").rem, None);
+        assert!(plan_at(&down, 5)
+            .expect("the loop is planned")
+            .shadows
+            .contains(&1));
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub const R14: u8 = 14;
 pub const R15: u8 = 15;
 
 /// Condition codes: the low nibble of `Jcc` and `SETcc`.
+pub const CC_O: u8 = 0x0;
 pub const CC_B: u8 = 0x2;
 pub const CC_AE: u8 = 0x3;
 pub const CC_E: u8 = 0x4;
@@ -31,6 +32,7 @@ pub const CC_S: u8 = 0x8;
 pub const CC_P: u8 = 0xA;
 pub const CC_NP: u8 = 0xB;
 pub const CC_L: u8 = 0xC;
+pub const CC_GE: u8 = 0xD;
 pub const CC_LE: u8 = 0xE;
 pub const CC_G: u8 = 0xF;
 
@@ -239,6 +241,11 @@ impl Asm {
         self.op(Some(0xF2), false, &[0x0F, 0x2C], dst, Rm::Reg(src));
     }
 
+    /// `cvttsd2si dst64, src`: truncates to a 64-bit integer (0x8000000000000000 when out of range).
+    pub fn cvttsd2si64(&mut self, dst: u8, src: u8) {
+        self.op(Some(0xF2), true, &[0x0F, 0x2C], dst, Rm::Reg(src));
+    }
+
     /// `cvtsi2sd dst, src32`.
     pub fn cvtsi2sd(&mut self, dst: u8, src: u8) {
         self.op(Some(0xF2), false, &[0x0F, 0x2A], dst, Rm::Reg(src));
@@ -278,14 +285,15 @@ impl Asm {
         self.code.push(imm);
     }
 
+    /// `sar r64, imm8`: shifts right, keeping the sign.
+    pub fn sar64_imm(&mut self, r: u8, imm: u8) {
+        self.op(None, true, &[0xC1], 7, Rm::Reg(r));
+        self.code.push(imm);
+    }
+
     /// `cmovs dst, src` (64-bit): copies `src` when the sign flag is set.
     pub fn cmovs(&mut self, dst: u8, src: u8) {
         self.op(None, true, &[0x0F, 0x48], dst, Rm::Reg(src));
-    }
-
-    /// `cmov<cc> dst, src` (64-bit): copies `src` when condition `cc` holds on the flags.
-    pub fn cmov(&mut self, cc: u8, dst: u8, src: u8) {
-        self.op(None, true, &[0x0F, 0x40 | cc], dst, Rm::Reg(src));
     }
 
     /// `movmskpd dst32, src`: the sign bits of the two doubles in `src`, in bits 0 and 1 of `dst`.
@@ -556,6 +564,11 @@ mod tests {
     fn register_forms() {
         assert_eq!(encode(|a| a.ucomisd(1, 0)), [0x66, 0x0F, 0x2E, 0xC8]);
         assert_eq!(encode(|a| a.cvttsd2si(RAX, 0)), [0xF2, 0x0F, 0x2C, 0xC0]);
+        assert_eq!(
+            encode(|a| a.cvttsd2si64(RAX, 0)),
+            [0xF2, 0x48, 0x0F, 0x2C, 0xC0]
+        );
+        assert_eq!(encode(|a| a.sar64_imm(RCX, 23)), [0x48, 0xC1, 0xF9, 0x17]);
         assert_eq!(encode(|a| a.cvtsi2sd(1, RAX)), [0xF2, 0x0F, 0x2A, 0xC8]);
         assert_eq!(
             encode(|a| a.movq_to_xmm(1, RAX)),
