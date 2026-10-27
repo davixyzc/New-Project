@@ -1,0 +1,18 @@
+// The loop runs the method in place, and then the object's method is replaced by another function. The guard sees that
+// the callee is no longer the inlined function, so the call takes the generic path from then on.
+const other = function (k) {
+  this.n -= k;
+};
+const obj = {
+  n: 0,
+  add(k) {
+    this.n += k;
+  },
+};
+let log = 0;
+for (let i = 0; i < 10; i++) {
+  if (i === 5) obj.add = other;
+  obj.add(i);
+  log += obj.n;
+}
+console.log(obj.n, log);

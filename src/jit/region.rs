@@ -158,6 +158,98 @@ pub(super) struct Region {
     pub(super) resumes: Vec<usize>,
     /// Set for a function region.
     pub(super) function: Option<Function>,
+    /// The method call that the loop runs in place, with its body, when `with_inline` finds one.
+    pub(super) inline: Option<Box<Inline>>,
+}
+
+/// A method that a loop region runs in place of its call (see `with_inline`): the call, the function that the callee
+/// must be, that function's own region, and its depths.
+pub(super) struct Inline {
+    call: usize,
+    proto: std::rc::Rc<Proto>,
+    lp: Region,
+    depth: Vec<i32>,
+}
+
+/// Where the body of an inlined method finds its receiver and its operands, and where it goes when it returns and when
+/// it declines. A decline leaves at the call's exit, as a call that the entry declines does (see `call_method`).
+#[derive(Clone, Copy)]
+struct InlineCtx {
+    receiver: Mem,
+    reg_base: u8,
+    exit: Label,
+    cont: Label,
+}
+
+/// The payload of the argument of an inlined body. The loop keeps it in its frame, below the property caches, since
+/// the argument is a number and the body reads it as one.
+const ARG_SLOT: i32 = 240;
+
+fn arg_payload() -> Mem {
+    Mem {
+        base: RSP,
+        disp: ARG_SLOT + 8,
+    }
+}
+
+/// Returns `lp`, with the method call that its loop inlines, when there is one. The call is the first in the loop whose
+/// callee is a method, and the method is the function that the loop's object literal makes for that name: the `Closure`
+/// that is followed by `InitProp` or `SetProp` of the name. The body of that function runs in place of the call, behind a check that
+/// the callee's prototype is that function (see `Emitter::inline_body`). Any other callee makes the call as before.
+pub(super) fn with_inline(proto: &Proto, depth: &[i32], mut lp: Region) -> Region {
+    let found = (lp.header..=lp.last).find_map(|ip| {
+        if depth[ip] < 3 || proto.code[ip] != Op::Call(1) {
+            return None;
+        }
+        match lp.marks[ip - lp.header][depth[ip] as usize - 3] {
+            Mark::Method(_, name, _) => Some((ip, name)),
+            _ => None,
+        }
+    });
+    let Some((call, name)) = found else {
+        return lp;
+    };
+    let mut sites = proto.code.windows(2).filter_map(|w| match w {
+        [Op::Closure(i), Op::InitProp(n) | Op::SetProp(n)] if *n == name => Some(*i),
+        _ => None,
+    });
+    let (Some(i), None) = (sites.next(), sites.next()) else {
+        return lp;
+    };
+    let Some(child) = proto.protos.get(i as usize).cloned() else {
+        return lp;
+    };
+    // An arrow function's `this` is not the receiver of the call, so it is never inlined.
+    if child.nparams != 1 || child.has_rest || child.is_arrow {
+        return lp;
+    }
+    let Some((child_depth, deepest)) = super::codegen::depths(&child) else {
+        return lp;
+    };
+    let types = super::types::number_slots(&child, &child_depth, deepest, 1);
+    let Some(mut body) = plan_function(&child, &child_depth, &types) else {
+        return lp;
+    };
+    if !body.function.as_ref().is_some_and(|f| f.receiver) {
+        return lp;
+    }
+    // The argument is read from the loop's frame, not from the register that the call takes it from.
+    for (local, home) in body.locals.iter_mut() {
+        if *local == 0 {
+            *home = Home::Mem(arg_payload());
+        }
+    }
+    // The body's operands start at the callee's depth, and must stay below the constants of the loop.
+    if TEMP_BASE as i32 + depth[call] - 3 + deepest > 16 - lp.consts.len() as i32 {
+        return lp;
+    }
+    lp.inline = Some(Box::new(Inline {
+        call,
+        proto: child,
+        lp: body,
+        depth: child_depth,
+    }));
+    lp
 }
 
 /// What an operand is, in the stack that `plan_function` follows.
@@ -579,6 +671,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         whole_guards,
         resumes,
         function: None,
+        inline: None,
     })
 }
 
@@ -657,6 +750,7 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
             receiver: facts.receiver,
             upvals: facts.upvals,
         }),
+        inline: None,
     })
 }
 
@@ -1615,6 +1709,7 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
         nlocals: 0,
         sides: Vec::new(),
         prop_cache: None,
+        inline: None,
     };
     e.a.bind(entry);
     e.a.push_reg(R13);
@@ -2037,6 +2132,7 @@ pub(super) fn emit_function(
         nlocals,
         sides: Vec::new(),
         prop_cache: None,
+        inline: None,
     };
     e.body_ops();
     let a = e.a;
@@ -2088,6 +2184,8 @@ struct Emitter<'a, 'b> {
     sides: Vec<(Label, usize, i32)>,
     /// The last `GetProp` that kept its property's address in r14: its instruction, its name, and its object's view.
     prop_cache: Option<(usize, u32, Mark)>,
+    /// The body of the method that the loop runs in place, with its own receiver and operands (see `inline_body`).
+    inline: Option<InlineCtx>,
 }
 
 impl Emitter<'_, '_> {
@@ -2467,6 +2565,12 @@ impl Emitter<'_, '_> {
                 self.a.ucomisd(b, a);
                 self.jump_if(t, CC_BE);
             }
+            // The body of an inlined method returns by continuing after the call.
+            Op::Return if self.inline.is_some() => {
+                if let Some(ctx) = self.inline {
+                    self.a.jmp(ctx.cont);
+                }
+            }
             Op::Return => {
                 match self.lp.function.as_ref() {
                     // A method returns `undefined`, with status 0 in rax, which the wrapper passes on.
@@ -2675,6 +2779,20 @@ impl Emitter<'_, '_> {
         );
         self.a.cmp64_imm32(R9, 1);
         self.a.jcc(CC_NE, exit);
+        // A loop that runs the callee's body in place (see `with_inline`) checks that the callee is that body's function.
+        let inlined = self
+            .lp
+            .inline
+            .as_deref()
+            .filter(|i| i.call == ip)
+            .map(|i| std::rc::Rc::as_ptr(&i.proto));
+        if let Some(target) = inlined {
+            self.a.mov_imm64(R11, target as usize as u64);
+            self.a.cmp_rr64(RDX, R11);
+            self.a.jcc(CC_NE, exit);
+            self.inline_body(ip, d, s, exit);
+            return;
+        }
         self.a.mov_load(
             RAX,
             Mem {
@@ -2857,6 +2975,9 @@ impl Emitter<'_, '_> {
 
     /// The xmm register of the operand at depth `k`.
     fn reg(&self, k: i32) -> u8 {
+        if let Some(ctx) = self.inline {
+            return (ctx.reg_base as i32 + k) as u8;
+        }
         let base = if self.lp.function.is_some() {
             FN_TEMP_BASE
         } else {
@@ -2976,8 +3097,86 @@ impl Emitter<'_, '_> {
         self.lp.marks[ip - self.lp.header][k as usize]
     }
 
+    /// The receiver of the method's body: the object local that the call reads the method from, when the body runs in
+    /// place, and the receiver of a function region otherwise.
+    fn receiver_home(&self) -> Mem {
+        match self.inline {
+            Some(ctx) => ctx.receiver,
+            None => receiver_mem(self.nlocals),
+        }
+    }
+
+    /// Runs the body of the method that the loop inlines in place of the call at `ip`, whose callee is at depth `d - 3`.
+    /// The body's operands go on from the callee's depth. Its declines leave at the call's exit, which is safe because
+    /// they come before any write, and its return continues after the call.
+    fn inline_body(&mut self, ip: usize, d: i32, s: u32, exit: Label) {
+        let lp = self.lp;
+        let inl = lp.inline.as_deref().expect("an inlined call has its body");
+        let arg = self.reg(d - 1);
+        self.a.movsd_store(arg_payload(), arg);
+        let cont = self.at[ip + 1 - lp.header];
+        let at: Vec<Label> = (0..inl.proto.code.len()).map(|_| self.a.label()).collect();
+        let not_entered = self.a.label();
+        {
+            let mut body = Emitter {
+                a: &mut *self.a,
+                proto: &*inl.proto,
+                depth: &inl.depth,
+                lp: &inl.lp,
+                at,
+                exits: Vec::new(),
+                not_entered,
+                slow: Vec::new(),
+                body: None,
+                nlocals: inl.proto.nlocals as i32,
+                sides: Vec::new(),
+                prop_cache: None,
+                inline: Some(InlineCtx {
+                    receiver: local_mem(s),
+                    reg_base: (TEMP_BASE as i32 + d - 3) as u8,
+                    exit,
+                    cont,
+                }),
+            };
+            body.emit_inline();
+        }
+        self.prop_cache = None;
+        self.forget_row_caches();
+        self.check_structure();
+    }
+
+    /// Emits the instructions of an inlined body, then its out-of-line paths. The body ends by jumping to the
+    /// continuation of the call, which its return jumps to as well.
+    fn emit_inline(&mut self) {
+        for ip in 0..self.proto.code.len() {
+            let at = self.at[ip];
+            self.a.bind(at);
+            let d = self.depth[ip];
+            if d < 0 {
+                self.a.ud2();
+            } else {
+                let op = self.proto.code[ip];
+                self.op(op, d, ip);
+            }
+        }
+        if let Some(ctx) = self.inline {
+            self.a.jmp(ctx.cont);
+        }
+        for (entry, join, dst, src, c) in std::mem::take(&mut self.slow) {
+            self.a.bind(entry);
+            self.a.movapd_rr(0, src);
+            self.a.mov_imm64(RCX, c.to_bits());
+            self.a.movq_to_xmm(1, RCX);
+            self.call_mod(dst);
+            self.a.jmp(join);
+        }
+    }
+
     /// A stub that leaves the loop so that the generic code runs the element operation at `ip`, which has `d` operands.
     fn side_exit(&mut self, ip: usize, d: i32) -> Label {
+        if let Some(ctx) = self.inline {
+            return ctx.exit;
+        }
         let stub = self.a.label();
         self.sides.push((stub, ip, d));
         stub
@@ -3253,7 +3452,7 @@ impl Emitter<'_, '_> {
     fn view_mem(&self, m: Mark) -> Mem {
         match m {
             Mark::View(s) => local_mem(s),
-            Mark::Receiver => receiver_mem(self.nlocals),
+            Mark::Receiver => self.receiver_home(),
             _ => unreachable!("a property is read only of a view or of the receiver (see `step` and `function_step`)"),
         }
     }

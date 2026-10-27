@@ -1,0 +1,58 @@
+// A method that a loop calls runs in the loop when its callee is the function the object literal makes. Replacing the
+// method, declining the body, and calling the same method on two objects must all give the same result as a call.
+const counter = {
+  n: 0,
+  add(k) {
+    this.n += k;
+  },
+  scale(k) {
+    this.n = this.n * 2 + k - 1;
+  },
+};
+for (let i = 0; i < 40; i++) counter.add(i % 3);
+console.log(counter.n);
+
+const other = {
+  n: 5,
+  add(k) {
+    this.n += k * 10;
+  },
+};
+let total = 0;
+for (let i = 0; i < 30; i++) {
+  counter.add(i);
+  other.add(i);
+  total += counter.n + other.n;
+}
+console.log(total, counter.n, other.n);
+
+// The method is replaced in the loop, so the callee changes and the loop makes the call generically.
+const swap = {
+  n: 1,
+  add(k) {
+    this.n += k;
+  },
+};
+for (let i = 0; i < 10; i++) {
+  if (i === 5) swap.add = function (k) {
+    this.n -= k;
+  };
+  swap.add(i);
+}
+console.log(swap.n);
+
+// The body declines when `n` is a string, and the generic call concatenates instead.
+const text = {
+  n: "a",
+  add(k) {
+    this.n += k;
+  },
+};
+for (let i = 0; i < 3; i++) text.add(i);
+console.log(text.n);
+
+// A body that uses its argument in a longer expression, and a loop whose receiver is another local.
+for (let i = 0; i < 4; i++) counter.scale(i);
+let alias = counter;
+for (let i = 0; i < 5; i++) alias.add(i + 0.5);
+console.log(counter.n, alias === counter);

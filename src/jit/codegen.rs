@@ -635,7 +635,9 @@ impl<'a> Gen<'a> {
         let mut regions = Vec::new();
         let mut entry_at = vec![None; proto.code.len()];
         for header in loop_headers(proto) {
-            if let Some(lp) = region::plan(proto, depth, &types, header) {
+            if let Some(lp) = region::plan(proto, depth, &types, header)
+                .map(|lp| region::with_inline(proto, depth, lp))
+            {
                 // A region is entered where the generic code reaches it, so each entry needs one
                 // region. The first region to claim an entry keeps it.
                 for &e in &lp.entries {
