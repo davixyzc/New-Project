@@ -1048,10 +1048,10 @@ impl<'a> Gen<'a> {
         self.a.jmp(generic);
     }
 
-    /// `push` of a plain value onto an array with room for it, done in place, as `rt::push_call` does: the value goes past
-    /// the end, the array's length grows, the receiver's reference is released and the new length replaces the callee.
-    /// A receiver that is not an array, a value with a reference, and a full array all jump to `slow`, before anything has
-    /// changed (apart from the callee, which only the last step writes).
+    /// `push` of a plain value or a string onto an array with room for it, done in place, as `rt::push_call` does: the
+    /// value goes past the end, the array's length grows, the receiver's reference is released and the new length
+    /// replaces the callee. A receiver that is not an array, a value with another reference, and a full array all jump
+    /// to `slow`, before anything has changed (apart from the callee, which only the last step writes).
     fn inline_push(&mut self, callee: Mem, this: Mem, arg: Mem, slow: Label, done: Label) {
         let Some(layout) = arr_layout() else {
             self.a.jmp(slow);
@@ -1059,9 +1059,14 @@ impl<'a> Gen<'a> {
         };
         self.check_tag(this, TAG_ARR, slow);
         self.check_release(this, slow);
-        // A value without a reference is copied as it is, so the element needs no release.
+        // A value without a reference is copied as it is, and a string moves into the element with its reference. Any
+        // other value takes the helper.
+        let plain = self.a.label();
         self.a.cmp8_imm(arg, TAG_NUM);
-        self.a.jcc(CC_A, slow);
+        self.a.jcc(CC_BE, plain);
+        self.a.cmp8_imm(arg, TAG_STR);
+        self.a.jcc(CC_NE, slow);
+        self.a.bind(plain);
         self.a.mov_load(RDX, this.at(8));
         self.a.add64_imm32(RDX, layout.vec);
         self.a.mov_load(
@@ -1094,6 +1099,9 @@ impl<'a> Gen<'a> {
         self.a.mov_store(Mem { base: RDI, disp: 0 }, R8);
         self.a.mov_load(R8, arg.at(8));
         self.a.mov_store(Mem { base: RDI, disp: 8 }, R8);
+        // The argument's slot is dead now, and its reference, if it had one, went to the element. The slot holds a plain
+        // value, which nothing drops.
+        self.a.mov8_imm(arg, TAG_UNDEF);
         self.a.add64_imm8(RSI, 1);
         self.a.mov_store(
             Mem {

@@ -1,0 +1,44 @@
+// Strings built by concatenation and cut by split, and strings pushed onto arrays. Plain values, shared and fresh
+// strings, and ASCII and non-ASCII text take these paths.
+const base = "w";
+const accents = "é";
+const parts = [];
+for (let i = -2; i < 4; i++) parts.push(base + i);
+console.log(parts.join(","), parts.length);
+
+console.log(base + true, base + undefined, base + null, base + "", "" + base, base + 1.5, base + 1e16, base + -0);
+console.log(accents + 2, accents + "ö", accents + accents, (accents + 3).length, (base + accents).length);
+
+const text = "alpha,beta,gamma,delta";
+console.log(text.split(",").join("|"), text.split(",").length, text.split(", ").length);
+console.log(text.split("a").length, text.split("", 3).join("-"), text.split(",", 2).join("+"));
+const wide = "é,ö,abc,,ü";
+const pieces = wide.split(",");
+console.log(pieces.length, pieces[0].length, pieces[1], pieces[2].length, pieces[3].length === 0, pieces[4]);
+const joined = wide.split(",").join(",");
+console.log(joined === wide, joined.length, wide.split("").length);
+console.log("a-b--c".split("-").map((p) => p.length).join(" "), "é-b".split("-")[0].length);
+console.log("é--ö--ab".split("--").map((p) => p.length).join(" "), "a--b--c".split("--")[1].length);
+
+const acc = [];
+const once = "x" + 1;
+acc.push(once);
+acc.push(once);
+acc.push("y" + "z");
+acc.push(text.split(",")[1]);
+acc.push(true);
+acc.push(undefined);
+acc.push(acc.length);
+console.log(acc.length, acc.join("/"));
+
+const nested = [];
+nested.push(nested);
+console.log(nested.length, nested[0].length);
+
+let grow = "";
+const chain = [];
+for (let i = 0; i < 5; i++) {
+  grow += i;
+  chain.push(grow + base);
+}
+console.log(chain.join(" "), grow.length, base.length);

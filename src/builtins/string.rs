@@ -322,17 +322,27 @@ fn trim_end(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> 
     Ok(Value::str(this_str(&this).trim_end()))
 }
 
+/// A piece of a string: a piece of an ASCII string is ASCII, and its character count is its length, so only a piece of
+/// another string is scanned.
+fn piece(text: &str, source_ascii: bool) -> Value {
+    if source_ascii {
+        Value::Str(Rc::new(JsStr::counted(text.to_string(), text.len(), true)))
+    } else {
+        Value::str(text)
+    }
+}
+
 /// The pieces of `s` between the occurrences of the ASCII byte `sep`, as `str::split` gives them.
-fn split_at_byte(s: &str, sep: u8) -> Vec<Value> {
+fn split_at_byte(s: &str, sep: u8, source_ascii: bool) -> Vec<Value> {
     let mut parts = Vec::new();
     let mut start = 0;
     for (i, &b) in s.as_bytes().iter().enumerate() {
         if b == sep {
-            parts.push(Value::str(&s[start..i]));
+            parts.push(piece(&s[start..i], source_ascii));
             start = i + 1;
         }
     }
-    parts.push(Value::str(&s[start..]));
+    parts.push(piece(&s[start..], source_ascii));
     parts
 }
 
@@ -345,8 +355,11 @@ fn split(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
             match sep.as_bytes() {
                 [] => s.chars().map(|c| Value::str(&c.to_string())).collect(),
                 // An ASCII byte never occurs inside a multi-byte character, so the pieces can be cut at it directly.
-                [byte] if byte.is_ascii() => split_at_byte(&s, *byte),
-                _ => s.split(sep.as_str()).map(Value::str).collect(),
+                [byte] if byte.is_ascii() => split_at_byte(&s, *byte, s.is_ascii()),
+                _ => s
+                    .split(sep.as_str())
+                    .map(|p| piece(p, s.is_ascii()))
+                    .collect(),
             }
         }
     };

@@ -1,5 +1,6 @@
 //! Runtime values and the conversion and comparison rules that operate on them.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell, RefMut};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -451,14 +452,15 @@ impl JsStr {
         self.ascii
     }
 
-    /// Appends `more`, keeping the counts up to date.
-    pub fn push_str(&mut self, more: &str) {
-        self.chars += if more.is_ascii() {
-            more.len()
-        } else {
-            more.chars().count()
-        };
-        self.ascii = self.ascii && more.is_ascii();
+    /// A string whose character count and ASCII flag the caller knows, so that `new` does not scan it.
+    pub(crate) fn counted(text: String, chars: usize, ascii: bool) -> JsStr {
+        JsStr { text, chars, ascii }
+    }
+
+    /// Appends `more`, whose character count and ASCII flag the caller knows, so that it is not scanned.
+    fn push_counted(&mut self, more: &str, chars: usize, ascii: bool) {
+        self.chars += chars;
+        self.ascii = self.ascii && ascii;
         self.text.push_str(more);
     }
 }
@@ -1389,25 +1391,38 @@ pub fn joins_too_long(a: &Value, b: &Value) -> bool {
     size(a) + size(b) > MAX_STRING_LEN
 }
 
+/// The text that `concat_owned` appends for `rhs`, with its character count and whether it is ASCII. A string and an
+/// integer know these, so nothing is scanned; any other value is converted and counted.
+fn appended<'a>(rhs: &'a Value, digits: &'a mut [u8; 21]) -> (Cow<'a, str>, usize, bool) {
+    match rhs {
+        Value::Str(r) => (Cow::Borrowed(r.as_str()), r.char_count(), r.is_ascii()),
+        Value::Num(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => {
+            let text = int_text(*n as i64, digits);
+            (Cow::Borrowed(text), text.len(), true)
+        }
+        other => {
+            let text = to_str(other);
+            let (chars, ascii) = (text.chars().count(), text.is_ascii());
+            (Cow::Owned(text), chars, ascii)
+        }
+    }
+}
+
 /// `old + rhs` where `old` is owned. A string held only by `old` is extended in place,
 /// which keeps loops that build a string linear instead of quadratic.
 pub fn concat_owned(old: Value, rhs: Value) -> Value {
     match old {
         Value::Str(mut s) => {
+            let mut digits = [0u8; 21];
+            let (more, chars, ascii) = appended(&rhs, &mut digits);
             if Rc::get_mut(&mut s).is_none() {
+                // A shared string is copied, and the copy keeps the counts of the string it copies.
                 let mut copy = String::with_capacity(s.len() * 2 + 16);
                 copy.push_str(&s);
-                s = Rc::new(JsStr::new(copy));
+                s = Rc::new(JsStr::counted(copy, s.char_count(), s.is_ascii()));
             }
             let buf = Rc::get_mut(&mut s).unwrap();
-            match &rhs {
-                Value::Str(r) => buf.push_str(r),
-                Value::Num(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => {
-                    let mut digits = [0u8; 21];
-                    buf.push_str(int_text(*n as i64, &mut digits));
-                }
-                other => buf.push_str(&to_str(other)),
-            }
+            buf.push_counted(&more, chars, ascii);
             Value::Str(s)
         }
         other => add(&other, &rhs),
