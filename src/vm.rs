@@ -676,6 +676,14 @@ fn konst(proto: &Proto, k: u32) -> &Value {
     unsafe { proto.consts.get_unchecked(k as usize) }
 }
 
+/// The hint of `Vm::to_primitive`. `Number` asks an object for `valueOf` first, as `+`, arithmetic, comparisons and `==`
+/// do, and `String` asks for `toString` first, as template strings and `String` do.
+#[derive(Clone, Copy, PartialEq)]
+enum Hint {
+    Number,
+    String,
+}
+
 /// Overwrites a value. A slot that holds a scalar needs no drop, so it is written directly.
 #[inline(always)]
 fn put(slot: &mut Value, v: Value) {
@@ -1702,22 +1710,36 @@ impl Vm {
                 if joins_too_long(self.local(idx), &rhs) {
                     return Err(self.make_error("RangeError", "Invalid string length"));
                 }
-                // Moving the value out first lets a string be extended in place.
-                let old = std::mem::replace(self.local_mut(idx), Value::Undef);
-                let result = match (&old, &rhs) {
-                    (Value::Num(x), Value::Num(y)) => {
-                        let sum = Value::Num(x + y);
-                        forget_scalar(old);
-                        forget_scalar(rhs);
-                        sum
+                let result = if self.local(idx).is_object() || rhs.is_object() {
+                    // An object converts before the sum, and the variable keeps its value until then.
+                    self.sync_ip(ip);
+                    let old = self.local(idx).clone();
+                    let old = self.to_primitive(old, Hint::Number)?;
+                    let rhs = self.to_primitive(rhs, Hint::Number)?;
+                    concat_owned(old, rhs)
+                } else {
+                    // Moving the value out first lets a string be extended in place.
+                    let old = std::mem::replace(self.local_mut(idx), Value::Undef);
+                    match (&old, &rhs) {
+                        (Value::Num(x), Value::Num(y)) => {
+                            let sum = Value::Num(x + y);
+                            forget_scalar(old);
+                            forget_scalar(rhs);
+                            sum
+                        }
+                        _ => concat_owned(old, rhs),
                     }
-                    _ => concat_owned(old, rhs),
                 };
                 put(self.local_mut(idx), result);
             }
             Op::ConcatLocal(i) => {
-                let rhs = self.pop();
-                let old = self.pop();
+                let mut rhs = self.pop();
+                let mut old = self.pop();
+                if old.is_object() || rhs.is_object() {
+                    self.sync_ip(ip);
+                    old = self.to_primitive(old, Hint::Number)?;
+                    rhs = self.to_primitive(rhs, Hint::Number)?;
+                }
                 if joins_too_long(&old, &rhs) {
                     return Err(self.make_error("RangeError", "Invalid string length"));
                 }
@@ -1765,28 +1787,48 @@ impl Vm {
             Op::AddLK(s, k) => {
                 let r = match (self.local(base + s as usize), konst(proto, k)) {
                     (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
-                    (a, b) => add(a, b),
+                    (a, b) if !a.is_object() => add(a, b),
+                    (a, b) => {
+                        let (a, b) = (a.clone(), b.clone());
+                        self.sync_ip(ip);
+                        self.plus(a, b)?
+                    }
                 };
                 self.stack.push(r);
             }
             Op::SubLK(s, k) => {
                 let r = match (self.local(base + s as usize), konst(proto, k)) {
                     (Value::Num(x), Value::Num(y)) => x - y,
-                    (a, b) => to_num(a) - to_num(b),
+                    (a, b) => {
+                        let (a, b) = (a.clone(), b.clone());
+                        self.sync_ip(ip);
+                        let x = self.to_number(a)?;
+                        x - self.to_number(b)?
+                    }
                 };
                 self.stack.push(Value::Num(r));
             }
             Op::MulLK(s, k) => {
                 let r = match (self.local(base + s as usize), konst(proto, k)) {
                     (Value::Num(x), Value::Num(y)) => x * y,
-                    (a, b) => to_num(a) * to_num(b),
+                    (a, b) => {
+                        let (a, b) = (a.clone(), b.clone());
+                        self.sync_ip(ip);
+                        let x = self.to_number(a)?;
+                        x * self.to_number(b)?
+                    }
                 };
                 self.stack.push(Value::Num(r));
             }
             Op::ModLK(s, k) => {
                 let r = match (self.local(base + s as usize), konst(proto, k)) {
                     (Value::Num(x), Value::Num(y)) => js_mod(*x, *y),
-                    (a, b) => js_mod(to_num(a), to_num(b)),
+                    (a, b) => {
+                        let (a, b) = (a.clone(), b.clone());
+                        self.sync_ip(ip);
+                        let x = self.to_number(a)?;
+                        js_mod(x, self.to_number(b)?)
+                    }
                 };
                 self.stack.push(Value::Num(r));
             }
@@ -1939,13 +1981,9 @@ impl Vm {
                 Some((x, y)) => self.replace_top2(Value::Num(x + y)),
                 None => {
                     self.sync_ip(ip);
-                    let (mut a, mut b) = self.pop_pair();
-                    if matches!(a, Value::Obj(_)) {
-                        a = Value::from_string(self.to_text(&a)?);
-                    }
-                    if matches!(b, Value::Obj(_)) {
-                        b = Value::from_string(self.to_text(&b)?);
-                    }
+                    let (a, b) = self.pop_pair();
+                    let a = self.to_primitive(a, Hint::Number)?;
+                    let b = self.to_primitive(b, Hint::Number)?;
                     if joins_too_long(&a, &b) {
                         return Err(self.make_error("RangeError", "Invalid string length"));
                     }
@@ -1956,33 +1994,45 @@ impl Vm {
             Op::Sub => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Num(x - y)),
                 None => {
+                    self.sync_ip(ip);
                     let (a, b) = self.pop_pair();
-                    self.stack.push(Value::Num(to_num(&a) - to_num(&b)));
+                    let x = self.to_number(a)?;
+                    let y = self.to_number(b)?;
+                    self.stack.push(Value::Num(x - y));
                 }
             },
             Op::Mul => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Num(x * y)),
                 None => {
+                    self.sync_ip(ip);
                     let (a, b) = self.pop_pair();
-                    self.stack.push(Value::Num(to_num(&a) * to_num(&b)));
+                    let x = self.to_number(a)?;
+                    let y = self.to_number(b)?;
+                    self.stack.push(Value::Num(x * y));
                 }
             },
             Op::Div => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Num(x / y)),
                 None => {
+                    self.sync_ip(ip);
                     let (a, b) = self.pop_pair();
-                    self.stack.push(Value::Num(to_num(&a) / to_num(&b)));
+                    let x = self.to_number(a)?;
+                    let y = self.to_number(b)?;
+                    self.stack.push(Value::Num(x / y));
                 }
             },
             Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr => {
+                self.sync_ip(ip);
                 let (a, b) = self.pop_pair();
-                self.stack
-                    .push(Value::Num(bitwise(op, to_num(&a), to_num(&b))));
+                let x = self.to_number(a)?;
+                let y = self.to_number(b)?;
+                self.stack.push(Value::Num(bitwise(op, x, y)));
             }
             Op::BitNot => {
+                self.sync_ip(ip);
                 let a = self.pop();
-                self.stack
-                    .push(Value::Num(f64::from(!to_int32(to_num(&a)))));
+                let x = self.to_number(a)?;
+                self.stack.push(Value::Num(f64::from(!to_int32(x))));
             }
             Op::In => {
                 let (key, target) = self.pop_pair();
@@ -2012,21 +2062,31 @@ impl Vm {
             Op::Mod => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Num(js_mod(x, y))),
                 None => {
+                    self.sync_ip(ip);
                     let (a, b) = self.pop_pair();
-                    self.stack.push(Value::Num(js_mod(to_num(&a), to_num(&b))));
+                    let x = self.to_number(a)?;
+                    let y = self.to_number(b)?;
+                    self.stack.push(Value::Num(js_mod(x, y)));
                 }
             },
             Op::Pow => {
+                self.sync_ip(ip);
                 let (a, b) = self.pop_pair();
-                self.stack.push(Value::Num(to_num(&a).powf(to_num(&b))));
+                let x = self.to_number(a)?;
+                let y = self.to_number(b)?;
+                self.stack.push(Value::Num(x.powf(y)));
             }
             Op::Eq => {
+                self.sync_ip(ip);
                 let (a, b) = self.pop_pair();
-                self.stack.push(Value::Bool(loose_eq(&a, &b)));
+                let equal = self.loose_equal(a, b)?;
+                self.stack.push(Value::Bool(equal));
             }
             Op::Ne => {
+                self.sync_ip(ip);
                 let (a, b) = self.pop_pair();
-                self.stack.push(Value::Bool(!loose_eq(&a, &b)));
+                let equal = self.loose_equal(a, b)?;
+                self.stack.push(Value::Bool(!equal));
             }
             Op::StrictEq => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Bool(x == y)),
@@ -2045,46 +2105,57 @@ impl Vm {
             Op::Lt => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Bool(x < y)),
                 None => {
+                    self.sync_ip(ip);
                     let (a, b) = self.pop_pair();
-                    self.stack
-                        .push(Value::Bool(compare(&a, &b) == Some(Ordering::Less)));
+                    let order = self.relation(a, b)?;
+                    self.stack.push(Value::Bool(order == Some(Ordering::Less)));
                 }
             },
             Op::Le => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Bool(x <= y)),
                 None => {
+                    self.sync_ip(ip);
                     let (a, b) = self.pop_pair();
-                    let r = matches!(compare(&a, &b), Some(Ordering::Less | Ordering::Equal));
+                    let order = self.relation(a, b)?;
+                    let r = matches!(order, Some(Ordering::Less | Ordering::Equal));
                     self.stack.push(Value::Bool(r));
                 }
             },
             Op::Gt => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Bool(x > y)),
                 None => {
+                    self.sync_ip(ip);
                     let (a, b) = self.pop_pair();
+                    let order = self.relation(a, b)?;
                     self.stack
-                        .push(Value::Bool(compare(&a, &b) == Some(Ordering::Greater)));
+                        .push(Value::Bool(order == Some(Ordering::Greater)));
                 }
             },
             Op::Ge => match self.num_pair() {
                 Some((x, y)) => self.replace_top2(Value::Bool(x >= y)),
                 None => {
+                    self.sync_ip(ip);
                     let (a, b) = self.pop_pair();
-                    let r = matches!(compare(&a, &b), Some(Ordering::Greater | Ordering::Equal));
+                    let order = self.relation(a, b)?;
+                    let r = matches!(order, Some(Ordering::Greater | Ordering::Equal));
                     self.stack.push(Value::Bool(r));
                 }
             },
             Op::Neg => {
+                self.sync_ip(ip);
                 let a = self.pop();
-                self.stack.push(Value::Num(-to_num(&a)));
+                let x = self.to_number(a)?;
+                self.stack.push(Value::Num(-x));
             }
             Op::Not => {
                 let a = self.pop();
                 self.stack.push(Value::Bool(!truthy(&a)));
             }
             Op::ToNumber => {
+                self.sync_ip(ip);
                 let a = self.pop();
-                self.stack.push(Value::Num(to_num(&a)));
+                let x = self.to_number(a)?;
+                self.stack.push(Value::Num(x));
             }
             Op::TypeOf => {
                 let a = self.pop();
@@ -2119,8 +2190,9 @@ impl Vm {
                     }
                     // `pop_pair` already removed both operands, so nothing is left to truncate.
                     None => {
+                        self.sync_ip(ip);
                         let (a, b) = self.pop_pair();
-                        compare(&a, &b) == Some(Ordering::Less)
+                        self.relation(a, b)? == Some(Ordering::Less)
                     }
                 };
                 if !less {
@@ -2138,27 +2210,36 @@ impl Vm {
                 }
             }
             Op::JumpIfNotLe(t) => {
+                self.sync_ip(ip);
                 let (a, b) = self.pop_pair();
-                if !matches!(compare(&a, &b), Some(Ordering::Less | Ordering::Equal)) {
+                let order = self.relation(a, b)?;
+                if !matches!(order, Some(Ordering::Less | Ordering::Equal)) {
                     return Ok(t as usize);
                 }
             }
             Op::JumpIfNotGt(t) => {
+                self.sync_ip(ip);
                 let (a, b) = self.pop_pair();
-                if compare(&a, &b) != Some(Ordering::Greater) {
+                if self.relation(a, b)? != Some(Ordering::Greater) {
                     return Ok(t as usize);
                 }
             }
             Op::JumpIfNotGe(t) => {
+                self.sync_ip(ip);
                 let (a, b) = self.pop_pair();
-                if !matches!(compare(&a, &b), Some(Ordering::Greater | Ordering::Equal)) {
+                let order = self.relation(a, b)?;
+                if !matches!(order, Some(Ordering::Greater | Ordering::Equal)) {
                     return Ok(t as usize);
                 }
             }
             Op::JumpIfLtLK(s, k, t) => {
                 let less = match (self.local(base + s as usize), konst(proto, k)) {
                     (Value::Num(x), Value::Num(y)) => *x < *y,
-                    (a, b) => compare(a, b) == Some(Ordering::Less),
+                    (a, b) => {
+                        let (a, b) = (a.clone(), b.clone());
+                        self.sync_ip(ip);
+                        self.relation(a, b)? == Some(Ordering::Less)
+                    }
                 };
                 if less {
                     return Ok(t as usize);
@@ -2167,7 +2248,11 @@ impl Vm {
             Op::JumpIfLtLL(a, b, t) => {
                 let less = match (self.local(base + a as usize), self.local(base + b as usize)) {
                     (Value::Num(x), Value::Num(y)) => *x < *y,
-                    (x, y) => compare(x, y) == Some(Ordering::Less),
+                    (x, y) => {
+                        let (x, y) = (x.clone(), y.clone());
+                        self.sync_ip(ip);
+                        self.relation(x, y)? == Some(Ordering::Less)
+                    }
                 };
                 if less {
                     return Ok(t as usize);
@@ -2176,7 +2261,11 @@ impl Vm {
             Op::JumpIfNotLtLK(s, k, t) => {
                 let less = match (self.local(base + s as usize), konst(proto, k)) {
                     (Value::Num(x), Value::Num(y)) => *x < *y,
-                    (a, b) => compare(a, b) == Some(Ordering::Less),
+                    (a, b) => {
+                        let (a, b) = (a.clone(), b.clone());
+                        self.sync_ip(ip);
+                        self.relation(a, b)? == Some(Ordering::Less)
+                    }
                 };
                 if !less {
                     return Ok(t as usize);
@@ -2185,7 +2274,11 @@ impl Vm {
             Op::JumpIfNotLtLL(a, b, t) => {
                 let less = match (self.local(base + a as usize), self.local(base + b as usize)) {
                     (Value::Num(x), Value::Num(y)) => *x < *y,
-                    (x, y) => compare(x, y) == Some(Ordering::Less),
+                    (x, y) => {
+                        let (x, y) = (x.clone(), y.clone());
+                        self.sync_ip(ip);
+                        self.relation(x, y)? == Some(Ordering::Less)
+                    }
                 };
                 if !less {
                     return Ok(t as usize);
@@ -2343,19 +2436,101 @@ impl Vm {
         }
     }
 
-    /// The text of a value where a string is needed, by `+`, a template literal or `String`. An object whose class, or
-    /// one of its prototypes, has a `toString` method gets that method called, as Node.js does. Any other value
-    /// converts as `to_str` does.
+    /// The text of a value where a string is needed, by a template literal, `String` or the join of an array. An object
+    /// converts through `ToPrimitive` with the string hint, so its `toString` runs before its `valueOf`.
     pub fn to_text(&mut self, v: &Value) -> Result<String, Value> {
-        if let Value::Obj(o) = v {
-            if o.borrow().collection.is_none() {
-                if let Lookup::Data(method @ Value::Func(_)) = lookup(o, "toString") {
-                    let result = self.call(&method, v.clone(), &[])?;
-                    return Ok(to_str(&result));
-                }
-            }
+        if let Value::Obj(_) = v {
+            let text = self.to_primitive(v.clone(), Hint::String)?;
+            return Ok(to_str(&text));
         }
         Ok(to_str(v))
+    }
+
+    /// `ToPrimitive`: the primitive that `v` converts to. A primitive is returned as it is, and an array, a function or
+    /// a built-in object takes its text. An object gives the first result that is not an object from its class's
+    /// methods, or its prototypes', in the order the hint gives: `valueOf` for `Number`, `toString` for `String`. A
+    /// built-in `toString` gives the text of the object, which is a primitive, so it ends the search. When every method
+    /// gives an object, the conversion throws a `TypeError`.
+    #[inline]
+    fn to_primitive(&mut self, v: Value, hint: Hint) -> Result<Value, Value> {
+        if v.is_object() || matches!(v, Value::Cell(_)) {
+            self.to_primitive_of(v, hint)
+        } else {
+            Ok(v)
+        }
+    }
+
+    /// The conversion of an object, or of a cell that holds one, which `to_primitive` runs. A primitive is returned as it is,
+    /// so the common case of `to_primitive` stays inline.
+    fn to_primitive_of(&mut self, v: Value, hint: Hint) -> Result<Value, Value> {
+        match &v {
+            Value::Obj(o) => {
+                if o.borrow().collection.is_none() {
+                    let order = match hint {
+                        Hint::Number => ["valueOf", "toString"],
+                        Hint::String => ["toString", "valueOf"],
+                    };
+                    for name in order {
+                        match lookup(o, name) {
+                            Lookup::Data(method @ Value::Func(_)) => {
+                                let result = self.call(&method, v.clone(), &[])?;
+                                if !result.is_object() {
+                                    return Ok(result);
+                                }
+                            }
+                            _ if name == "toString" => return Ok(Value::str(&to_str(&v))),
+                            _ => {}
+                        }
+                    }
+                    return Err(
+                        self.make_error("TypeError", "Cannot convert object to primitive value")
+                    );
+                }
+                Ok(Value::str(&to_str(&v)))
+            }
+            Value::Arr(_) | Value::Func(_) | Value::Native(_) => Ok(Value::str(&to_str(&v))),
+            Value::Cell(c) => {
+                let inner = c.borrow().clone();
+                self.to_primitive(inner, hint)
+            }
+            _ => Ok(v),
+        }
+    }
+
+    /// `ToNumber` for an operand of an arithmetic or bitwise operator. An object converts through `valueOf` first.
+    pub fn to_number(&mut self, v: Value) -> Result<f64, Value> {
+        match v {
+            Value::Num(n) => Ok(n),
+            other => Ok(to_num(&self.to_primitive(other, Hint::Number)?)),
+        }
+    }
+
+    /// The order of two operands of `<`, `<=`, `>` or `>=`. Each one converts through `ToPrimitive`, the first before the
+    /// second.
+    fn relation(&mut self, a: Value, b: Value) -> Result<Option<Ordering>, Value> {
+        let a = self.to_primitive(a, Hint::Number)?;
+        let b = self.to_primitive(b, Hint::Number)?;
+        Ok(compare(&a, &b))
+    }
+
+    /// `==`. An object compared with a primitive converts through `ToPrimitive` first, unless the primitive is null or
+    /// undefined, which no object equals.
+    fn loose_equal(&mut self, a: Value, b: Value) -> Result<bool, Value> {
+        let (a, b) = if a.is_object() && !b.is_object() && !b.is_nullish() {
+            (self.to_primitive(a, Hint::Number)?, b)
+        } else if b.is_object() && !a.is_object() && !a.is_nullish() {
+            (a, self.to_primitive(b, Hint::Number)?)
+        } else {
+            (a, b)
+        };
+        Ok(loose_eq(&a, &b))
+    }
+
+    /// `a + b` for operands that are not both numbers. Each one converts through `ToPrimitive` before the sum or the text.
+    fn plus(&mut self, a: Value, b: Value) -> Result<Value, Value> {
+        let a = self.to_primitive(a, Hint::Number)?;
+        let b = self.to_primitive(b, Hint::Number)?;
+        Ok(add(&a, &b))
     }
 
     /// `v instanceof ctor`: whether the prototype chain of `v` holds the prototype of `ctor`. Functions and classes

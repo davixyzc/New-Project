@@ -1,0 +1,58 @@
+// Objects convert through ToPrimitive. `valueOf` runs first for `+`, arithmetic, comparisons and `==`, and `toString`
+// runs first for template literals and `String`. A method that gives an object is skipped, and when none gives a
+// primitive the conversion throws.
+const n = { valueOf() { return 42; }, toString() { return "T"; } };
+console.log(n + 1, n + "x", `${n}`, String(n), Number(n), n * 2, n - 0.5, +n, -n);
+
+const onlyText = { toString() { return "10"; } };
+console.log(onlyText + 5, onlyText * 3, `${onlyText}!`);
+
+class Money {
+  constructor(cents) {
+    this.cents = cents;
+  }
+  valueOf() {
+    return this.cents;
+  }
+}
+const a = new Money(500);
+const b = new Money(250);
+console.log(a + b, a > b, a < 1000, a == 500, a === 500, a - b);
+
+const log = [];
+const p = { valueOf() { log.push("p"); return 1; } };
+const q = { valueOf() { log.push("q"); return 2; } };
+console.log(p + q, log.join(""));
+
+const r = { valueOf() { return {}; }, toString() { return "R"; } };
+console.log(r + "!", r * 1);
+
+console.log({} + "", [1, 2] + "", String({}), `${[3, 4]}`, {} == "[object Object]");
+
+let total = { n: 1, valueOf() { return this.n; } };
+total += 5;
+console.log(total, typeof total);
+
+let text = "x";
+text += { toString() { return "y"; } };
+console.log(text);
+
+const c = { valueOf() { return 7; } };
+let sum = 0;
+for (let i = 0; i < 4; i++) {
+  sum += c;
+}
+console.log(sum);
+
+try {
+  ({ valueOf() { throw new Error("boom"); } }) * 2;
+} catch (e) {
+  console.log(e.message);
+}
+
+const bad = { valueOf() { return {}; }, toString() { return {}; } };
+try {
+  bad + 1;
+} catch (e) {
+  console.log(e instanceof TypeError);
+}

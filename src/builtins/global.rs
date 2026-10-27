@@ -601,11 +601,11 @@ fn reference_error_ctor(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Valu
     Ok(new_error(vm, this, "ReferenceError", args))
 }
 
-fn number(_vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn number(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Num(if args.is_empty() {
         0.0
     } else {
-        to_num(&args[0])
+        vm.to_number(args[0].clone())?
     }))
 }
 
