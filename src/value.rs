@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell, RefMut};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
+use std::ptr;
 use std::rc::Rc;
 
 use crate::bytecode::Proto;
@@ -461,7 +462,7 @@ impl JsStr {
     fn push_counted(&mut self, more: &str, chars: usize, ascii: bool) {
         self.chars += chars;
         self.ascii = self.ascii && ascii;
-        self.text.push_str(more);
+        push_small(&mut self.text, more);
     }
 }
 
@@ -1163,11 +1164,11 @@ pub fn join_items(a: &ArrRef, sep: &str, outer: Option<&Joining>) -> String {
     let mut text = String::new();
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
-            text.push_str(sep);
+            push_small(&mut text, sep);
         }
         match item {
             Value::Undef | Value::Null => {}
-            Value::Str(s) => text.push_str(s),
+            Value::Str(s) => push_small(&mut text, s),
             Value::Num(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => push_int(&mut text, *n as i64),
             other => text.push_str(&to_str_in(other, Some(&joining))),
         }
@@ -1391,6 +1392,50 @@ pub fn joins_too_long(a: &Value, b: &Value) -> bool {
     size(a) + size(b) > MAX_STRING_LEN
 }
 
+/// Appends `more` to `text`. Short text, which most strings are built from, is copied with a few word moves rather
+/// than by a call to `memcpy`, whose set-up costs about as much as the copy itself.
+#[inline(always)]
+pub(crate) fn push_small(text: &mut String, more: &str) {
+    let n = more.len();
+    if n > 16 {
+        text.push_str(more);
+        return;
+    }
+    if text.capacity() - text.len() < n {
+        text.reserve(n);
+    }
+    let src = more.as_ptr();
+    // SAFETY: `reserve` made room for `n` bytes past the end, and the length grows over them only after they are
+    // written. They are a copy of the valid UTF-8 of `more`, which cannot overlap `text`: `more` is borrowed apart from it.
+    unsafe {
+        let v = text.as_mut_vec();
+        let end = v.len();
+        let dst = v.as_mut_ptr().add(end);
+        if n >= 8 {
+            // The first and the last eight bytes cover all of them, since `n` is at most 16.
+            ptr::write_unaligned(dst as *mut u64, ptr::read_unaligned(src as *const u64));
+            let tail = n - 8;
+            ptr::write_unaligned(
+                dst.add(tail) as *mut u64,
+                ptr::read_unaligned(src.add(tail) as *const u64),
+            );
+        } else if n >= 4 {
+            ptr::write_unaligned(dst as *mut u32, ptr::read_unaligned(src as *const u32));
+            let tail = n - 4;
+            ptr::write_unaligned(
+                dst.add(tail) as *mut u32,
+                ptr::read_unaligned(src.add(tail) as *const u32),
+            );
+        } else if n > 0 {
+            // One to three bytes: the first, the middle and the last cover them all.
+            *dst = *src;
+            *dst.add(n / 2) = *src.add(n / 2);
+            *dst.add(n - 1) = *src.add(n - 1);
+        }
+        v.set_len(end + n);
+    }
+}
+
 /// The text that `concat_owned` appends for `rhs`, with its character count and whether it is ASCII. A string and an
 /// integer know these, so nothing is scanned; any other value is converted and counted.
 fn appended<'a>(rhs: &'a Value, digits: &'a mut [u8; 21]) -> (Cow<'a, str>, usize, bool) {
@@ -1418,7 +1463,7 @@ pub fn concat_owned(old: Value, rhs: Value) -> Value {
             if Rc::get_mut(&mut s).is_none() {
                 // A shared string is copied, and the copy keeps the counts of the string it copies.
                 let mut copy = String::with_capacity(s.len() * 2 + 16);
-                copy.push_str(&s);
+                push_small(&mut copy, &s);
                 s = Rc::new(JsStr::counted(copy, s.char_count(), s.is_ascii()));
             }
             let buf = Rc::get_mut(&mut s).unwrap();

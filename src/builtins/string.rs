@@ -4,7 +4,9 @@ use std::rc::Rc;
 
 use crate::builtins::arg;
 use crate::builtins::array::bounds;
-use crate::value::{num_to_string, to_num, to_str, JsStr, NativeDef, Value, MAX_STRING_LEN};
+use crate::value::{
+    num_to_string, push_small, to_num, to_str, JsStr, NativeDef, Value, MAX_STRING_LEN,
+};
 use crate::vm::Vm;
 
 pub static METHODS: &[NativeDef] = &[
@@ -326,7 +328,9 @@ fn trim_end(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> 
 /// another string is scanned.
 fn piece(text: &str, source_ascii: bool) -> Value {
     if source_ascii {
-        Value::Str(Rc::new(JsStr::counted(text.to_string(), text.len(), true)))
+        let mut owned = String::with_capacity(text.len());
+        push_small(&mut owned, text);
+        Value::Str(Rc::new(JsStr::counted(owned, text.len(), true)))
     } else {
         Value::str(text)
     }
