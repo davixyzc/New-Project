@@ -1,0 +1,11 @@
+// Splitting by one character, by several, by nothing, and with a limit, checked against Node.
+const cases = [["a,b,,c,", ","], ["", ","], ["abc", ","], [",,", ","], ["x", "x"], ["héllo wörld", "ö"], ["a--b--c", "--"], ["abc", ""], ["a b  c", " "], ["😀,😃", ","], ["a,b,c", ",,"], ["a,b,c", undefined], ["", ""], ["a", "a"]];
+for (let i = 0; i < cases.length; i++) {
+  const parts = cases[i][1] === undefined ? cases[i][0].split() : cases[i][0].split(cases[i][1]);
+  console.log(parts.length, parts.join("|"));
+}
+console.log("a,b,c,d".split(",", 2).join("|"), "a,b,c".split(",", 0).length);
+const big = [];
+for (let i = 0; i < 1000; i++) big.push("w" + (i % 7));
+const joined = big.join(",");
+console.log(joined.length, joined.split(",").length, joined.split(", ").length, joined.split(",")[999]);

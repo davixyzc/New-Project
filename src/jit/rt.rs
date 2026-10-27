@@ -98,7 +98,7 @@ pub unsafe extern "C" fn concat_top(a: *mut Value, b: *const Value) -> bool {
 /// `x % y` for numbers: the remainder with the sign of `x`, which is JavaScript's `%`. Native code
 /// calls it when its inline path does not cover the operands.
 pub extern "C" fn js_mod(x: f64, y: f64) -> f64 {
-    x % y
+    crate::value::js_mod(x, y)
 }
 
 /// Runs the instruction at `ip`, which native code does not handle itself.

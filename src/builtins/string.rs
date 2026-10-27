@@ -322,16 +322,31 @@ fn trim_end(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> 
     Ok(Value::str(this_str(&this).trim_end()))
 }
 
+/// The pieces of `s` between the occurrences of the ASCII byte `sep`, as `str::split` gives them.
+fn split_at_byte(s: &str, sep: u8) -> Vec<Value> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        if b == sep {
+            parts.push(Value::str(&s[start..i]));
+            start = i + 1;
+        }
+    }
+    parts.push(Value::str(&s[start..]));
+    parts
+}
+
 fn split(_vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = this_str(&this);
     let mut parts: Vec<Value> = match arg(args, 0) {
         Value::Undef => vec![Value::str(&s)],
         sep => {
             let sep = to_str(&sep);
-            if sep.is_empty() {
-                s.chars().map(|c| Value::str(&c.to_string())).collect()
-            } else {
-                s.split(sep.as_str()).map(Value::str).collect()
+            match sep.as_bytes() {
+                [] => s.chars().map(|c| Value::str(&c.to_string())).collect(),
+                // An ASCII byte never occurs inside a multi-byte character, so the pieces can be cut at it directly.
+                [byte] if byte.is_ascii() => split_at_byte(&s, *byte),
+                _ => s.split(sep.as_str()).map(Value::str).collect(),
             }
         }
     };

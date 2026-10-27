@@ -1,0 +1,18 @@
+// Remainders of whole numbers beyond 2^31, of fractions, and of the special values, checked against Node.
+const xs = [2147483648, 4294967296, 1e15, 2 ** 53, 2 ** 53 + 2, 2 ** 60, 2 ** 62, 2 ** 63, 1e18, -1e18, -(2 ** 60) - 512, 9007199254740993, 123456789012345678, -0, 0, 1.5, -7.25, 1 / 0, -1 / 0, 0 / 0];
+const ms = [2147483648, 7, 1000003, 2 ** 40, 1e18, -3, -(2 ** 31), 0, 1 / 0, 0.5, 2 ** 62, 2 ** 63, -1];
+for (let i = 0; i < xs.length; i++) {
+  for (let j = 0; j < ms.length; j++) {
+    const r = xs[i] % ms[j];
+    console.log(i, j, r, 1 / r);
+  }
+}
+// The same with literal divisors, which take the reciprocal path in a loop.
+let sum = 0;
+for (let i = 0; i < xs.length; i++) {
+  const r = xs[i] % 2147483647;
+  const s = xs[i] % 1000;
+  console.log(i, r, s);
+  sum += r;
+}
+console.log(sum);
