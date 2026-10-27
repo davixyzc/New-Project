@@ -351,6 +351,12 @@ impl Asm {
         self.code.push(imm);
     }
 
+    /// `cmp r32, imm32`.
+    pub fn cmp32_imm32(&mut self, r: u8, imm: i32) {
+        self.op(None, false, &[0x81], 7, Rm::Reg(r));
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
     /// `cmp r64, imm8`.
     pub fn cmp64_imm8(&mut self, r: u8, imm: u8) {
         self.op(None, true, &[0x83], 7, Rm::Reg(r));

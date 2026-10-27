@@ -497,17 +497,32 @@ pub(super) fn int_divisor(c: f64) -> Option<u32> {
 
 /// `x % c` for an integer divisor `c`: x is in `src` and the result goes to `dst`, which may be `src`.
 /// xmm0 is scratch. The remainder takes the sign of x, sign bit included, so -0 stays -0. Jumps to
-/// `slow` when x is not an integer in the 32-bit range, where the reciprocal is not exact. Binds
-/// `join` after the code, which is where the result is ready.
-pub(super) fn emit_mod_const(a: &mut Asm, c: u32, src: u8, dst: u8, slow: Label, join: Label) {
+/// `slow` when x is not an integer in the 32-bit range, where the reciprocal is not exact. `whole` says
+/// x is known to be whole, which leaves only the range to check. Binds `join` after the code, which is
+/// where the result is ready.
+pub(super) fn emit_mod_const(
+    a: &mut Asm,
+    c: u32,
+    src: u8,
+    dst: u8,
+    slow: Label,
+    join: Label,
+    whole: bool,
+) {
     let (m, s) = magic(c);
     let general = a.label();
     a.cvttsd2si(RAX, src);
-    a.cvtsi2sd(0, RAX);
-    // The integer converted back must equal x. A NaN compares unordered, which the parity check catches.
-    a.ucomisd(0, src);
-    a.jcc(CC_NE, slow);
-    a.jcc(CC_P, slow);
+    if whole {
+        // A whole x truncates exactly, unless it is out of the 32-bit range, which truncates to the most negative int.
+        a.cmp32_imm32(RAX, i32::MIN);
+        a.jcc(CC_E, slow);
+    } else {
+        a.cvtsi2sd(0, RAX);
+        // The integer converted back must equal x. A NaN compares unordered, which the parity check catches.
+        a.ucomisd(0, src);
+        a.jcc(CC_NE, slow);
+        a.jcc(CC_P, slow);
+    }
     // A positive x is its own dividend, and its remainder is not negative: x - c * ((x * m) >> s), with no sign to take.
     a.test32(RAX, RAX);
     a.jcc(CC_LE, general);
@@ -888,7 +903,7 @@ impl<'a> Gen<'a> {
         self.check_tag(x, TAG_NUM, slow);
         self.load_num(i, 1);
         let join = self.a.label();
-        emit_mod_const(&mut self.a, c, 1, 1, slow, join);
+        emit_mod_const(&mut self.a, c, 1, 1, slow, join, false);
         self.store_num(dst, 1);
     }
 

@@ -129,6 +129,10 @@ pub(super) struct Region {
     math: Option<(u32, u32)>,
     /// The kind of each operand before each instruction of a loop, from `header` on (see `operand_marks`).
     marks: Vec<Vec<Mark>>,
+    /// The locals that hold whole numbers, by local (see `plan`).
+    whole: Vec<bool>,
+    /// The whole locals that the loop uses and that a path carries in from before it, which the entry checks find whole.
+    whole_guards: Vec<u32>,
     /// The instructions of a loop that read or write an element. A side exit resumes the generic code at one of
     /// them, with its operands written back, so the generic code dispatches them as exits.
     pub(super) resumes: Vec<usize>,
@@ -141,6 +145,10 @@ pub(super) struct Region {
 enum Mark {
     /// A number, in the operand's register.
     Num,
+    /// A number that is whole, so its register holds an integral value. An index or a `%` takes it without checking
+    /// that it is whole. A number out of the 32-bit range, or NaN, which an overflow can make, converts to the most
+    /// negative int, which those uses refuse.
+    Int,
     /// A boolean, from a comparison or `!`, held as 0.0 or 1.0. Only a jump or a return takes it.
     Bool,
     /// The function, pushed by `GetUpval`. Only a call takes it, and it has no register.
@@ -422,14 +430,57 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         })
         .collect();
     let math = math_reads(proto, depth, header, last)?;
-    let kinds = Kinds {
-        arrays: &arrays,
-        objects: &objects,
-        object_reads: &object_reads,
-        math_global: math.map(|m| m.0),
-        math_sqrt: math.map(|m| m.1),
+    // A local holds whole numbers while every store to it stores one, as the marks of the stack show. The marks depend on
+    // the locals, so the set only narrows until the marks agree with it.
+    let mut whole: Vec<bool> = (0..proto.nlocals)
+        .map(|i| !arrays[i as usize] && !objects[i as usize])
+        .collect();
+    let marks = loop {
+        let kinds = Kinds {
+            arrays: &arrays,
+            objects: &objects,
+            object_reads: &object_reads,
+            math_global: math.map(|m| m.0),
+            math_sqrt: math.map(|m| m.1),
+            whole: &whole,
+        };
+        let marks = operand_marks(proto, depth, header, last, &entries, &kinds)?;
+        let mut narrowed = false;
+        for ip in header..=last {
+            if depth[ip] < 0 {
+                continue;
+            }
+            let top = marks[ip - header].last().copied();
+            let store = match code[ip] {
+                // A store keeps its local whole when the value on top is whole.
+                Op::SetLocal(i) | Op::PopToLocal(i) | Op::AddToLocal(i) => {
+                    Some((i, top == Some(Mark::Int)))
+                }
+                // A string, or a cell, is not a whole number.
+                Op::ConcatLocal(i) | Op::NewCell(i) => Some((i, false)),
+                _ => None,
+            };
+            if let Some((i, keeps)) = store {
+                if !keeps && whole[i as usize] {
+                    whole[i as usize] = false;
+                    narrowed = true;
+                }
+            }
+        }
+        if !narrowed {
+            break marks;
+        }
     };
-    let marks = operand_marks(proto, depth, header, last, &entries, &kinds)?;
+    // A whole local that the loop uses, and that a path carries in from before the loop, is checked on entry from every
+    // entry. A local the loop does not use keeps whatever it holds, so it needs no check: an array that it holds would
+    // only send the loop to the generic code.
+    let whole_guards: Vec<u32> = (0..proto.nlocals)
+        .filter(|&i| {
+            whole[i as usize]
+                && locals.iter().any(|&(l, _)| l == i)
+                && entries.iter().any(|&e| live[i as usize][e])
+        })
+        .collect();
     // A store of an element leaves the loop at the store when the element is a boolean, so the store is a resume point.
     for ip in header..=last {
         if matches!(code[ip], Op::SetLocal(i) | Op::PopToLocal(i) if !objects[i as usize])
@@ -457,6 +508,8 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         object_reads,
         math,
         marks,
+        whole,
+        whole_guards,
         resumes,
         function: None,
     })
@@ -525,6 +578,8 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
         math: None,
         // The operands before each instruction, which the emitter reads for the kinds of the operands it takes.
         marks: states.into_iter().map(Option::unwrap_or_default).collect(),
+        whole: vec![false; proto.nlocals as usize],
+        whole_guards: Vec::new(),
         resumes: Vec::new(),
         function: Some(Function {
             nparams,
@@ -840,6 +895,8 @@ struct Kinds<'a> {
     math_global: Option<u32>,
     /// The name index of `sqrt`, when the loop reads it through `Math`.
     math_sqrt: Option<u32>,
+    /// The locals that hold whole numbers (see `plan`).
+    whole: &'a [bool],
 }
 
 /// Whether `name` is the property `length`, which an array answers by its length (see `Op::GetLocalProp`).
@@ -892,7 +949,13 @@ fn math_reads(
 
 /// Whether an operand of this kind has a register (see `Mark`).
 fn has_register(m: &Mark) -> bool {
-    matches!(m, Mark::Num | Mark::Bool | Mark::Elem)
+    matches!(m, Mark::Num | Mark::Int | Mark::Bool | Mark::Elem)
+}
+
+/// Whether constant `k` is a whole number, which its register holds as an integral value.
+fn whole_const(proto: &Proto, k: u32) -> bool {
+    let c = number(proto, k);
+    c.is_finite() && c.fract() == 0.0
 }
 
 /// The address of the built-in `sqrt`, which a loop compares a property with (see `Mark::Sqrt`).
@@ -1000,7 +1063,7 @@ fn pop_kinds(state: &mut Vec<Mark>, n: usize) -> Option<Vec<Mark>> {
 fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) -> bool {
     let (arrays, objects) = (kinds.arrays, kinds.objects);
     let plain = |i: u32| !arrays[i as usize];
-    let number = |m: &Mark| *m == Mark::Num;
+    let number = |m: &Mark| matches!(m, Mark::Num | Mark::Int);
     // A side exit resumes the generic code with the operands of the instruction on the stack, so none of them may be a
     // receiver, which has no register to write back.
     let side_exit = matches!(
@@ -1026,7 +1089,11 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
         }
     }
     match op {
-        Op::Const(_) => state.push(Mark::Num),
+        Op::Const(k) => state.push(if whole_const(proto, k) {
+            Mark::Int
+        } else {
+            Mark::Num
+        }),
         Op::True | Op::False => state.push(Mark::Bool),
         Op::GetGlobal(k) if kinds.math_global == Some(k) => state.push(Mark::Math),
         Op::GetGlobal(_) => state.push(Mark::Owned),
@@ -1087,7 +1154,10 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
         Op::SetProp(n) if kinds.math_sqrt.is_some() && is_sqrt(proto, n) => return false,
         Op::SetProp(_) => {
             let n = state.len();
-            if n < 2 || state[n - 1] != Mark::Num || !matches!(state[n - 2], Mark::View(_)) {
+            if n < 2
+                || !matches!(state[n - 1], Mark::Num | Mark::Int)
+                || !matches!(state[n - 2], Mark::View(_))
+            {
                 return false;
             }
             state.truncate(n - 2);
@@ -1105,14 +1175,18 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
             if !plain(i) {
                 return false;
             }
-            state.push(Mark::Num);
+            state.push(if kinds.whole[i as usize] {
+                Mark::Int
+            } else {
+                Mark::Num
+            });
         }
         // A method call on the object that the callee was read from. The call looks the callee up, and a side exit
         // resumes at the read, so no operand below the callee may need a side exit.
         Op::Call(1)
             if matches!(
                 state.as_slice(),
-                [.., Mark::Method(s, _, _), Mark::View(v), Mark::Num] if s == v
+                [.., Mark::Method(s, _, _), Mark::View(v), Mark::Num | Mark::Int] if s == v
             ) =>
         {
             let n = state.len();
@@ -1134,7 +1208,7 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
                     state[state.len() - 2],
                     Mark::View(_) | Mark::Owned | Mark::Math
                 )
-                && state[state.len() - 1] == Mark::Num =>
+                && matches!(state[state.len() - 1], Mark::Num | Mark::Int) =>
         {
             let n = state.len();
             state.truncate(n - 3);
@@ -1147,7 +1221,7 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
             let pushes = n >= 3
                 && matches!(
                     (state[n - 3], state[n - 2], state[n - 1]),
-                    (Mark::Push(s), Mark::Array(a), Mark::Num | Mark::Bool) if s == a
+                    (Mark::Push(s), Mark::Array(a), Mark::Num | Mark::Int | Mark::Bool) if s == a
                 );
             if !pushes {
                 return false;
@@ -1174,11 +1248,12 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
                 return false;
             }
         }
-        Op::AddLK(i, _) | Op::SubLK(i, _) | Op::MulLK(i, _) | Op::ModLK(i, _) => {
+        Op::AddLK(i, k) | Op::SubLK(i, k) | Op::MulLK(i, k) | Op::ModLK(i, k) => {
             if !plain(i) {
                 return false;
             }
-            state.push(Mark::Num);
+            let whole = kinds.whole[i as usize] && whole_const(proto, k);
+            state.push(if whole { Mark::Int } else { Mark::Num });
         }
         Op::JumpIfLtLL(p, q, _) | Op::JumpIfNotLtLL(p, q, _) => {
             if !plain(p) || !plain(q) {
@@ -1186,16 +1261,22 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
             }
         }
         Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => {
-            if pop_kinds(state, 2).is_none() {
+            let Some(operands) = pop_kinds(state, 2) else {
                 return false;
-            }
-            state.push(Mark::Num);
+            };
+            // A sum, difference, product or remainder of whole numbers is whole. A quotient is not.
+            let whole = op != Op::Div && operands.iter().all(|m| *m == Mark::Int);
+            state.push(if whole { Mark::Int } else { Mark::Num });
         }
         Op::Neg => {
-            if pop_kinds(state, 1).is_none() {
+            let Some(operand) = pop_kinds(state, 1) else {
                 return false;
-            }
-            state.push(Mark::Num);
+            };
+            state.push(if operand[0] == Mark::Int {
+                Mark::Int
+            } else {
+                Mark::Num
+            });
         }
         Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Ne | Op::Not => {
             let pops = if matches!(op, Op::Not) { 1 } else { 2 };
@@ -1225,7 +1306,7 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
             _ => return false,
         },
         Op::GetIndexLocal(_) if kinds.object_reads.contains(&ip) => match state.last() {
-            Some(Mark::Num) => {
+            Some(Mark::Num | Mark::Int) => {
                 state.pop();
                 state.push(Mark::Owned);
             }
@@ -1253,7 +1334,7 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
                 Some(popped)
                     if !plain(a)
                         && popped[1..].iter().all(number)
-                        && matches!(popped[0], Mark::Num | Mark::Bool) =>
+                        && matches!(popped[0], Mark::Num | Mark::Int | Mark::Bool) =>
                 {
                     state.push(popped[0]);
                 }
@@ -1435,6 +1516,22 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
     for &i in &lp.guards {
         e.a.cmp8_imm(local_mem(i), TAG_NUM);
         e.a.jcc(CC_NE, not_entered);
+    }
+    // A whole local holds an integral number on entry, or a value that the uses of whole numbers refuse, which truncates to
+    // the most negative int: one out of the 32-bit range, or NaN. Any other value leaves the loop to the generic code.
+    for &i in &lp.whole_guards {
+        e.a.cmp8_imm(local_mem(i), TAG_NUM);
+        e.a.jcc(CC_NE, not_entered);
+        e.a.movsd_load(0, local_mem(i).at(8));
+        let checked = e.a.label();
+        e.a.cvttsd2si(RAX, 0);
+        e.a.cmp32_imm32(RAX, i32::MIN);
+        e.a.jcc(CC_E, checked);
+        e.a.cvtsi2sd(1, RAX);
+        e.a.ucomisd(1, 0);
+        e.a.jcc(CC_NE, not_entered);
+        e.a.jcc(CC_P, not_entered);
+        e.a.bind(checked);
     }
     for &a in &lp.arrays {
         e.a.cmp8_imm(local_mem(a), TAG_ARR);
@@ -2125,7 +2222,7 @@ impl Emitter<'_, '_> {
             Op::Mul => self.a.sse(SSE_MUL, y, x),
             Op::Div => self.a.sse(SSE_DIV, y, x),
             Op::Mod => match self.magic_divisor(ip) {
-                Some((n, c)) => self.mod_top(y, n, c),
+                Some((n, c)) => self.mod_top(y, n, c, self.mark(ip, d - 2) == Mark::Int),
                 None => {
                     let (slow, done) = (self.a.label(), self.a.label());
                     self.int_remainder(y, x, slow);
@@ -2265,7 +2362,7 @@ impl Emitter<'_, '_> {
                 let exit = self.side_exit(ip, d);
                 let key = self.reg(d - 1);
                 self.a.mov_load(R8, local_mem(a).at(8));
-                self.elem_addr(key, exit);
+                self.elem_addr(key, self.mark(ip, d - 1) == Mark::Int, exit);
                 self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_OBJ);
                 self.a.jcc(CC_NE, exit);
                 let to = self.operand_mem(d - 1);
@@ -2276,21 +2373,21 @@ impl Emitter<'_, '_> {
                 let exit = self.side_exit(ip, d);
                 let (key, tag) = (self.reg(d - 1), self.tag_cell(d - 1));
                 self.a.mov_load(R8, local_mem(a).at(8));
-                self.elem_read(key, key, tag, exit);
+                self.elem_read(key, key, tag, self.mark(ip, d - 1) == Mark::Int, exit);
             }
             Op::GetIndex2Local(a) => {
                 let exit = self.side_exit(ip, d);
                 let (row, key, tag) = (self.reg(d - 2), self.reg(d - 1), self.tag_cell(d - 2));
                 self.a.mov_load(R8, local_mem(a).at(8));
-                self.elem_row(row, exit);
-                self.elem_read(key, row, tag, exit);
+                self.elem_row(row, self.mark(ip, d - 2) == Mark::Int, exit);
+                self.elem_read(key, row, tag, self.mark(ip, d - 1) == Mark::Int, exit);
             }
             Op::SetIndexLocal(a) => {
                 let exit = self.side_exit(ip, d);
                 let boolean = self.mark(ip, d - 1) == Mark::Bool;
                 let (key, value) = (self.reg(d - 2), self.reg(d - 1));
                 self.a.mov_load(R8, local_mem(a).at(8));
-                self.elem_write(key, value, boolean, exit);
+                self.elem_write(key, value, boolean, self.mark(ip, d - 2) == Mark::Int, exit);
                 self.a.movapd_rr(key, value);
             }
             Op::SetIndex2Local(a) => {
@@ -2298,8 +2395,8 @@ impl Emitter<'_, '_> {
                 let boolean = self.mark(ip, d - 1) == Mark::Bool;
                 let (row, key, value) = (self.reg(d - 3), self.reg(d - 2), self.reg(d - 1));
                 self.a.mov_load(R8, local_mem(a).at(8));
-                self.elem_row(row, exit);
-                self.elem_write(key, value, boolean, exit);
+                self.elem_row(row, self.mark(ip, d - 3) == Mark::Int, exit);
+                self.elem_write(key, value, boolean, self.mark(ip, d - 2) == Mark::Int, exit);
                 self.a.movapd_rr(row, value);
             }
             // The built-in `Math` is not read here: the entry checked that `Math.sqrt` is the built-in (see `emit`).
@@ -2804,17 +2901,20 @@ impl Emitter<'_, '_> {
 
     /// Leaves the address of element `key` of the array in r8 in rdx, with the index in rax. A key that is not a whole
     /// index inside the array jumps to `exit`.
-    fn elem_addr(&mut self, key: u8, exit: Label) {
+    fn elem_addr(&mut self, key: u8, whole: bool, exit: Label) {
         // `allowed` admits element operations only when the layout is known.
         let layout =
             arr_layout().expect("the planner admits array elements only with a known layout");
-        // The number is a whole index when truncating it and converting it back give the same number. NaN fails the
-        // comparison, which sets the parity flag when the operands are unordered.
         self.a.cvttsd2si(RAX, key);
-        self.a.cvtsi2sd(1, RAX);
-        self.a.ucomisd(key, 1);
-        self.a.jcc(CC_NE, exit);
-        self.a.jcc(CC_P, exit);
+        // A whole key is an index as it is. Any other key is a whole index when truncating it and converting it back give
+        // the same number. NaN fails the comparison, which sets the parity flag when the operands are unordered. A whole key
+        // out of the 32-bit range truncates to the most negative int, which the bounds below refuse.
+        if !whole {
+            self.a.cvtsi2sd(1, RAX);
+            self.a.ucomisd(key, 1);
+            self.a.jcc(CC_NE, exit);
+            self.a.jcc(CC_P, exit);
+        }
         self.a.movsxd(RAX, RAX);
         // A negative index is huge as an unsigned number, so the bounds below refuse it too.
         self.a.cmp64_imm32(RAX, MAX_ARRAY_GROW as i32);
@@ -2841,8 +2941,8 @@ impl Emitter<'_, '_> {
 
     /// Loads element `key` of the array in r8 into `dst`, as a number or as 0.0 or 1.0 for a boolean, and its tag into
     /// `tag`. Any other element jumps to `exit`.
-    fn elem_read(&mut self, key: u8, dst: u8, tag: Mem, exit: Label) {
-        self.elem_addr(key, exit);
+    fn elem_read(&mut self, key: u8, dst: u8, tag: Mem, whole: bool, exit: Label) {
+        self.elem_addr(key, whole, exit);
         let (num, done) = (self.a.label(), self.a.label());
         self.a.movzx_load8(RAX, Mem { base: RDX, disp: 0 });
         self.a.cmp64_imm8(RAX, TAG_NUM);
@@ -2860,8 +2960,8 @@ impl Emitter<'_, '_> {
 
     /// Stores the number or boolean in `src` as element `key` of the array in r8. An element that holds a reference
     /// jumps to `exit`, before anything is written.
-    fn elem_write(&mut self, key: u8, src: u8, boolean: bool, exit: Label) {
-        self.elem_addr(key, exit);
+    fn elem_write(&mut self, key: u8, src: u8, boolean: bool, whole: bool, exit: Label) {
+        self.elem_addr(key, whole, exit);
         self.a.movzx_load8(RAX, Mem { base: RDX, disp: 0 });
         // The tags up to number are undefined, null, boolean and number, which hold no reference.
         self.a.cmp64_imm8(RAX, TAG_NUM);
@@ -2877,8 +2977,8 @@ impl Emitter<'_, '_> {
     }
 
     /// Makes r8 the array that element `key` of the array in r8 holds. An element that is not an array jumps to `exit`.
-    fn elem_row(&mut self, key: u8, exit: Label) {
-        self.elem_addr(key, exit);
+    fn elem_row(&mut self, key: u8, whole: bool, exit: Label) {
+        self.elem_addr(key, whole, exit);
         self.a.movzx_load8(RAX, Mem { base: RDX, disp: 0 });
         self.a.cmp64_imm8(RAX, TAG_ARR);
         self.a.jcc(CC_NE, exit);
@@ -3103,7 +3203,7 @@ impl Emitter<'_, '_> {
         let src = self.local_src(i, 1);
         let (slow, join) = (self.a.label(), self.a.label());
         match int_divisor(c) {
-            Some(n) => emit_mod_const(self.a, n, src, dst, slow, join),
+            Some(n) => emit_mod_const(self.a, n, src, dst, slow, join, self.lp.whole[i as usize]),
             None => {
                 self.a.jmp(slow);
                 self.a.bind(join);
@@ -3137,9 +3237,9 @@ impl Emitter<'_, '_> {
     }
 
     /// `top % c` in place, for the integer divisor `n` of `c` (see `magic_divisor`).
-    fn mod_top(&mut self, top: u8, n: u32, c: f64) {
+    fn mod_top(&mut self, top: u8, n: u32, c: f64, whole: bool) {
         let (slow, join) = (self.a.label(), self.a.label());
-        emit_mod_const(self.a, n, top, top, slow, join);
+        emit_mod_const(self.a, n, top, top, slow, join, whole);
         self.slow.push((slow, join, top, top, c));
     }
 
@@ -3461,6 +3561,31 @@ mod tests {
             lp.locals[..],
             [(0, Home::Reg(2)), (2, Home::Reg(3))]
         ));
+    }
+
+    #[test]
+    fn a_whole_local_the_loop_does_not_use_is_not_checked_on_entry() {
+        // `for (j = 0; j < n; j++) {}`, with an array in local 2 that only the code after the loop reads. The array is
+        // live on entry, but the loop never touches it, so its frame slot, which holds an array, is not checked.
+        let p = proto(
+            vec![
+                Op::Const(0),
+                Op::PopToLocal(0),
+                Op::GetLocal(0),
+                Op::GetLocal(1),
+                Op::JumpIfNotLt(8),
+                Op::IncLocal(0),
+                Op::Jump(2),
+                Op::Return,
+                Op::GetLocal(2),
+                Op::Return,
+            ],
+            vec![Value::Num(0.0)],
+            3,
+            0,
+        );
+        let lp = plan_at(&p, 2).expect("the loop is planned");
+        assert_eq!(lp.whole_guards, vec![0, 1]);
     }
 
     #[test]
