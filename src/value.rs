@@ -1311,6 +1311,14 @@ pub fn concat_owned(old: Value, rhs: Value) -> Value {
 
 /// `%` with an integer fast path, because the floating-point remainder is slow.
 pub fn js_mod(a: f64, b: f64) -> f64 {
+    // Below 2^53 the quotient of the magnitudes, cut to a whole number, is exact in floating point, and the remainder
+    // that follows from it is exact too. The casts check that both operands are whole.
+    const EXACT: f64 = 9_007_199_254_740_992.0;
+    let (m, d) = (a.abs(), b.abs());
+    if m < EXACT && (1.0..EXACT).contains(&d) && (m as i64) as f64 == m && (d as i64) as f64 == d {
+        let r = m - (m / d) as i64 as f64 * d;
+        return if a.is_sign_negative() { -r } else { r };
+    }
     // Casts avoid the libm call that `fract` needs on baseline x86-64. Below 2^63 the operands are exact in i64, and
     // so is the remainder, which is also exact as a float: fmod's result always is. The bound keeps `i64::MIN % -1`
     // out.
