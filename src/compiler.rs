@@ -69,12 +69,16 @@ struct FinallyCtx {
 struct Scope {
     vars: Vec<Var>,
     first_slot: u32,
+    /// False for a `switch` body, where a case can jump past a declaration, so its constants are not folded.
+    foldable: bool,
 }
 
 struct Var {
     name: String,
     slot: u32,
     is_const: bool,
+    /// The constant pool index of the number a `const` is initialised with, when that is a literal.
+    literal: Option<u32>,
 }
 
 #[derive(Default)]
@@ -88,8 +92,15 @@ struct LoopCtx {
 }
 
 enum Ref {
-    Local { slot: u32, is_const: bool },
-    Upval { index: u32, is_const: bool },
+    Local {
+        slot: u32,
+        is_const: bool,
+        literal: Option<u32>,
+    },
+    Upval {
+        index: u32,
+        is_const: bool,
+    },
     Global,
 }
 
@@ -557,6 +568,42 @@ impl Compiler {
         self.emit(Op::Const(i));
     }
 
+    /// The constant pool index of the number that the code from `at` pushes, when that code is a single number constant.
+    fn number_at(&mut self, at: usize) -> Option<u32> {
+        let fs = self.fs();
+        if fs.code.len() != at + 1 {
+            return None;
+        }
+        match fs.code[at] {
+            Op::Const(c) if matches!(fs.consts[c as usize], Value::Num(_)) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Records that the `const` just declared as `name` holds the number constant `c`, so that later reads in this
+    /// function load it directly.
+    fn fold_const(&mut self, name: &str, c: u32) {
+        let scope = self.fs().scopes.last_mut().unwrap();
+        if !scope.foldable {
+            return;
+        }
+        if let Some(v) = scope.vars.iter_mut().rev().find(|v| v.name == name) {
+            v.literal = Some(c);
+        }
+    }
+
+    /// The constant pool index of `e` when it is a number literal, or a `const` that holds one.
+    fn number_operand(&mut self, e: &Expr) -> Option<u32> {
+        match e {
+            Expr::Num(n) => Some(self.num_const(*n)),
+            Expr::Ident(name) => match self.resolve(name) {
+                Ref::Local { literal, .. } => literal,
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     // ----- scopes and slots -------------------------------------------------
 
     fn enter_scope(&mut self) {
@@ -565,6 +612,7 @@ impl Compiler {
         fs.scopes.push(Scope {
             vars: Vec::new(),
             first_slot,
+            foldable: true,
         });
     }
 
@@ -614,6 +662,7 @@ impl Compiler {
             name: name.to_string(),
             slot,
             is_const,
+            literal: None,
         });
         slot
     }
@@ -654,6 +703,7 @@ impl Compiler {
                 return Ref::Local {
                     slot: v.slot,
                     is_const: v.is_const,
+                    literal: v.literal,
                 };
             }
         }
@@ -669,7 +719,7 @@ impl Compiler {
         // Not ours: capture it from the enclosing function. Its locals are cells
         // because a nested function refers to the name, so the capture can share the cell.
         let (desc, is_const) = match self.resolve_at(level - 1, name) {
-            Ref::Local { slot, is_const } => (
+            Ref::Local { slot, is_const, .. } => (
                 UpvalDesc {
                     from_local: true,
                     by_value: self.funcs[level - 1].by_value_slots.contains(&slot),
@@ -701,6 +751,7 @@ impl Compiler {
             Ref::Local {
                 slot,
                 is_const: false,
+                ..
             } if !self.slot_is_boxed(slot) => Some(slot),
             _ => None,
         }
@@ -737,6 +788,11 @@ impl Compiler {
 
     fn load_var(&mut self, name: &str) {
         match self.resolve(name) {
+            Ref::Local {
+                literal: Some(c), ..
+            } => {
+                self.emit(Op::Const(c));
+            }
             Ref::Local { slot, .. } => self.get_slot(slot),
             Ref::Upval { index, .. } => {
                 self.emit(Op::GetUpval(index));
@@ -754,6 +810,7 @@ impl Compiler {
             Ref::Local {
                 slot,
                 is_const: false,
+                ..
             } => self.set_slot(slot),
             Ref::Upval {
                 index,
@@ -953,9 +1010,10 @@ impl Compiler {
                 self.line(*line);
                 self.expr_discard(e)?;
             }
-            Stmt::Var(_, decls, line) => {
+            Stmt::Var(kind, decls, line) => {
                 self.line(*line);
                 for (name, init) in decls {
+                    let before = self.here();
                     match init {
                         Some(Expr::Func(def)) => {
                             let idx = self.child(def, Some(name))?;
@@ -966,7 +1024,11 @@ impl Compiler {
                             self.emit(Op::Undef);
                         }
                     }
+                    let literal = self.number_at(before);
                     self.init_var_pop(name);
+                    if let (VarKind::Const, Some(c)) = (kind, literal) {
+                        self.fold_const(name, c);
+                    }
                 }
             }
             Stmt::Func(..) | Stmt::Empty => {}
@@ -1153,6 +1215,7 @@ impl Compiler {
         cases: &[(Option<Expr>, Vec<Stmt>)],
     ) -> Result<(), String> {
         self.enter_scope();
+        self.fs().scopes.last_mut().unwrap().foldable = false;
         for (_, body) in cases {
             self.declare_block(body)?;
         }
@@ -1536,11 +1599,12 @@ impl Compiler {
             }
             Expr::Update { op, prefix, target } => self.update(op, *prefix, target)?,
             Expr::Binary(op, a, b) => {
-                if let (Some(fused), Expr::Num(c)) = (fused_local_const(op), &**b) {
+                if let Some(fused) = fused_local_const(op) {
                     if let Some(slot) = self.local_operand(a) {
-                        let k = self.num_const(*c);
-                        self.emit(fused(slot, k));
-                        return Ok(());
+                        if let Some(k) = self.number_operand(b) {
+                            self.emit(fused(slot, k));
+                            return Ok(());
+                        }
                     }
                 }
                 self.expr(a)?;
@@ -1846,6 +1910,7 @@ impl Compiler {
                 if let Ref::Local {
                     slot,
                     is_const: false,
+                    ..
                 } = self.resolve(name)
                 {
                     if !self.slot_is_boxed(slot) {

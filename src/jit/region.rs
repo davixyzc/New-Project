@@ -2067,16 +2067,19 @@ impl Emitter<'_, '_> {
             Op::Sub => self.a.sse(SSE_SUB, y, x),
             Op::Mul => self.a.sse(SSE_MUL, y, x),
             Op::Div => self.a.sse(SSE_DIV, y, x),
-            Op::Mod => {
-                let (slow, done) = (self.a.label(), self.a.label());
-                self.int_remainder(y, x, slow);
-                self.a.jmp(done);
-                self.a.bind(slow);
-                self.a.movapd_rr(0, y);
-                self.a.movapd_rr(1, x);
-                self.call_mod(y);
-                self.a.bind(done);
-            }
+            Op::Mod => match self.magic_divisor(ip) {
+                Some((n, c)) => self.mod_top(y, n, c),
+                None => {
+                    let (slow, done) = (self.a.label(), self.a.label());
+                    self.int_remainder(y, x, slow);
+                    self.a.jmp(done);
+                    self.a.bind(slow);
+                    self.a.movapd_rr(0, y);
+                    self.a.movapd_rr(1, x);
+                    self.call_mod(y);
+                    self.a.bind(done);
+                }
+            },
             Op::Neg => {
                 self.a.mov_imm64(RAX, 1 << 63);
                 self.a.movq_to_xmm(0, RAX);
@@ -2998,6 +3001,37 @@ impl Emitter<'_, '_> {
             }
         }
         self.slow.push((slow, join, dst, src, c));
+    }
+
+    /// The integer divisor `n` and its value `c` when the `%` at `ip` divides by a number constant that the instruction
+    /// before it pushed. No other instruction may jump to `ip`, or the right operand could come from somewhere else.
+    fn magic_divisor(&self, ip: usize) -> Option<(u32, f64)> {
+        if ip == 0 || ip - 1 < self.lp.header {
+            return None;
+        }
+        let k = match self.proto.code[ip - 1] {
+            Op::Const(k) => k,
+            _ => return None,
+        };
+        let c = match self.proto.consts.get(k as usize) {
+            Some(Value::Num(c)) => *c,
+            _ => return None,
+        };
+        let n = int_divisor(c)?;
+        let jumped = self
+            .proto
+            .code
+            .iter()
+            .enumerate()
+            .any(|(j, &op)| j != ip - 1 && successors(op, j, 0).iter().any(|&(t, _)| t == ip));
+        (!jumped).then_some((n, c))
+    }
+
+    /// `top % c` in place, for the integer divisor `n` of `c` (see `magic_divisor`).
+    fn mod_top(&mut self, top: u8, n: u32, c: f64) {
+        let (slow, join) = (self.a.label(), self.a.label());
+        emit_mod_const(self.a, n, top, top, slow, join);
+        self.slow.push((slow, join, top, top, c));
     }
 
     /// Sets xmm0 to 0.0 and compares `x` with it, so that ZF is set when `x` is falsy: zero, or NaN.

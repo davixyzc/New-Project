@@ -1,0 +1,87 @@
+// A `const` whose value is a number literal reads as that number, and a `%` by such a constant takes the reciprocal
+// path in loops. The values checked are the ones that path must not get wrong: negative, fractional and out-of-range
+// dividends, zero, one and fractional divisors, and a right operand that a jump chooses.
+const W = 120, H = 120;
+const DIV = 7;
+const NEG = -3;
+const FRAC = 2.5;
+const ONE = 1;
+const ZERO = 0;
+const BIG = 2147483648;
+const SHADOW = 5;
+const NOT_LITERAL = W + 0;
+
+{
+  const SHADOW = 9;
+  console.log(SHADOW);
+}
+console.log(SHADOW, NOT_LITERAL, typeof W, typeof FRAC, BIG);
+
+try {
+  W = 5;
+} catch (e) {
+  console.log(e.message);
+}
+try {
+  H++;
+} catch (e) {
+  console.log(e.message);
+}
+console.log(W, H);
+
+// A function reads the constant through a captured variable, and a closure made before a declaration sees it too.
+function readW() {
+  return W;
+}
+const later = () => LATE;
+const LATE = 42;
+console.log(readW(), later());
+
+// A `let` is not a constant, and a constant built from another one is read at run time.
+let plain = 1;
+plain = 6;
+const PAIR = 2, DOUBLE = PAIR * 3;
+console.log(plain, PAIR, DOUBLE);
+
+// A shadowing constant in a function, and a block constant that a closure captures.
+function inner() {
+  const H = 2;
+  return 9 % H;
+}
+console.log(inner(), 9 % H);
+const fns = [];
+for (let i = 0; i < 3; i++) {
+  const K = 10;
+  fns.push(() => K + i);
+  console.log(K % 4);
+}
+console.log(fns[0](), fns[2]());
+
+let acc = 0;
+let nans = 0;
+for (let i = 0; i < 2000; i++) {
+  acc += (i * 3 + 1) % H;
+  acc += (i - 1000) % DIV;
+  acc += i % (i % 2 === 0 ? 2 : 3);
+  acc += i % NEG + i % ONE + i % FRAC;
+  const z = i % ZERO;
+  if (z !== z) nans++;
+}
+console.log(acc, nans);
+
+let lk = 0;
+for (let i = 0; i < 500; i++) lk += i % H + i + H + i * DIV - NEG;
+console.log(lk);
+
+const values = [2147483647, 2147483648, 4294967296, 9007199254740991, 1.5, -0, 0 / 0, 1 / 0, -7, -2147483648];
+for (let i = 0; i < values.length; i++) {
+  const v = values[i];
+  console.log(v % H, v % DIV, 1 / (v % H));
+}
+
+function rem(a) {
+  return a % H;
+}
+let fsum = 0;
+for (let i = 0; i < 1000; i++) fsum += rem(i * 7 - 300);
+console.log(fsum);
