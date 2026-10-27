@@ -1405,11 +1405,15 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
         body: None,
         nlocals: 0,
         sides: Vec::new(),
+        prop_cache: None,
     };
     e.a.bind(entry);
     e.a.push_reg(R13);
     e.a.push_reg(R15);
-    e.a.sub_rsp32(FRAME);
+    // r14 is saved with the others. The frame is 8 bytes shorter, so the locals keep their places and the stack stays
+    // aligned for the calls.
+    e.a.push_reg(R14);
+    e.a.sub_rsp32(FRAME - 8);
     for &i in &lp.guards {
         e.a.cmp8_imm(local_mem(i), TAG_NUM);
         e.a.jcc(CC_NE, not_entered);
@@ -1523,6 +1527,35 @@ impl Entries<Label> {
             filter: self.filter.map(|l| a.offset(l)),
             reduce: self.reduce.map(|l| a.offset(l)),
         }
+    }
+}
+
+/// Whether `op` may run between a `GetProp` and the `SetProp` that reuses its property address: it runs straight
+/// through, runs no script code and writes no property. The local that holds the object (`view_slot`) must not be
+/// written.
+fn window_op(op: Op, view_slot: Option<u32>) -> bool {
+    match op {
+        Op::Const(_)
+        | Op::GetLocal(_)
+        | Op::Dup
+        | Op::Swap
+        | Op::Pop
+        | Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Neg
+        | Op::Mod
+        | Op::AddLK(..)
+        | Op::SubLK(..)
+        | Op::MulLK(..)
+        | Op::ModLK(..) => true,
+        Op::SetLocal(i)
+        | Op::PopToLocal(i)
+        | Op::AddToLocal(i)
+        | Op::IncLocal(i)
+        | Op::DecLocal(i) => view_slot != Some(i),
+        _ => false,
     }
 }
 
@@ -1764,6 +1797,7 @@ pub(super) fn emit_function(
         }),
         nlocals,
         sides: Vec::new(),
+        prop_cache: None,
     };
     e.body_ops();
     let a = e.a;
@@ -1813,6 +1847,8 @@ struct Emitter<'a, 'b> {
     nlocals: i32,
     /// The side exits of the element operations: the stub, the instruction, and the operand depth before it.
     sides: Vec<(Label, usize, i32)>,
+    /// The last `GetProp` that kept its property's address in r14: its instruction, its name, and its object's view.
+    prop_cache: Option<(usize, u32, Mark)>,
 }
 
 impl Emitter<'_, '_> {
@@ -1864,7 +1900,8 @@ impl Emitter<'_, '_> {
             }
             self.spill(ip, d);
             self.writeback();
-            self.a.add_rsp32(FRAME);
+            self.a.add_rsp32(FRAME - 8);
+            self.a.pop_reg(R14);
             self.a.pop_reg(R15);
             self.a.pop_reg(R13);
             self.a.mov_imm32(RAX, ip as u32);
@@ -1879,7 +1916,8 @@ impl Emitter<'_, '_> {
             let stub = self.exits[k];
             self.a.bind(stub);
             self.writeback();
-            self.a.add_rsp32(FRAME);
+            self.a.add_rsp32(FRAME - 8);
+            self.a.pop_reg(R14);
             self.a.pop_reg(R15);
             self.a.pop_reg(R13);
             self.a.mov_imm32(RAX, t as u32);
@@ -1887,7 +1925,8 @@ impl Emitter<'_, '_> {
         }
         let not_entered = self.not_entered;
         self.a.bind(not_entered);
-        self.a.add_rsp32(FRAME);
+        self.a.add_rsp32(FRAME - 8);
+        self.a.pop_reg(R14);
         self.a.pop_reg(R15);
         self.a.pop_reg(R13);
         self.a.mov_imm64(RAX, NOT_ENTERED);
@@ -2306,20 +2345,38 @@ impl Emitter<'_, '_> {
                 self.count_down(obj);
             }
             Op::GetProp(n) => {
-                let obj = self.view_mem(self.mark(ip, d - 1));
+                let view = self.mark(ip, d - 1);
+                let obj = self.view_mem(view);
                 self.prop_read(ip, d, self.reg(d - 1), obj, n);
+                // The property's address is kept in r14 for a `SetProp` that follows (see `cache_holds`).
+                if self.r14_free() {
+                    self.prop_cache = Some((ip, n, view));
+                }
             }
             Op::SetProp(n) => {
-                // The object is a view, and the value is a number that replaces a number that the property holds.
-                let obj = self.view_mem(self.mark(ip, d - 2));
-                let exit = self.side_exit(ip, d);
-                let site = self.prop_site(n);
-                find_prop(&mut *self.a, obj, site, exit);
-                self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
-                self.a.jcc(CC_NE, exit);
-                self.a
-                    .movsd_store(Mem { base: RDX, disp: 8 }, self.reg(d - 1));
-                self.a.movapd_rr(self.reg(d - 2), self.reg(d - 1));
+                // The object is a view or the receiver, and the value is a number that replaces a number that the
+                // property holds.
+                let view = self.mark(ip, d - 2);
+                let cached = self.prop_cache.is_some_and(|(at, name, read)| {
+                    name == n && read == view && self.cache_holds(at, ip, view)
+                });
+                if cached {
+                    // The `GetProp` before it found the property, and nothing since could move the property or change
+                    // the object, so its address is still in r14. The property held a number then, and still does.
+                    self.a
+                        .movsd_store(Mem { base: R14, disp: 8 }, self.reg(d - 1));
+                    self.a.movapd_rr(self.reg(d - 2), self.reg(d - 1));
+                } else {
+                    let obj = self.view_mem(view);
+                    let exit = self.side_exit(ip, d);
+                    let site = self.prop_site(n);
+                    find_prop(&mut *self.a, obj, site, exit);
+                    self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
+                    self.a.jcc(CC_NE, exit);
+                    self.a
+                        .movsd_store(Mem { base: RDX, disp: 8 }, self.reg(d - 1));
+                    self.a.movapd_rr(self.reg(d - 2), self.reg(d - 1));
+                }
             }
             Op::Call(1) if self.lp.function.is_none() && self.mark(ip, d - 3) == Mark::Sqrt => {
                 // The object is released after its checks, as the other side exits leave the counts alone until then.
@@ -2884,9 +2941,39 @@ impl Emitter<'_, '_> {
         }
     }
 
-    /// Reads the number that property `n` of the object at `obj` holds into xmm `dst`. A property that is not a number,
-    /// or an object that the hint does not find, exits at `ip`, which the generic code runs, with `d` operands on the
-    /// stack.
+    /// Whether r14 may hold a property's address. A loop saves r14 on entry. A batch keeps its index in r14 while it
+    /// calls a plain function's body, which writes no property, so only a method or a closure body may write r14.
+    fn r14_free(&self) -> bool {
+        self.lp
+            .function
+            .as_ref()
+            .map_or(true, |f| f.receiver || f.upvals)
+    }
+
+    /// Whether the property that the `GetProp` at `at` read is still where that read found it, at `ip`, where
+    /// the `SetProp` that matches it runs. The instructions between them run straight through, run no script
+    /// code, write no property and leave the object's local alone, and none of them can be entered from elsewhere.
+    fn cache_holds(&self, at: usize, ip: usize, view: Mark) -> bool {
+        let view_slot = match view {
+            Mark::View(s) => Some(s),
+            _ => None,
+        };
+        (at + 1..=ip).all(|k| {
+            !self.is_jump_target(k)
+                && !self.lp.resumes.contains(&k)
+                && (k == ip || window_op(self.proto.code[k], view_slot))
+        })
+    }
+
+    /// Whether an instruction other than the one before `k` jumps to `k`.
+    fn is_jump_target(&self, k: usize) -> bool {
+        self.proto
+            .code
+            .iter()
+            .enumerate()
+            .any(|(j, &op)| j + 1 != k && successors(op, j, 0).iter().any(|&(t, _)| t == k))
+    }
+
     /// The memory of the object that a property operand reads in place: a local's slot, or a method's receiver.
     fn view_mem(&self, m: Mark) -> Mem {
         match m {
@@ -2896,10 +2983,16 @@ impl Emitter<'_, '_> {
         }
     }
 
+    /// Reads the number that property `n` of the object at `obj` holds into xmm `dst`. A property that is not a number,
+    /// or an object that the hint does not find, exits at `ip`, which the generic code runs, with `d` operands on the
+    /// stack.
     fn prop_read(&mut self, ip: usize, d: i32, dst: u8, obj: Mem, n: u32) {
         let exit = self.side_exit(ip, d);
         let site = self.prop_site(n);
         find_prop(&mut *self.a, obj, site, exit);
+        if self.r14_free() {
+            self.a.mov_rr(R14, RDX);
+        }
         self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
         self.a.jcc(CC_NE, exit);
         self.a.movsd_load(dst, Mem { base: RDX, disp: 8 });

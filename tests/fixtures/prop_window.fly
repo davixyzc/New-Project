@@ -1,0 +1,71 @@
+// Property updates in loops, in a method and in a closure. The read and the write of `o.k += v` must see the same
+// object and property. A getter, a call on the right-hand side that writes the property, a property that changes
+// type, a property that a later statement adds, and a site that sees several shapes must all behave as in JavaScript.
+const o = { x: 0, y: 1 };
+const p = { x: 10, y: 20 };
+let a = o;
+for (let i = 0; i < 1000; i++) {
+  a.x += i * 0.5;
+  a.y += a.x * 0.001;
+  a = i % 2 === 0 ? o : p;
+}
+console.log(o.x, o.y, p.x, p.y);
+
+const counter = { n: 0, add(k) { this.n += k; this.n += 1; } };
+for (let i = 0; i < 500; i++) counter.add(i % 3);
+console.log(counter.n);
+
+const acc = { total: 0 };
+const bump = (k) => { acc.total += k; };
+for (let i = 0; i < 300; i++) bump(i);
+console.log(acc.total);
+
+let reads = 0;
+class Cell {
+  constructor() { this._v = 1; }
+  get v() { reads++; return this._v; }
+  set v(w) { this._v = w; }
+}
+const g = new Cell();
+for (let i = 0; i < 50; i++) g.v += 1;
+console.log(g.v, reads);
+
+const o2 = { x: 5 };
+const setTo100 = () => { o2.x = 100; return 1; };
+for (let i = 0; i < 3; i++) o2.x += setTo100();
+console.log(o2.x);
+
+const s = { t: "a" };
+for (let i = 0; i < 4; i++) s.t += i;
+console.log(s.t);
+
+const m = { v: 1 };
+for (let i = 0; i < 6; i++) {
+  m.v += i;
+  if (i === 3) m.v = "z";
+}
+console.log(m.v);
+
+const sh = { a: 1 };
+for (let i = 0; i < 5; i++) {
+  sh.a += i;
+  if (i === 2) sh.b = 7;
+  sh.a += 1;
+}
+console.log(sh.a, sh.b);
+
+const objs = [{ x: 1 }, { x: 2 }];
+for (let i = 0; i < 6; i++) objs[i % 2].x += i;
+console.log(objs[0].x, objs[1].x);
+
+const mixed = [{ x: 1 }, { y: 0, x: 2 }, { x: 3, z: 9 }];
+for (let i = 0; i < 9; i++) mixed[i % 3].x += i;
+console.log(mixed[0].x, mixed[1].x, mixed[2].x);
+
+const grow = { n: 1 };
+for (let i = 0; i < 40; i++) {
+  grow.n += 1;
+  grow["k" + i] = i;
+  grow.n += 1;
+}
+console.log(grow.n, grow.k39);
