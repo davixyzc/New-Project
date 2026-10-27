@@ -43,10 +43,17 @@ const FN_MAX_DEPTH: i32 = 13;
 /// Arguments a function region takes, in xmm0 and up.
 pub(super) const MAX_ARGS: usize = 6;
 /// The bytes of a loop region's frame, below the saved `r13`: room to save the xmm registers a call
-/// clobbers, and a size that keeps rsp 16-byte aligned at those calls.
-const FRAME: i32 = 152;
+/// clobbers, the tag cells and the row caches, and a size that keeps rsp 16-byte aligned at those calls.
+const FRAME: i32 = 184;
 /// Where the tag of an element operand is kept, one byte per depth. `call_mod` saves its registers below this.
 const TAG_CELLS: i32 = 136;
+/// Where the row caches of a loop start, above the tag cells. Each array with a cache takes a key and a row, 8 bytes each
+/// (see `row_cached`).
+const ROW_CACHE_BASE: i32 = 144;
+/// The most arrays that a loop keeps a row cache for.
+const MAX_ROW_CACHES: usize = 2;
+/// The key of an empty row cache. A key is a 32-bit index (see `row_cached`), so no key takes it.
+const NO_KEY: u64 = 1 << 40;
 /// The largest magnitude an integer copy of a local may have. It stays exact, and fits an imm32.
 const INT_LIMIT: i32 = i32::MAX;
 /// The stack that a function region may use, below the stack its wrapper was called on.
@@ -118,6 +125,8 @@ pub(super) struct Region {
     /// The locals that hold arrays. A loop reads and writes their elements in place, so they have no register,
     /// and the loop checks on entry that they hold an array.
     arrays: Vec<u32>,
+    /// The arrays whose rows a loop reads by a whole key, which keep their last row in the frame (see `row_cached`).
+    row_caches: Vec<u32>,
     /// The locals that hold objects, which a loop reads in place (see `Mark::View`). They have no register.
     pub(super) objects: Vec<u32>,
     /// The object locals that a path reads from the entry before it writes them, which the loop checks on entry.
@@ -490,6 +499,24 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
             resumes.push(ip);
         }
     }
+    // An array whose rows the loop reads by a whole key keeps its last row in the frame (see `row_cached`). A loop that
+    // stores into the array, or rebinds its local, keeps none, which is stricter than needed: no store replaces a row.
+    // Two arrays at most take a cache.
+    let mut row_caches: Vec<u32> = Vec::new();
+    for ip in header..=last {
+        if let Op::GetIndex2Local(a) = code[ip] {
+            let replaced = (header..=last).any(|j| {
+                matches!(code[j], Op::SetIndexLocal(b) | Op::SetLocal(b) | Op::PopToLocal(b) if b == a)
+            });
+            if depth[ip] >= 0
+                && !replaced
+                && !row_caches.contains(&a)
+                && row_caches.len() < MAX_ROW_CACHES
+            {
+                row_caches.push(a);
+            }
+        }
+    }
     Some(Region {
         header,
         last,
@@ -501,6 +528,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         int_local,
         rem,
         arrays: (0..proto.nlocals).filter(|&i| arrays[i as usize]).collect(),
+        row_caches,
         objects: (0..proto.nlocals)
             .filter(|&i| objects[i as usize])
             .collect(),
@@ -572,6 +600,7 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
         int_local: None,
         rem: None,
         arrays: Vec::new(),
+        row_caches: Vec::new(),
         objects: Vec::new(),
         object_guards: Vec::new(),
         object_reads: Vec::new(),
@@ -1485,6 +1514,14 @@ fn js_spill(k: usize) -> Mem {
     }
 }
 
+/// The frame slot at `offset` (0 for the key, 8 for the row) of the row cache of the loop's array `j` (see `row_cached`).
+fn row_cache_mem(j: usize, offset: i32) -> Mem {
+    Mem {
+        base: RSP,
+        disp: ROW_CACHE_BASE + 16 * j as i32 + offset,
+    }
+}
+
 /// Emits a loop region. `entry` is the label the generic code calls, with rdx set to the instruction
 /// it reached the loop at. The region returns the index of the instruction it left at, or
 /// `NOT_ENTERED` when a guard failed.
@@ -1609,6 +1646,11 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
             e.a.mov_rr(R15, R13);
             e.a.sub64(R15, R8);
         }
+    }
+    // Each row cache starts empty, since the rows of its array may have changed since the last entry.
+    for j in 0..lp.row_caches.len() {
+        e.a.mov_imm64(RAX, NO_KEY);
+        e.a.mov_store(row_cache_mem(j, 0), RAX);
     }
     for &(bits, x) in &lp.consts {
         e.a.mov_imm64(RAX, bits);
@@ -2378,8 +2420,14 @@ impl Emitter<'_, '_> {
             Op::GetIndex2Local(a) => {
                 let exit = self.side_exit(ip, d);
                 let (row, key, tag) = (self.reg(d - 2), self.reg(d - 1), self.tag_cell(d - 2));
+                let whole = self.mark(ip, d - 2) == Mark::Int;
                 self.a.mov_load(R8, local_mem(a).at(8));
-                self.elem_row(row, self.mark(ip, d - 2) == Mark::Int, exit);
+                match self.row_slots(a) {
+                    Some((key_slot, row_slot)) if whole => {
+                        self.row_cached(row, key_slot, row_slot, exit)
+                    }
+                    _ => self.elem_row(row, whole, exit),
+                }
                 self.elem_read(key, row, tag, self.mark(ip, d - 1) == Mark::Int, exit);
             }
             Op::SetIndexLocal(a) => {
@@ -2974,6 +3022,32 @@ impl Emitter<'_, '_> {
             self.a.mov8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
             self.a.movsd_store(Mem { base: RDX, disp: 8 }, src);
         }
+    }
+
+    /// The key and row slots of the row cache of array `a`, when the loop keeps one (see `row_caches`).
+    fn row_slots(&self, a: u32) -> Option<(Mem, Mem)> {
+        let j = self.lp.row_caches.iter().position(|&b| b == a)?;
+        Some((row_cache_mem(j, 0), row_cache_mem(j, 8)))
+    }
+
+    /// Makes r8 the row at the whole key in xmm `key` of the array in r8, as `elem_row` does, and keeps the key and the row
+    /// in the slots of the array's cache. A key that the cache holds takes its row from there, without the bounds and tag
+    /// checks, which passed when the key was stored. The rows of the array do not change while the loop runs: an element
+    /// store exits before it overwrites a reference (see `elem_write`), and a loop keeps no cache for an array it rebinds
+    /// (see `plan`). An empty slot holds `NO_KEY`, which no key takes.
+    fn row_cached(&mut self, key: u8, key_slot: Mem, row_slot: Mem, exit: Label) {
+        let (miss, done) = (self.a.label(), self.a.label());
+        self.a.cvttsd2si(RCX, key);
+        self.a.mov_load(RAX, key_slot);
+        self.a.cmp_rr64(RCX, RAX);
+        self.a.jcc(CC_NE, miss);
+        self.a.mov_load(R8, row_slot);
+        self.a.jmp(done);
+        self.a.bind(miss);
+        self.elem_row(key, true, exit);
+        self.a.mov_store(key_slot, RCX);
+        self.a.mov_store(row_slot, R8);
+        self.a.bind(done);
     }
 
     /// Makes r8 the array that element `key` of the array in r8 holds. An element that is not an array jumps to `exit`.
@@ -3586,6 +3660,31 @@ mod tests {
         );
         let lp = plan_at(&p, 2).expect("the loop is planned");
         assert_eq!(lp.whole_guards, vec![0, 1]);
+    }
+
+    #[test]
+    fn an_array_whose_rows_the_loop_only_reads_keeps_a_row_cache() {
+        // `for (j = 0; j < 4; j++) s = a[j][j]`, with `a` in local 0, `j` in local 1 and `s` in local 2.
+        let p = proto(
+            vec![
+                Op::Const(0),
+                Op::PopToLocal(1),
+                Op::GetLocal(1),
+                Op::GetLocal(1),
+                Op::GetIndex2Local(0),
+                Op::PopToLocal(2),
+                Op::IncLocal(1),
+                Op::JumpIfLtLK(1, 1, 2),
+                Op::Return,
+            ],
+            vec![Value::Num(0.0), Value::Num(4.0)],
+            3,
+            0,
+        );
+        assert_eq!(
+            plan_at(&p, 2).expect("the loop is planned").row_caches,
+            vec![0]
+        );
     }
 
     #[test]
