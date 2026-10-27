@@ -858,6 +858,8 @@ impl Compiler {
             numeric_entry: Cell::new(0),
             numeric_argc: Cell::new(u32::MAX),
             numeric_bool: Cell::new(false),
+            method_entry: Cell::new(0),
+            method_argc: Cell::new(u32::MAX),
             names: fs.names,
             protos: fs.protos,
             upvals: fs.upvals.iter().map(|(_, d, _)| *d).collect(),

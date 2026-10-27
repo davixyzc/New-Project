@@ -71,6 +71,21 @@ pub(super) struct Function {
     pub(super) self_upval: Option<u32>,
     /// Whether the function returns a boolean, which native code returns as 0.0 or 1.0.
     pub(super) returns_bool: bool,
+    /// Whether the function reads `this`. Its entry then takes the receiver, and it returns `undefined` (see `method_admitted`).
+    pub(super) receiver: bool,
+}
+
+/// What the planner of a function region learns from the instructions it steps through (see `function_step`).
+#[derive(Default)]
+struct FnFacts {
+    /// The upvalue that the function calls itself through, if it does.
+    self_upval: Option<u32>,
+    /// Whether the function returns a boolean, once it returns a number or a boolean.
+    ret_bool: Option<bool>,
+    /// Whether the function returns `undefined`, which only a method does.
+    ret_undefined: bool,
+    /// Whether the function reads `this`.
+    receiver: bool,
 }
 
 /// A region: a loop, or a whole function.
@@ -148,6 +163,9 @@ enum Mark {
     /// The built-in `Math` global, which a loop reads through its name (see `Region::math`). It has no register and no
     /// slot, and nothing on the stack may need it at a side exit.
     Math,
+    /// The `this` of a method, which a function region reads in place from a copy in its frame (see `emit_function`).
+    /// Only a property read or write takes it, and it has no register or slot to write back.
+    Receiver,
 }
 
 /// Plans a loop region for the loop whose back jumps go to `header`. `None` if the loop has an
@@ -423,8 +441,7 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
     let mut states: Vec<Option<Vec<Mark>>> = vec![None; n];
     states[0] = Some(Vec::new());
     let mut work = vec![0usize];
-    let mut self_upval = None;
-    let mut ret_kind = None;
+    let mut facts = FnFacts::default();
     while let Some(ip) = work.pop() {
         let d = depth[ip];
         if d < 0 || d > FN_MAX_DEPTH {
@@ -432,16 +449,7 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
         }
         let op = code[ip];
         let before = states[ip].clone()?;
-        let after = function_step(
-            proto,
-            ip,
-            op,
-            &before,
-            types,
-            nparams,
-            &mut self_upval,
-            &mut ret_kind,
-        )?;
+        let after = function_step(proto, ip, op, &before, types, nparams, &mut facts)?;
         for (next, _) in successors(op, ip, d) {
             if next >= n || depth[next] < 0 {
                 return None;
@@ -455,6 +463,9 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
                 Some(_) => {}
             }
         }
+    }
+    if !method_admitted(proto, depth, &facts) {
+        return None;
     }
     let locals = (0..proto.nlocals)
         .map(|i| (i, Home::Mem(frame_local(i))))
@@ -474,14 +485,52 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
         object_guards: Vec::new(),
         object_reads: Vec::new(),
         math: None,
-        marks: Vec::new(),
+        // The operands before each instruction, which the emitter reads for the kinds of the operands it takes.
+        marks: states.into_iter().map(Option::unwrap_or_default).collect(),
         resumes: Vec::new(),
         function: Some(Function {
             nparams,
-            self_upval,
-            returns_bool: ret_kind.unwrap_or(false),
+            self_upval: facts.self_upval,
+            returns_bool: facts.ret_bool.unwrap_or(false),
+            receiver: facts.receiver,
         }),
     })
+}
+
+/// Whether a function whose instructions `facts` describes can run as a function region, given that the function
+/// reads `this`. A function that does not read `this` returns numbers or booleans, as a numeric entry does. A method
+/// instead returns `undefined`, and never a number. It must go forward only, so that each instruction runs at most
+/// once. And its one write comes after every read, since a read that fails declines the call, which must not come
+/// after a write (see `Mark::Receiver`).
+fn method_admitted(proto: &Proto, depth: &[i32], facts: &FnFacts) -> bool {
+    if !facts.receiver {
+        return !facts.ret_undefined;
+    }
+    if !facts.ret_undefined || facts.ret_bool.is_some() {
+        return false;
+    }
+    let (mut writes, mut reads) = (Vec::new(), Vec::new());
+    for (ip, &op) in proto.code.iter().enumerate() {
+        if depth[ip] < 0 {
+            continue;
+        }
+        if successors(op, ip, depth[ip])
+            .iter()
+            .any(|&(next, _)| next <= ip)
+        {
+            return false;
+        }
+        match op {
+            Op::SetProp(_) => writes.push(ip),
+            Op::GetProp(_) => reads.push(ip),
+            _ => {}
+        }
+    }
+    match writes.as_slice() {
+        [] => true,
+        [write] => reads.iter().all(|&read| read < *write),
+        _ => false,
+    }
 }
 
 /// The operands after `op` runs on the operands `before`, or `None` when `op` is not number work.
@@ -492,9 +541,14 @@ fn function_step(
     before: &[Mark],
     types: &Numbers,
     nparams: u32,
-    self_upval: &mut Option<u32>,
-    ret_kind: &mut Option<bool>,
+    facts: &mut FnFacts,
 ) -> Option<Vec<Mark>> {
+    let FnFacts {
+        self_upval,
+        ret_bool: ret_kind,
+        ret_undefined,
+        receiver,
+    } = facts;
     let mut s = before.to_vec();
     let top_numbers =
         |k: usize| before.len() >= k && before[before.len() - k..].iter().all(|&m| m == Mark::Num);
@@ -578,6 +632,22 @@ fn function_step(
             s.truncate(len - argc - 2);
             s.push(Mark::Num);
         }
+        // The `this` of a method, which the body reads and writes properties of (see `Mark::Receiver`).
+        Op::This if !proto.is_arrow => {
+            *receiver = true;
+            s.push(Mark::Receiver);
+        }
+        Op::Dup if before.last() == Some(&Mark::Receiver) => s.push(Mark::Receiver),
+        Op::GetProp(_) if before.last() == Some(&Mark::Receiver) => *s.last_mut()? = Mark::Num,
+        Op::SetProp(_)
+            if before.len() >= 2
+                && before[before.len() - 2] == Mark::Receiver
+                && before.last() == Some(&Mark::Num) =>
+        {
+            s.truncate(s.len() - 2);
+            s.push(Mark::Num);
+        }
+        Op::Return if before.last() == Some(&Mark::This) => *ret_undefined = true,
         _ => return None,
     }
     Some(s)
@@ -1223,6 +1293,14 @@ fn frame_local(i: u32) -> Mem {
     }
 }
 
+/// The copy of a method's receiver in its native frame, below the locals: the tag of the value, and then its payload.
+fn receiver_mem(nlocals: i32) -> Mem {
+    Mem {
+        base: RBP,
+        disp: -8 * (nlocals + 3),
+    }
+}
+
 /// The stack slot that a call of `js_mod` saves register `k` in.
 fn js_spill(k: usize) -> Mem {
     Mem {
@@ -1533,7 +1611,10 @@ pub(super) fn emit_function(
         );
     }
     a.call_label(body);
-    a.mov_imm32(RAX, 0);
+    // A method's body gives its status in rax, since it can decline. Any other function returns 0 there.
+    if !function.receiver {
+        a.mov_imm32(RAX, 0);
+    }
     leave_frame(a);
     // A body that finds the stack too low returns through the entry that called it, with its frame
     // still in place, so the entry returns 1.
@@ -1554,6 +1635,15 @@ pub(super) fn emit_function(
     a.push_reg(RBP);
     a.mov_rr(RBP, RSP);
     a.sub_rsp32(frame);
+    if function.receiver {
+        // The receiver comes in rsi. Its value is copied into the frame, which takes no reference of its own: the caller
+        // keeps the receiver alive for the call.
+        let receiver = receiver_mem(nlocals);
+        a.mov_load(RAX, Mem { base: RSI, disp: 0 });
+        a.mov_store(receiver, RAX);
+        a.mov_load(RAX, Mem { base: RSI, disp: 8 });
+        a.mov_store(receiver.at(8), RAX);
+    }
     for i in 0..function.nparams {
         a.movsd_store(frame_local(i), i as u8);
     }
@@ -1575,18 +1665,20 @@ pub(super) fn emit_function(
     e.body_ops();
     let a = e.a;
     let (nparams, returns_bool) = (function.nparams, function.returns_bool);
-    let map = if nparams <= 2 {
+    // The batch entries call the body without a receiver, so a method has none.
+    let batches = !function.receiver;
+    let map = if batches && nparams <= 2 {
         Some(emit_batch(a, body, Mode::Map, nparams, returns_bool))
     } else {
         None
     };
-    let filter = if nparams <= 2 {
+    let filter = if batches && nparams <= 2 {
         Some(emit_batch(a, body, Mode::Filter, nparams, returns_bool))
     } else {
         None
     };
     // A reduce that returns booleans would hand a boolean to the next call, so it runs in the interpreter.
-    let reduce = if nparams <= 3 && !returns_bool {
+    let reduce = if batches && nparams <= 3 && !returns_bool {
         Some(emit_batch(a, body, Mode::Reduce, nparams, false))
     } else {
         None
@@ -1658,6 +1750,15 @@ impl Emitter<'_, '_> {
         }
         for (stub, ip, d) in std::mem::take(&mut self.sides) {
             self.a.bind(stub);
+            if self.body.is_some() {
+                // A function declines before it writes anything, so the call runs in the interpreter, and the frame is
+                // all there is to leave. The wrapper passes the status on.
+                self.a.mov_imm32(RAX, 1);
+                self.a.mov_rr(RSP, RBP);
+                self.a.pop_reg(RBP);
+                self.a.ret();
+                continue;
+            }
             self.spill(ip, d);
             self.writeback();
             self.a.add_rsp32(FRAME);
@@ -1705,7 +1806,7 @@ impl Emitter<'_, '_> {
                 self.check_last(m, exit);
                 self.count_down(m);
             }
-            Op::Pop | Op::Undef | Op::GetUpval(_) => {}
+            Op::Pop | Op::Undef | Op::This | Op::GetUpval(_) => {}
             Op::Dup if self.lp.function.is_none() && self.mark(ip, d - 1) == Mark::Owned => {
                 let (from, to) = (self.operand_mem(d - 1), self.operand_mem(d));
                 self.copy_value(from, to);
@@ -1714,6 +1815,7 @@ impl Emitter<'_, '_> {
             Op::Dup
                 if self.lp.function.is_none()
                     && matches!(self.mark(ip, d - 1), Mark::View(_) | Mark::Math) => {}
+            Op::Dup if self.mark(ip, d - 1) == Mark::Receiver => {}
             Op::Dup => {
                 self.a.movapd_rr(self.reg(d), x);
                 let (from, to) = (self.tag_cell(d - 1), self.tag_cell(d));
@@ -1888,7 +1990,12 @@ impl Emitter<'_, '_> {
                 self.jump_if(t, CC_BE);
             }
             Op::Return => {
-                self.a.movapd_rr(0, x);
+                if self.lp.function.as_ref().is_some_and(|f| f.receiver) {
+                    // A method returns `undefined`, with status 0 in rax, which the wrapper passes on.
+                    self.a.mov_imm32(RAX, 0);
+                } else {
+                    self.a.movapd_rr(0, x);
+                }
                 self.a.mov_rr(RSP, RBP);
                 self.a.pop_reg(RBP);
                 self.a.ret();
@@ -1994,19 +2101,15 @@ impl Emitter<'_, '_> {
                 self.count_down(obj);
             }
             Op::GetProp(n) => {
-                let Mark::View(s) = self.mark(ip, d - 1) else {
-                    unreachable!("the planner admits a property read only of a view (see `step`)")
-                };
-                self.prop_read(ip, d, self.reg(d - 1), local_mem(s), n);
+                let obj = self.view_mem(self.mark(ip, d - 1));
+                self.prop_read(ip, d, self.reg(d - 1), obj, n);
             }
             Op::SetProp(n) => {
                 // The object is a view, and the value is a number that replaces a number that the property holds.
-                let Mark::View(s) = self.mark(ip, d - 2) else {
-                    unreachable!("the planner admits a property write only to a view (see `step`)")
-                };
+                let obj = self.view_mem(self.mark(ip, d - 2));
                 let exit = self.side_exit(ip, d);
                 let site = self.prop_site(n);
-                find_prop(&mut *self.a, local_mem(s), site, exit);
+                find_prop(&mut *self.a, obj, site, exit);
                 self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
                 self.a.jcc(CC_NE, exit);
                 self.a
@@ -2464,6 +2567,15 @@ impl Emitter<'_, '_> {
     /// Reads the number that property `n` of the object at `obj` holds into xmm `dst`. A property that is not a number,
     /// or an object that the hint does not find, exits at `ip`, which the generic code runs, with `d` operands on the
     /// stack.
+    /// The memory of the object that a property operand reads in place: a local's slot, or a method's receiver.
+    fn view_mem(&self, m: Mark) -> Mem {
+        match m {
+            Mark::View(s) => local_mem(s),
+            Mark::Receiver => receiver_mem(self.nlocals),
+            _ => unreachable!("a property is read only of a view or of the receiver (see `step` and `function_step`)"),
+        }
+    }
+
     fn prop_read(&mut self, ip: usize, d: i32, dst: u8, obj: Mem, n: u32) {
         let exit = self.side_exit(ip, d);
         let site = self.prop_site(n);
@@ -2685,6 +2797,8 @@ mod tests {
             numeric_entry: Default::default(),
             numeric_argc: std::cell::Cell::new(u32::MAX),
             numeric_bool: Default::default(),
+            method_entry: Default::default(),
+            method_argc: std::cell::Cell::new(u32::MAX),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams,

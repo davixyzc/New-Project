@@ -1299,6 +1299,63 @@ impl<'a> Gen<'a> {
         self.a.jmp(done);
     }
 
+    /// A call of a method, which runs through the method's entry (see `Native::direct_method`). The receiver is an object,
+    /// and each argument a number. The entry gets the arguments as doubles on the native stack, and the receiver's
+    /// address. A call that the entry declines, before it changed anything, goes to `generic`. Otherwise the method
+    /// returned `undefined`, and the receiver and the callee are released, as `numeric_call` releases them. RDX holds the
+    /// prototype of the callee (see `load_proto`), which the checks leave alone.
+    fn method_call(&mut self, d: i32, argc: u32, not_method: Label, generic: Label, done: Label) {
+        let argc = argc as i32;
+        let callee = self.temp(d - argc - 2);
+        let this = self.temp(d - argc - 1);
+        let proto_field = |field: usize| Mem {
+            base: RDX,
+            disp: field as i32,
+        };
+        // The entry takes exactly the arguments of the call, and the receiver must be an object.
+        self.a
+            .mov32_load(R9, proto_field(std::mem::offset_of!(Proto, method_argc)));
+        self.a.cmp64_imm32(R9, argc);
+        self.a.jcc(CC_NE, not_method);
+        self.check_tag(this, TAG_OBJ, not_method);
+        for j in 0..argc {
+            let arg = self.temp(d - argc + j);
+            self.check_tag(arg, TAG_NUM, not_method);
+        }
+        // Releasing the callee and the receiver after the call frees nothing only if each has a reference to spare (see
+        // `numeric_call`).
+        self.check_release(callee, not_method);
+        self.check_release(this, not_method);
+        let room = 16 * ((argc + 1) / 2);
+        self.a.sub_rsp32(room);
+        for j in 0..argc {
+            let arg = self.temp(d - argc + j);
+            self.a.movsd_load(0, arg.at(8));
+            self.a.movsd_store(
+                Mem {
+                    base: RSP,
+                    disp: 8 * j,
+                },
+                0,
+            );
+        }
+        self.a.mov_rr(RDI, RSP);
+        self.a.lea(RSI, this);
+        self.a
+            .mov_load(RAX, proto_field(std::mem::offset_of!(Proto, method_entry)));
+        self.a.call_reg(RAX);
+        self.a.add_rsp32(room);
+        // The status is 1 when the method declined. Then nothing has changed, and the helper makes the call.
+        self.a.test64(RAX, RAX);
+        self.a.jcc(CC_NE, generic);
+        // The method returned `undefined`, which replaces the callee.
+        self.release_owned(this);
+        self.a.mov8_imm(this, TAG_UNDEF);
+        self.release_owned(callee);
+        self.a.mov8_imm(callee, TAG_UNDEF);
+        self.a.jmp(done);
+    }
+
     /// A plain call. `rt::call_plain` pushes the callee's frame when it can, and then native code
     /// runs the callee's code itself. Otherwise the call has already run when the helper returns.
     fn plain_call(&mut self, ip: usize, d: i32, argc: u32) {
@@ -1367,7 +1424,9 @@ impl<'a> Gen<'a> {
             let callee = self.temp(d - argc as i32 - 2);
             self.check_tag(callee, TAG_FUNC, generic);
             self.load_proto(callee);
-            let not_numeric = self.a.label();
+            let (not_method, not_numeric) = (self.a.label(), self.a.label());
+            self.method_call(d, argc, not_method, generic, done);
+            self.a.bind(not_method);
             self.numeric_call(d, argc, not_numeric, generic, done);
             self.a.bind(not_numeric);
             self.closure_call(ip, d, argc, generic, ran);
@@ -2952,6 +3011,8 @@ mod tests {
             numeric_entry: Default::default(),
             numeric_argc: std::cell::Cell::new(u32::MAX),
             numeric_bool: Default::default(),
+            method_entry: Default::default(),
+            method_argc: std::cell::Cell::new(u32::MAX),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,
@@ -2991,6 +3052,8 @@ mod tests {
             numeric_entry: Default::default(),
             numeric_argc: std::cell::Cell::new(u32::MAX),
             numeric_bool: Default::default(),
+            method_entry: Default::default(),
+            method_argc: std::cell::Cell::new(u32::MAX),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,

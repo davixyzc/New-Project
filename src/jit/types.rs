@@ -196,6 +196,8 @@ mod tests {
             numeric_entry: Default::default(),
             numeric_argc: std::cell::Cell::new(u32::MAX),
             numeric_bool: Default::default(),
+            method_entry: Default::default(),
+            method_argc: std::cell::Cell::new(u32::MAX),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,

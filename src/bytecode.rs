@@ -209,6 +209,12 @@ pub struct Proto {
     pub numeric_argc: Cell<u32>,
     /// Whether `numeric_entry` returns a boolean, so that native code gives its result as one.
     pub numeric_bool: Cell<bool>,
+    /// The entry of a method, which reads its receiver. Native code calls it with the receiver's address (see
+    /// `Native::direct_method`). Zero until the function is compiled, and zero for a function that is not a method.
+    pub method_entry: Cell<usize>,
+    /// The number of arguments that `method_entry` takes. It is `u32::MAX` when there is no such entry, so no call has
+    /// that many arguments.
+    pub method_argc: Cell<u32>,
     pub protos: Vec<Rc<Proto>>,
     pub upvals: Vec<UpvalDesc>,
     pub nparams: u32,
@@ -242,6 +248,11 @@ impl Proto {
                         self.numeric_argc
                             .set(if self.has_rest { u32::MAX } else { nparams });
                         self.numeric_bool.set(returns_bool);
+                    }
+                    if let Some((entry, nparams)) = code.direct_method() {
+                        self.method_entry.set(entry);
+                        self.method_argc
+                            .set(if self.has_rest { u32::MAX } else { nparams });
                     }
                 }
                 compiled

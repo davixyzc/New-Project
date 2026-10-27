@@ -130,6 +130,18 @@ pub struct Native {
     frame_len: usize,
     /// The function's entry for numbers, when it has one.
     spec: Option<Spec>,
+    /// The function's entry for a method, when it reads its receiver.
+    method: Option<Method>,
+}
+
+/// The wrapper of a method, which takes the parameters as doubles and the receiver. It returns 0 when the method ran, and 1
+/// when it declined before it changed anything (see `region::method_admitted`).
+type MethodWrapper = unsafe extern "C" fn(*const f64, *const Value) -> u64;
+
+/// The entry of a method: its wrapper, and how many parameters the wrapper takes.
+struct Method {
+    wrapper: MethodWrapper,
+    nparams: u32,
 }
 
 /// The entry of a function region: a wrapper that takes the parameters as doubles.
@@ -186,6 +198,13 @@ impl Native {
             spec.nparams,
             spec.returns_bool,
         ))
+    }
+
+    /// The entry of a method as native code calls it: its wrapper's address, and its number of parameters. `None` when the
+    /// function has no such entry.
+    pub(crate) fn direct_method(&self) -> Option<(usize, u32)> {
+        let method = self.method.as_ref()?;
+        Some((method.wrapper as usize, method.nparams))
     }
 
     /// The address of the function's code. Native code calls it with `rdx` set to 0, which starts
@@ -349,30 +368,41 @@ pub fn compile(proto: &Proto) -> Option<Box<Native>> {
     }
     let compiled = codegen::compile(proto)?;
     let mem = ExecMem::new(&compiled.code)?;
-    let spec = compiled.function.map(|(entries, function)| {
-        // SAFETY: each offset is an entry in `mem`, which is not moved by `Native` and lives as long as the
-        // spec does. Each entry is called with the signature of its type.
-        let at = |offset: usize| unsafe { mem.ptr().add(offset) };
-        Spec {
-            wrapper: unsafe { std::mem::transmute::<*const u8, Wrapper>(at(entries.wrapper)) },
-            map: entries
-                .map
-                .map(|o| unsafe { std::mem::transmute::<*const u8, BatchFn>(at(o)) }),
-            filter: entries
-                .filter
-                .map(|o| unsafe { std::mem::transmute::<*const u8, BatchFn>(at(o)) }),
-            reduce: entries
-                .reduce
-                .map(|o| unsafe { std::mem::transmute::<*const u8, BatchFn>(at(o)) }),
-            nparams: function.nparams,
-            self_upval: function.self_upval,
-            returns_bool: function.returns_bool,
+    // SAFETY (for the transmutes below): each offset is an entry in `mem`, which is not moved by `Native` and lives as
+    // long as the entries do. Each entry is called with the signature of its type.
+    let at = |offset: usize| unsafe { mem.ptr().add(offset) };
+    let (mut spec, mut method) = (None, None);
+    if let Some((entries, function)) = compiled.function {
+        if function.receiver {
+            method = Some(Method {
+                wrapper: unsafe {
+                    std::mem::transmute::<*const u8, MethodWrapper>(at(entries.wrapper))
+                },
+                nparams: function.nparams,
+            });
+        } else {
+            spec = Some(Spec {
+                wrapper: unsafe { std::mem::transmute::<*const u8, Wrapper>(at(entries.wrapper)) },
+                map: entries
+                    .map
+                    .map(|o| unsafe { std::mem::transmute::<*const u8, BatchFn>(at(o)) }),
+                filter: entries
+                    .filter
+                    .map(|o| unsafe { std::mem::transmute::<*const u8, BatchFn>(at(o)) }),
+                reduce: entries
+                    .reduce
+                    .map(|o| unsafe { std::mem::transmute::<*const u8, BatchFn>(at(o)) }),
+                nparams: function.nparams,
+                self_upval: function.self_upval,
+                returns_bool: function.returns_bool,
+            });
         }
-    });
+    }
     Some(Box::new(Native {
         mem,
         offsets: compiled.offsets,
         frame_len: compiled.frame_len,
         spec,
+        method,
     }))
 }

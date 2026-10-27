@@ -1,0 +1,62 @@
+// Methods that read and write their receiver. A method that finds something unusual, such as a property that is not a
+// number, a missing property or an argument that is not a number, falls back to the interpreter. So does a method that
+// writes twice, returns a number, or calls another method.
+const counter = { n: 0, add(k) { this.n += k; } };
+for (let i = 0; i < 1000; i++) counter.add(i % 3);
+console.log(counter.n);
+
+const text = { n: "a", add(k) { this.n += k; } };
+for (let i = 0; i < 3; i++) text.add(i);
+console.log(text.n);
+
+const hole = { add(k) { this.n += k; } };
+for (let i = 0; i < 2; i++) hole.add(i);
+console.log(hole.n);
+
+// The method is replaced in the middle of the loop, and each call runs the method that the object holds then.
+const other = { n: 0, add(k) { this.n += 10 * k; } };
+const swap = { n: 0, add(k) { this.n += k; } };
+for (let i = 0; i < 6; i++) {
+  if (i === 3) swap.add = other.add;
+  swap.add(1);
+}
+console.log(swap.n);
+
+const two = { n: 0, m: 0, both(k) { this.n += k; this.m = this.n * 2; } };
+for (let i = 0; i < 4; i++) two.both(i);
+console.log(two.n, two.m);
+
+const ret = { n: 5, get(k) { return this.n + k; } };
+let total = 0;
+for (let i = 0; i < 4; i++) total += ret.get(i);
+console.log(total);
+
+const strs = { n: 0, add(k) { this.n += k; } };
+for (let i = 0; i < 2; i++) strs.add("x");
+console.log(strs.n);
+
+// The receiver is a temporary, so nothing else keeps it alive during the call.
+function make(v) {
+  return { n: v, add(k) { this.n += k; } };
+}
+let made = 0;
+for (let i = 0; i < 5; i++) made += make(i).n;
+console.log(made);
+
+const grow = { add(k) { this.v = k; } };
+for (let i = 0; i < 3; i++) grow.add(i);
+console.log(grow.v);
+
+const chain = { n: 0, inc(k) { this.n += k; }, twice(k) { this.inc(k); this.inc(k); } };
+for (let i = 0; i < 3; i++) chain.twice(i);
+console.log(chain.n);
+
+// A method that reads its receiver before it writes: the reads all come before the write.
+const p = { x: 0, vx: 1, step(dt) { this.x += this.vx * dt; } };
+for (let i = 0; i < 10; i++) p.step(0.5);
+console.log(p.x);
+
+// A property that holds a string is replaced by the number that the method writes.
+const slot = { v: "s", set(k) { this.v = k; } };
+for (let i = 0; i < 3; i++) slot.set(i);
+console.log(slot.v);
