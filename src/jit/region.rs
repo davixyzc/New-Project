@@ -408,6 +408,15 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         math_sqrt: math.map(|m| m.1),
     };
     let marks = operand_marks(proto, depth, header, last, &entries, &kinds)?;
+    // A store of an element leaves the loop at the store when the element is a boolean, so the store is a resume point.
+    for ip in header..=last {
+        if matches!(code[ip], Op::SetLocal(i) | Op::PopToLocal(i) if !objects[i as usize])
+            && marks[ip - header].last() == Some(&Mark::Elem)
+            && !resumes.contains(&ip)
+        {
+            resumes.push(ip);
+        }
+    }
     Some(Region {
         header,
         last,
@@ -965,7 +974,8 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
     ) || push_base(proto, op).is_some()
         || object_base(proto, op).is_some()
         || matches!(op, Op::GetProp(_) | Op::SetProp(_) | Op::GetGlobal(_))
-        || matches!(op, Op::PopToLocal(i) if objects[i as usize]);
+        || matches!(op, Op::PopToLocal(i) if objects[i as usize])
+        || (matches!(op, Op::SetLocal(_) | Op::PopToLocal(_)) && state.last() == Some(&Mark::Elem));
     // The read of `sqrt` from `Math` needs no side exit, since the entry checks that it is the built-in
     // (see `Region::math`).
     let math_read =
@@ -1112,6 +1122,9 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
         }
         Op::SetLocal(i) | Op::PopToLocal(i) => match pop_kinds(state, 1) {
             Some(v) if plain(i) && number(&v[0]) => {}
+            // An element is a number unless it is a boolean, and a store of one leaves the loop when it is a boolean (see
+            // `Emitter::op`), so the local only ever takes a number.
+            Some(v) if plain(i) && v[0] == Mark::Elem => {}
             _ => return false,
         },
         Op::AddToLocal(i) => match pop_kinds(state, 1) {
@@ -1914,6 +1927,16 @@ impl Emitter<'_, '_> {
                 }
                 self.count_down(dst);
                 self.copy_value(src, dst);
+            }
+            Op::SetLocal(i) | Op::PopToLocal(i)
+                if self.mark(ip, d - 1) == Mark::Elem && !self.lp.objects.contains(&i) =>
+            {
+                // A boolean element is not a number, so the store leaves the loop at the store, where the generic code
+                // keeps the tag. A number goes to the local.
+                let exit = self.side_exit(ip, d);
+                self.a.cmp8_imm(self.tag_cell(d - 1), TAG_NUM);
+                self.a.jcc(CC_NE, exit);
+                self.write_local(i, x);
             }
             Op::SetLocal(i) | Op::PopToLocal(i) => self.write_local(i, x),
             Op::AddToLocal(i) => self.update_local(i, SSE_ADD, x),

@@ -1,0 +1,30 @@
+// A loop that copies elements into locals and pushes them back out. A boolean element must stay a boolean when it is
+// pushed, while numbers stay numbers, so a store of a boolean element leaves the loop and the interpreter keeps its tag.
+const flags = [true, 0, false, 1.5, true, 2];
+const copies = [];
+for (let i = 0; i < flags.length; i++) {
+  const f = flags[i];
+  copies.push(f);
+}
+console.log(JSON.stringify(copies));
+
+const nums = [1, 2, 3, 4];
+const twice = [];
+let total = 0;
+for (let i = 0; i < nums.length; i++) {
+  const v = nums[i];
+  twice.push(v * 2);
+  total += v;
+}
+console.log(JSON.stringify(twice), total);
+
+// The same local takes booleans and numbers in turn, and counts the truthy ones.
+const mixed = [false, 3, true, 0, true];
+let truthy = 0;
+const seen = [];
+for (let i = 0; i < mixed.length; i++) {
+  const m = mixed[i];
+  if (m) truthy++;
+  seen.push(m);
+}
+console.log(truthy, JSON.stringify(seen));
