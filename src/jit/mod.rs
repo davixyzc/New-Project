@@ -132,6 +132,8 @@ pub struct Native {
     spec: Option<Spec>,
     /// The function's entry for a method, when it reads its receiver.
     method: Option<Method>,
+    /// The function's entry for a closure that reads a captured number (see `ClosureEntry`).
+    closure: Option<ClosureEntry>,
 }
 
 /// The wrapper of a method, which takes the parameters as doubles and the receiver. It returns 0 when the method ran, and 1
@@ -142,6 +144,17 @@ type MethodWrapper = unsafe extern "C" fn(*const f64, *const Value) -> u64;
 struct Method {
     wrapper: MethodWrapper,
     nparams: u32,
+}
+
+/// The wrapper of a closure that reads a captured number, which takes the parameters as doubles and the address of the
+/// callee's value, and returns its result (see `Ret`).
+type ClosureWrapper = unsafe extern "C" fn(*const f64, *const Value) -> Ret;
+
+/// The entry of a closure: its wrapper, how many parameters the wrapper takes, and whether it returns a boolean.
+struct ClosureEntry {
+    wrapper: ClosureWrapper,
+    nparams: u32,
+    returns_bool: bool,
 }
 
 /// The entry of a function region: a wrapper that takes the parameters as doubles.
@@ -197,6 +210,17 @@ impl Native {
             spec.wrapper as usize,
             spec.nparams,
             spec.returns_bool,
+        ))
+    }
+
+    /// The entry of a closure as native code calls it: its wrapper's address, its number of parameters, and whether it
+    /// returns a boolean. `None` when the function has no such entry.
+    pub(crate) fn direct_closure(&self) -> Option<(usize, u32, bool)> {
+        let closure = self.closure.as_ref()?;
+        Some((
+            closure.wrapper as usize,
+            closure.nparams,
+            closure.returns_bool,
         ))
     }
 
@@ -371,7 +395,7 @@ pub fn compile(proto: &Proto) -> Option<Box<Native>> {
     // SAFETY (for the transmutes below): each offset is an entry in `mem`, which is not moved by `Native` and lives as
     // long as the entries do. Each entry is called with the signature of its type.
     let at = |offset: usize| unsafe { mem.ptr().add(offset) };
-    let (mut spec, mut method) = (None, None);
+    let (mut spec, mut method, mut closure) = (None, None, None);
     if let Some((entries, function)) = compiled.function {
         if function.receiver {
             method = Some(Method {
@@ -379,6 +403,14 @@ pub fn compile(proto: &Proto) -> Option<Box<Native>> {
                     std::mem::transmute::<*const u8, MethodWrapper>(at(entries.wrapper))
                 },
                 nparams: function.nparams,
+            });
+        } else if function.upvals {
+            closure = Some(ClosureEntry {
+                wrapper: unsafe {
+                    std::mem::transmute::<*const u8, ClosureWrapper>(at(entries.wrapper))
+                },
+                nparams: function.nparams,
+                returns_bool: function.returns_bool,
             });
         } else {
             spec = Some(Spec {
@@ -404,5 +436,6 @@ pub fn compile(proto: &Proto) -> Option<Box<Native>> {
         frame_len: compiled.frame_len,
         spec,
         method,
+        closure,
     }))
 }

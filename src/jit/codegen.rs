@@ -32,7 +32,7 @@ pub(super) const TAG_BOOL: u8 = 2;
 pub(super) const TAG_NUM: u8 = 3;
 const TAG_STR: u8 = 4;
 pub(super) const TAG_ARR: u8 = 5;
-const TAG_CELL: u8 = 9;
+pub(super) const TAG_CELL: u8 = 9;
 pub(super) const TAG_OBJ: u8 = 6;
 pub(super) const TAG_FUNC: u8 = 7;
 pub(super) const TAG_NATIVE: u8 = 8;
@@ -1299,6 +1299,83 @@ impl<'a> Gen<'a> {
         self.a.jmp(done);
     }
 
+    /// A call of a closure that reads a captured number, through the closure's entry (see `Native::direct_closure`). The
+    /// entry gets the arguments as doubles on the native stack, and the callee's address, which it reads the captured
+    /// numbers through. The arguments must be numbers. A call that the entry declines, before it changed anything, goes to
+    /// `generic`. Otherwise the result replaces the callee, and `this` is released, as `numeric_call` releases it. RDX holds
+    /// the prototype of the callee (see `load_proto`), which the checks leave alone.
+    fn closure_numbers_call(
+        &mut self,
+        d: i32,
+        argc: u32,
+        not_closure: Label,
+        generic: Label,
+        done: Label,
+    ) {
+        let argc = argc as i32;
+        let callee = self.temp(d - argc - 2);
+        let this = self.temp(d - argc - 1);
+        let boolean = self.a.label();
+        let proto_field = |field: usize| Mem {
+            base: RDX,
+            disp: field as i32,
+        };
+        // The entry takes exactly the arguments of the call, each of them a number.
+        self.a
+            .mov32_load(R9, proto_field(std::mem::offset_of!(Proto, closure_argc)));
+        self.a.cmp64_imm32(R9, argc);
+        self.a.jcc(CC_NE, not_closure);
+        for j in 0..argc {
+            let arg = self.temp(d - argc + j);
+            self.check_tag(arg, TAG_NUM, not_closure);
+        }
+        // Releasing the callee and `this` after the call frees nothing only if each has a reference to spare (see
+        // `numeric_call`).
+        self.check_release(callee, not_closure);
+        self.check_release(this, not_closure);
+        let room = 16 * ((argc + 1) / 2);
+        self.a.sub_rsp32(room);
+        for j in 0..argc {
+            let arg = self.temp(d - argc + j);
+            self.a.movsd_load(0, arg.at(8));
+            self.a.movsd_store(
+                Mem {
+                    base: RSP,
+                    disp: 8 * j,
+                },
+                0,
+            );
+        }
+        self.a.mov_rr(RDI, RSP);
+        self.a.lea(RSI, callee);
+        self.a
+            .mov_load(RAX, proto_field(std::mem::offset_of!(Proto, closure_entry)));
+        self.a.call_reg(RAX);
+        self.a.add_rsp32(room);
+        // The entry returns 1 when it declined, before anything changed. Then the helper makes the call.
+        self.a.test64(RAX, RAX);
+        self.a.jcc(CC_NE, generic);
+        // The result is in xmm0, which the releases leave alone. The call clobbered RDX, so the prototype is loaded again
+        // through the callee, which holds the closure until it is released. Its flag gives the kind of result.
+        self.load_proto(callee);
+        self.a
+            .movzx_load8(RSI, proto_field(std::mem::offset_of!(Proto, closure_bool)));
+        self.release_owned(this);
+        self.a.mov8_imm(this, TAG_UNDEF);
+        self.release_owned(callee);
+        self.a.test64(RSI, RSI);
+        self.a.jcc(CC_NE, boolean);
+        self.a.mov8_imm(callee, TAG_NUM);
+        self.a.movsd_store(callee.at(8), 0);
+        self.a.jmp(done);
+        // An entry that returns a boolean gives 0.0 or 1.0.
+        self.a.bind(boolean);
+        self.a.cvttsd2si(RAX, 0);
+        self.a.mov8_imm(callee, TAG_BOOL);
+        self.a.mov_store8(callee.at(1), RAX);
+        self.a.jmp(done);
+    }
+
     /// A call of a method, which runs through the method's entry (see `Native::direct_method`). The receiver is an object,
     /// and each argument a number. The entry gets the arguments as doubles on the native stack, and the receiver's
     /// address. A call that the entry declines, before it changed anything, goes to `generic`. Otherwise the method
@@ -1424,9 +1501,12 @@ impl<'a> Gen<'a> {
             let callee = self.temp(d - argc as i32 - 2);
             self.check_tag(callee, TAG_FUNC, generic);
             self.load_proto(callee);
-            let (not_method, not_numeric) = (self.a.label(), self.a.label());
+            let (not_method, not_closure, not_numeric) =
+                (self.a.label(), self.a.label(), self.a.label());
             self.method_call(d, argc, not_method, generic, done);
             self.a.bind(not_method);
+            self.closure_numbers_call(d, argc, not_closure, generic, done);
+            self.a.bind(not_closure);
             self.numeric_call(d, argc, not_numeric, generic, done);
             self.a.bind(not_numeric);
             self.closure_call(ip, d, argc, generic, ran);
@@ -3013,6 +3093,9 @@ mod tests {
             numeric_bool: Default::default(),
             method_entry: Default::default(),
             method_argc: std::cell::Cell::new(u32::MAX),
+            closure_entry: Default::default(),
+            closure_argc: std::cell::Cell::new(u32::MAX),
+            closure_bool: Default::default(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,
@@ -3054,6 +3137,9 @@ mod tests {
             numeric_bool: Default::default(),
             method_entry: Default::default(),
             method_argc: std::cell::Cell::new(u32::MAX),
+            closure_entry: Default::default(),
+            closure_argc: std::cell::Cell::new(u32::MAX),
+            closure_bool: Default::default(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,

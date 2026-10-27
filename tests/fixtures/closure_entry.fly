@@ -1,0 +1,60 @@
+// Closures that read a captured number. The number is read from the closure when the closure is called, so a variable that
+// the enclosing function changes later must show its new value, and a captured value that is not a number, or an argument
+// that is not a number, must still give what the interpreter gives.
+function makeAdder(k) {
+  return (x) => x + k;
+}
+let total = 0;
+for (let i = 0; i < 300; i++) {
+  const add = makeAdder(i % 10);
+  total += add(i);
+}
+console.log(total);
+
+// A variable that is shared with the closure, and written after the closure is made.
+let shared = 1;
+const readShared = () => shared + 1;
+console.log(readShared());
+shared = 5;
+console.log(readShared());
+
+// A captured string: the call declines, and the interpreter adds the strings.
+function makeLabel(s) {
+  return (x) => s + x;
+}
+const label = makeLabel("n=");
+console.log(label(3), label(4));
+
+// A captured boolean, which the entry does not read as a number.
+function makeGate(open) {
+  return (x) => (open ? x : 0);
+}
+const gate = makeGate(true);
+const shut = makeGate(false);
+console.log(gate(7), shut(7));
+
+// A closure of a closure: the inner one reads the outer one's captured number.
+function outer(a) {
+  return (b) => (c) => a + b + c;
+}
+const twice = outer(100)(10);
+let sum = 0;
+for (let i = 0; i < 4; i++) sum += twice(i);
+console.log(sum);
+
+// Two parameters, one of them captured, called in a loop that also keeps numbers in registers.
+function scaler(f) {
+  return (x, y) => x * f + y;
+}
+const scale = scaler(0.5);
+let acc = 0.25;
+for (let i = 0; i < 10; i++) acc += scale(i, 1.5);
+console.log(acc);
+
+// A call with a non-number argument: the closure's entry does not take it.
+const twiceOf = (x) => x * 2 + shared;
+console.log(twiceOf(4), twiceOf("4"));
+
+// Recursion through a captured function is unchanged.
+const fib = (n) => (n < 2 ? n : fib(n - 1) + fib(n - 2));
+console.log(fib(15));

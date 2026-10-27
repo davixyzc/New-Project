@@ -18,14 +18,14 @@
 
 use super::codegen::{
     emit_mod_const, find_global, find_prop, int_divisor, local_uses, magic, successors, PropSite,
-    OWNING, TAG_ARR, TAG_BOOL, TAG_FUNC, TAG_NATIVE, TAG_NUM, TAG_OBJ,
+    OWNING, TAG_ARR, TAG_BOOL, TAG_CELL, TAG_FUNC, TAG_NATIVE, TAG_NUM, TAG_OBJ,
 };
 use super::rt;
 use super::types::Numbers;
 use super::x64::*;
 use super::Batch;
 use crate::bytecode::{Op, Proto};
-use crate::value::{arr_layout, entry_layout, prop_layout, PropHint, Value};
+use crate::value::{arr_layout, cell_value_offset, entry_layout, prop_layout, PropHint, Value};
 use crate::vm::MAX_ARRAY_GROW;
 use std::mem::offset_of;
 
@@ -73,11 +73,15 @@ pub(super) struct Function {
     pub(super) returns_bool: bool,
     /// Whether the function reads `this`. Its entry then takes the receiver, and it returns `undefined` (see `method_admitted`).
     pub(super) receiver: bool,
+    /// Whether the function reads a captured number, which its entry reads from the closure it is called with.
+    pub(super) upvals: bool,
 }
 
 /// What the planner of a function region learns from the instructions it steps through (see `function_step`).
 #[derive(Default)]
 struct FnFacts {
+    /// Whether the function reads a captured number (see `Function::upvals`).
+    upvals: bool,
     /// The upvalue that the function calls itself through, if it does.
     self_upval: Option<u32>,
     /// Whether the function returns a boolean, once it returns a number or a boolean.
@@ -479,6 +483,10 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
     if !method_admitted(proto, depth, &facts) {
         return None;
     }
+    // The entry of a closure has no stack budget, which a self call would need, and it returns a number.
+    if facts.upvals && (facts.receiver || facts.self_upval.is_some() || facts.ret_undefined) {
+        return None;
+    }
     let locals = (0..proto.nlocals)
         .map(|i| (i, Home::Mem(frame_local(i))))
         .collect();
@@ -505,6 +513,7 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
             self_upval: facts.self_upval,
             returns_bool: facts.ret_bool.unwrap_or(false),
             receiver: facts.receiver,
+            upvals: facts.upvals,
         }),
     })
 }
@@ -560,6 +569,7 @@ fn function_step(
         ret_bool: ret_kind,
         ret_undefined,
         receiver,
+        upvals,
     } = facts;
     let mut s = before.to_vec();
     let top_numbers =
@@ -570,6 +580,13 @@ fn function_step(
     match op {
         Op::Const(k) if number(k) => s.push(Mark::Num),
         Op::Undef => s.push(Mark::This),
+        // A read of a captured variable that `this` does not follow is a number, which the entry reads from the closure it
+        // is called with (see `emit_function`). A function that calls itself reads its callee the same way, then pushes
+        // `this`.
+        Op::GetUpval(_) if proto.code.get(ip + 1) != Some(&Op::Undef) => {
+            *upvals = true;
+            s.push(Mark::Num);
+        }
         Op::GetUpval(k) => {
             if *self_upval.get_or_insert(k) != k {
                 return None;
@@ -1345,6 +1362,14 @@ fn frame_local(i: u32) -> Mem {
     }
 }
 
+/// The address of the callee's value that a closure's entry is called with, in its native frame, below the receiver's copy.
+fn callee_mem(nlocals: i32) -> Mem {
+    Mem {
+        base: RBP,
+        disp: -8 * (nlocals + 4),
+    }
+}
+
 /// The copy of a method's receiver in its native frame, below the locals: the tag of the value, and then its payload.
 fn receiver_mem(nlocals: i32) -> Mem {
     Mem {
@@ -1648,21 +1673,26 @@ pub(super) fn emit_function(
     let nlocals = proto.nlocals as i32;
     let frame = (8 * (nlocals + 8) + 104 + 15) / 16 * 16;
     let (wrapper, body, overflow) = (a.label(), a.label(), a.label());
-    if function.receiver {
-        // A method needs no wrapper. Nothing a method calls can call it back, so it needs neither the stack budget nor the
-        // registers that a wrapper saves: its body saves rbp, and nothing else. The caller passes the arguments in rdi,
-        // and the receiver in rsi.
+    if function.receiver || function.upvals {
+        // A method or a closure needs no wrapper. Nothing it calls can call it back, so it needs neither the stack budget
+        // nor the registers that a wrapper saves: its body saves rbp, and nothing else. The caller passes the arguments in
+        // rdi, and the receiver, or the callee's value, in rsi.
         a.bind(wrapper);
         a.push_reg(RBP);
         a.mov_rr(RBP, RSP);
         a.sub_rsp32(frame);
-        // The receiver's value is copied into the frame, which takes no reference of its own: the caller keeps the
-        // receiver alive for the call.
-        let receiver = receiver_mem(nlocals);
-        a.mov_load(RAX, Mem { base: RSI, disp: 0 });
-        a.mov_store(receiver, RAX);
-        a.mov_load(RAX, Mem { base: RSI, disp: 8 });
-        a.mov_store(receiver.at(8), RAX);
+        if function.receiver {
+            // The receiver's value is copied into the frame, which takes no reference of its own: the caller keeps the
+            // receiver alive for the call.
+            let receiver = receiver_mem(nlocals);
+            a.mov_load(RAX, Mem { base: RSI, disp: 0 });
+            a.mov_store(receiver, RAX);
+            a.mov_load(RAX, Mem { base: RSI, disp: 8 });
+            a.mov_store(receiver.at(8), RAX);
+        } else {
+            // The callee's address is kept, which the captured numbers are read through.
+            a.mov_store(callee_mem(nlocals), RSI);
+        }
         for j in 0..function.nparams {
             a.movsd_load(
                 j as u8,
@@ -1727,7 +1757,11 @@ pub(super) fn emit_function(
         exits: Vec::new(),
         not_entered,
         slow: Vec::new(),
-        body: Some(if function.receiver { wrapper } else { body }),
+        body: Some(if function.receiver || function.upvals {
+            wrapper
+        } else {
+            body
+        }),
         nlocals,
         sides: Vec::new(),
     };
@@ -1735,7 +1769,7 @@ pub(super) fn emit_function(
     let a = e.a;
     let (nparams, returns_bool) = (function.nparams, function.returns_bool);
     // The batch entries call the body without a receiver, so a method has none.
-    let batches = !function.receiver;
+    let batches = !(function.receiver || function.upvals);
     let map = if batches && nparams <= 2 {
         Some(emit_batch(a, body, Mode::Map, nparams, returns_bool))
     } else {
@@ -1874,6 +1908,89 @@ impl Emitter<'_, '_> {
                 let m = self.operand_mem(d - 1);
                 self.check_last(m, exit);
                 self.count_down(m);
+            }
+            // A captured number, read from the closure that the entry was called with (see `emit_function`). A value that is
+            // not a number declines the call, before anything has changed.
+            Op::GetUpval(k)
+                if self.lp.function.as_ref().is_some_and(|f| f.upvals)
+                    && self.proto.code.get(ip + 1) != Some(&Op::Undef) =>
+            {
+                let exit = self.side_exit(ip, d);
+                let layout = arr_layout()
+                    .expect("the planner admits a captured number only with a known layout");
+                let cell_value = cell_value_offset()
+                    .expect("the planner admits a captured number only with a known layout");
+                let upvals = offset_of!(crate::value::Closure, upvals) as i32;
+                let (copied, read) = (self.a.label(), self.a.label());
+                // The callee's value holds the closure's allocation, whose closure follows the counts.
+                self.a.mov_load(RCX, callee_mem(self.nlocals));
+                self.a.mov_load(RCX, Mem { base: RCX, disp: 8 });
+                self.a.add64_imm32(RCX, super::RC_VALUE);
+                self.a.mov_load(
+                    RSI,
+                    Mem {
+                        base: RCX,
+                        disp: upvals + layout.len,
+                    },
+                );
+                self.a.cmp64_imm32(RSI, k as i32);
+                self.a.jcc(CC_BE, exit);
+                self.a.mov_load(
+                    RDX,
+                    Mem {
+                        base: RCX,
+                        disp: upvals + layout.buf,
+                    },
+                );
+                // A variable that the enclosing frame shares is a cell, whose number is read through the cell's allocation.
+                self.a.cmp8_imm(
+                    Mem {
+                        base: RDX,
+                        disp: 16 * k as i32,
+                    },
+                    TAG_CELL,
+                );
+                self.a.jcc(CC_NE, copied);
+                self.a.mov_load(
+                    RDX,
+                    Mem {
+                        base: RDX,
+                        disp: 16 * k as i32 + 8,
+                    },
+                );
+                self.a.cmp8_imm(
+                    Mem {
+                        base: RDX,
+                        disp: cell_value,
+                    },
+                    TAG_NUM,
+                );
+                self.a.jcc(CC_NE, exit);
+                self.a.movsd_load(
+                    self.reg(d),
+                    Mem {
+                        base: RDX,
+                        disp: cell_value + 8,
+                    },
+                );
+                self.a.jmp(read);
+                self.a.bind(copied);
+                self.a.cmp8_imm(
+                    Mem {
+                        base: RDX,
+                        disp: 16 * k as i32,
+                    },
+                    TAG_NUM,
+                );
+                self.a.jcc(CC_NE, exit);
+                self.a.movsd_load(
+                    self.reg(d),
+                    Mem {
+                        base: RDX,
+                        disp: 16 * k as i32 + 8,
+                    },
+                );
+                self.a.bind(read);
             }
             Op::Pop | Op::Undef | Op::This | Op::GetUpval(_) => {}
             Op::Dup if self.lp.function.is_none() && self.mark(ip, d - 1) == Mark::Owned => {
@@ -2069,11 +2186,15 @@ impl Emitter<'_, '_> {
                 self.jump_if(t, CC_BE);
             }
             Op::Return => {
-                if self.lp.function.as_ref().is_some_and(|f| f.receiver) {
+                match self.lp.function.as_ref() {
                     // A method returns `undefined`, with status 0 in rax, which the wrapper passes on.
-                    self.a.mov_imm32(RAX, 0);
-                } else {
-                    self.a.movapd_rr(0, x);
+                    Some(f) if f.receiver => self.a.mov_imm32(RAX, 0),
+                    // A closure returns its number, with status 0 in rax, which the wrapper passes on too.
+                    Some(f) if f.upvals => {
+                        self.a.movapd_rr(0, x);
+                        self.a.mov_imm32(RAX, 0);
+                    }
+                    _ => self.a.movapd_rr(0, x),
                 }
                 self.a.mov_rr(RSP, RBP);
                 self.a.pop_reg(RBP);
@@ -2995,6 +3116,9 @@ mod tests {
             numeric_bool: Default::default(),
             method_entry: Default::default(),
             method_argc: std::cell::Cell::new(u32::MAX),
+            closure_entry: Default::default(),
+            closure_argc: std::cell::Cell::new(u32::MAX),
+            closure_bool: Default::default(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams,

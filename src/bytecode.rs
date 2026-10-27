@@ -215,6 +215,13 @@ pub struct Proto {
     /// The number of arguments that `method_entry` takes. It is `u32::MAX` when there is no such entry, so no call has
     /// that many arguments.
     pub method_argc: Cell<u32>,
+    /// The entry of a function that reads a captured number. Native code calls it with the address of the callee's
+    /// value, which the captured numbers are read from (see `Native::direct_closure`). Zero for a function without one.
+    pub closure_entry: Cell<usize>,
+    /// The number of arguments that `closure_entry` takes. It is `u32::MAX` when there is no such entry.
+    pub closure_argc: Cell<u32>,
+    /// Whether `closure_entry` returns a boolean.
+    pub closure_bool: Cell<bool>,
     pub protos: Vec<Rc<Proto>>,
     pub upvals: Vec<UpvalDesc>,
     pub nparams: u32,
@@ -253,6 +260,12 @@ impl Proto {
                         self.method_entry.set(entry);
                         self.method_argc
                             .set(if self.has_rest { u32::MAX } else { nparams });
+                    }
+                    if let Some((entry, nparams, returns_bool)) = code.direct_closure() {
+                        self.closure_entry.set(entry);
+                        self.closure_argc
+                            .set(if self.has_rest { u32::MAX } else { nparams });
+                        self.closure_bool.set(returns_bool);
                     }
                 }
                 compiled
