@@ -1,0 +1,14 @@
+// The length of an element of an array in a local, read in place: a string, an array, and other values, which take the
+// generic code. The output is the one Node gives.
+const words = ["ab", "", "xyz", "é", "abcdef"];
+const rows = [[1, 2], [], [3, 4, 5], [6]];
+let total = 0;
+for (let i = 0; i < 2000; i++) {
+  for (let j = 0; j < words.length; j++) total += words[j].length;
+  for (let j = 0; j < rows.length; j++) total += rows[j].length;
+}
+console.log(total, words[3].length, rows[2].length);
+const mixed = [5, "hi", [1, 2, 3], { length: 9 }];
+let s = "";
+for (let k = 0; k < mixed.length; k++) s += String(mixed[k].length) + " ";
+console.log(s);

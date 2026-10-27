@@ -2744,6 +2744,51 @@ impl<'a> Gen<'a> {
                 let (obj, key) = (self.local(i), self.temp(d - 1));
                 let get = rt::get_index_local as *const () as usize;
                 let done = self.a.label();
+                // `local[k].length` reads the length of the string or the array that is the element, in place, and so
+                // does the `GetProp` after it, which is skipped: the element is not copied. Any other element runs the
+                // code below, and the `GetProp` runs as usual.
+                if let (Some(layout), Some(slayout)) = (arr_layout(), str_layout()) {
+                    if let Some(Op::GetProp(n)) = self.proto.code.get(self.cur + 1).copied() {
+                        if &*self.proto.names[n as usize] == "length"
+                            && self.cur + 2 < self.proto.code.len()
+                        {
+                            let after = self.ops[self.cur + 2];
+                            let (not_str, native_miss) = (self.a.label(), self.a.label());
+                            self.arr_elem(obj, key, layout, native_miss);
+                            self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_STR);
+                            self.a.jcc(CC_NE, not_str);
+                            self.a.mov_load(RCX, Mem { base: RDX, disp: 8 });
+                            self.a.mov_load(
+                                RSI,
+                                Mem {
+                                    base: RCX,
+                                    disp: slayout.chars,
+                                },
+                            );
+                            self.a.cvtsi2sd64(1, RSI);
+                            self.a.mov8_imm(key, TAG_NUM);
+                            self.a.movsd_store(key.at(8), 1);
+                            self.a.jmp(after);
+                            self.a.bind(not_str);
+                            self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_ARR);
+                            self.a.jcc(CC_NE, native_miss);
+                            self.a.mov_load(RCX, Mem { base: RDX, disp: 8 });
+                            self.a.add64_imm32(RCX, layout.vec);
+                            self.a.mov_load(
+                                RSI,
+                                Mem {
+                                    base: RCX,
+                                    disp: layout.len,
+                                },
+                            );
+                            self.a.cvtsi2sd64(1, RSI);
+                            self.a.mov8_imm(key, TAG_NUM);
+                            self.a.movsd_store(key.at(8), 1);
+                            self.a.jmp(after);
+                            self.a.bind(native_miss);
+                        }
+                    }
+                }
                 if let Some(layout) = arr_layout() {
                     // An element of an array in a local is read in place, into the key's slot.
                     let native_miss = self.a.label();
