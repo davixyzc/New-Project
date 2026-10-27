@@ -1,0 +1,11 @@
+// Strings built with numbers. A whole number below 9e15 is written as its digits, and any other number goes through the
+// general conversion, both when a string is extended and when an array is joined. A shared string is copied on append.
+let s = "";
+for (let i = -2; i < 3; i++) s += "w" + i;
+console.log(s);
+console.log("n" + -0, "n" + 1.5, "n" + NaN, "n" + Infinity, "n" + 1e20, "n" + 9007199254740993);
+console.log([-0, 1.5, NaN, Infinity, 1e20, 9007199254740992, 7, -7].join(","));
+const shared = "p";
+const a = shared + 1;
+const b = shared + 2;
+console.log(shared, a, b, shared + "é" + 3, ("é" + 1 + 2).length, (shared + "é").length);

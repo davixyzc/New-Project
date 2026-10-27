@@ -227,14 +227,6 @@ pub unsafe extern "C" fn call(
 // The value helpers below run without the VM's bookkeeping, because they neither fail nor
 // change the stack's length. They only move or copy values between slots of the frame.
 
-/// `*dst = src.clone()`, where `dst` is a dead slot that holds nothing to drop.
-///
-/// # Safety
-/// Both pointers must point at valid values, or at a dead slot for `dst`.
-pub unsafe extern "C" fn clone_into(src: *const Value, dst: *mut Value) {
-    ptr::write(dst, (*src).clone());
-}
-
 /// `*dst = src.clone()`, dropping the value `dst` held.
 ///
 /// # Safety

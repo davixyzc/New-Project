@@ -2356,10 +2356,13 @@ impl<'a> Gen<'a> {
                         self.a.mov8_imm(t, TAG_NUM);
                     }
                     None => {
-                        // Not a number (a string): clone the constant, which is stored in the prototype.
+                        // Not a number (a string): the constant is stored in the prototype, so its copy is made in place,
+                        // and counts one more reference as `clone` does.
                         let addr = &self.proto.consts[k as usize] as *const Value as usize;
-                        let clone = rt::clone_into as *const () as usize;
-                        self.direct_call(clone, &[Arg::Imm(addr as u64), Arg::Addr(t)]);
+                        self.a.mov_imm64(R11, addr as u64);
+                        self.load_clone(Mem { base: R11, disp: 0 });
+                        self.a.mov_store(t, RAX);
+                        self.a.mov_store(t.at(8), RCX);
                     }
                 }
                 Fast::Pure

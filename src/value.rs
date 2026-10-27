@@ -1225,7 +1225,9 @@ pub fn join_items(a: &ArrRef, sep: &str, outer: Option<&Joining>) -> String {
         match item {
             Value::Undef | Value::Null => {}
             Value::Str(s) => push_small(&mut text, s),
-            Value::Num(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => push_int(&mut text, *n as i64),
+            Value::Num(n) if (*n as i64) as f64 == *n && n.abs() < 9.0e15 => {
+                push_int(&mut text, *n as i64)
+            }
             other => text.push_str(&to_str_in(other, Some(&joining))),
         }
     }
@@ -1497,7 +1499,7 @@ pub(crate) fn push_small(text: &mut String, more: &str) {
 fn appended<'a>(rhs: &'a Value, digits: &'a mut [u8; 21]) -> (Cow<'a, str>, usize, bool) {
     match rhs {
         Value::Str(r) => (Cow::Borrowed(r.as_str()), r.char_count(), r.is_ascii()),
-        Value::Num(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => {
+        Value::Num(n) if (*n as i64) as f64 == *n && n.abs() < 9.0e15 => {
             let text = int_text(*n as i64, digits);
             (Cow::Borrowed(text), text.len(), true)
         }
@@ -1517,10 +1519,15 @@ pub fn concat_owned(old: Value, rhs: Value) -> Value {
             let mut digits = [0u8; 21];
             let (more, chars, ascii) = appended(&rhs, &mut digits);
             if Rc::get_mut(&mut s).is_none() {
-                // A shared string is copied, and the copy keeps the counts of the string it copies.
+                // A shared string is copied with `more` already appended, so the copy is made once and counted once.
                 let mut copy = String::with_capacity(s.len() * 2 + 16);
                 push_small(&mut copy, &s);
-                s = Rc::new(JsStr::counted(copy, s.char_count(), s.is_ascii()));
+                push_small(&mut copy, &more);
+                return Value::Str(Rc::new(JsStr::counted(
+                    copy,
+                    s.char_count() + chars,
+                    s.is_ascii() && ascii,
+                )));
             }
             let buf = Rc::get_mut(&mut s).unwrap();
             buf.push_counted(&more, chars, ascii);
