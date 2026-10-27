@@ -260,6 +260,15 @@ struct Parser<'a> {
     transitions: Transitions,
 }
 
+/// Whether two texts are the same. A key that a parser reads is short, and the bytes are compared one by one, which
+/// costs less than a call into the library's comparison. A long text is compared as a whole.
+fn same_text(a: &str, b: &str) -> bool {
+    if a.len() > 16 {
+        return a == b;
+    }
+    a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| x == y)
+}
+
 impl<'a> Parser<'a> {
     /// The byte at the current position. Every token starts with an ASCII byte, so this is enough to choose a token.
     fn byte(&self) -> Option<u8> {
@@ -378,7 +387,7 @@ impl<'a> Parser<'a> {
         if let Some(shared) = self
             .keys
             .iter()
-            .find(|k| k.len() == name.len() && k.as_bytes().last() == last && &***k == name)
+            .find(|k| k.len() == name.len() && k.as_bytes().last() == last && same_text(k, name))
         {
             return shared.clone();
         }
