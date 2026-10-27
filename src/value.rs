@@ -314,6 +314,20 @@ impl Props {
         self.push_hinted(key, v, None);
     }
 
+    /// Adds a value for a key that the transition to `to` adds to this object's shape, which the caller has checked
+    /// (see `obj_put_cached`). The object must be in shape mode, with the shape that the transition starts from.
+    fn push_to(&mut self, v: Value, to: &'static Shape) {
+        bump_epoch();
+        self.shape = to;
+        self.id = shape_id(to);
+        self.values.push(v);
+    }
+
+    /// The shape of the object, when it is in shape mode.
+    fn shape_in_use(&self) -> Option<&'static Shape> {
+        self.dict.is_none().then_some(self.shape)
+    }
+
     /// `push`, which records in `hint` the shape transition that it makes, so that a site which adds the same key to
     /// objects of the same shape can make the same transition without looking it up.
     fn push_hinted(&mut self, key: Rc<str>, v: Value, hint: Option<&PropHint>) {
@@ -588,6 +602,48 @@ pub fn obj_put(obj: &ObjRef, key: &Rc<str>, v: Value) {
     match props.position_of_key(key) {
         Some(i) => props.set_value(i, v),
         None => props.push(key.clone(), v),
+    }
+}
+
+/// The shape transitions that a parser has seen: adding a key to an object of one shape made an object of another. An
+/// object of the first shape does not have the key, so the parser makes the same transition without a lookup. Keys
+/// are compared by pointer, which finds the keys that a parser shares.
+#[derive(Default)]
+pub struct Transitions {
+    entries: Vec<(usize, Rc<str>, &'static Shape)>,
+}
+
+/// The most transitions a parser keeps. One that meets more shapes looks each key up.
+const MAX_TRANSITIONS: usize = 32;
+
+impl Transitions {
+    fn find(&self, from: usize, key: &Rc<str>) -> Option<&'static Shape> {
+        self.entries
+            .iter()
+            .find(|(f, k, _)| *f == from && Rc::ptr_eq(k, key))
+            .map(|&(_, _, to)| to)
+    }
+}
+
+/// `obj_put` for a parser, which keeps the shape transitions that it makes in `transitions`, so that an object of a shape
+/// that it has seen takes the key without a lookup.
+pub fn obj_put_cached(obj: &ObjRef, key: &Rc<str>, v: Value, transitions: &mut Transitions) {
+    let mut props = obj.borrow_mut();
+    if let Some(to) = transitions.find(props.id, key) {
+        props.push_to(v, to);
+        return;
+    }
+    match props.position_of_key(key) {
+        Some(i) => props.set_value(i, v),
+        None => {
+            let from = props.id;
+            props.push(key.clone(), v);
+            if let Some(to) = props.shape_in_use() {
+                if transitions.entries.len() < MAX_TRANSITIONS {
+                    transitions.entries.push((from, key.clone(), to));
+                }
+            }
+        }
     }
 }
 

@@ -1,0 +1,20 @@
+// JSON objects that share shapes: the same keys in the same and in another order, a repeated key (the last value wins),
+// more keys than an object keeps in shape mode, and rows that differ only after a common prefix.
+const text = '[{"a":1,"b":2},{"a":3,"b":4},{"b":5,"a":6},{"a":7,"a":8,"b":9},{"a":10,"b":11,"c":12},{"a":13,"b":14,"c":15}]';
+const parsed = JSON.parse(text);
+console.log(JSON.stringify(parsed));
+
+let s = "{";
+for (let i = 0; i < 40; i++) s += (i ? "," : "") + '"k' + i + '":' + i;
+s += "}";
+const big = JSON.parse(s);
+console.log(big.k0, big.k20, big.k39, JSON.stringify(big).length);
+
+const rows = [];
+for (let r = 0; r < 50; r++) rows.push(JSON.parse('{"x":' + r + ',"y":"v' + (r % 3) + '","z":' + (r % 2) + '}'));
+let sum = 0;
+for (const row of rows) sum += row.x + row.y.length + row.z;
+console.log(sum, JSON.stringify(rows[49]), JSON.stringify(rows[2]));
+
+const mixed = JSON.parse('[{"p":1,"q":{"p":2}},{"q":{"p":3},"p":4},{"p":5,"q":[{"p":6}]}]');
+console.log(JSON.stringify(mixed), mixed[1].p, mixed[2].q[0].p);

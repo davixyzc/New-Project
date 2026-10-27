@@ -4,7 +4,10 @@ use std::borrow::Cow;
 use std::rc::Rc;
 
 use crate::builtins::{arg, table_object};
-use crate::value::{is_index_key, key_order, obj_put, push_number, to_str, NativeDef, Value};
+use crate::value::{
+    is_index_key, key_order, obj_put_cached, push_number, push_small, to_str, NativeDef,
+    Transitions, Value,
+};
 use crate::vm::Vm;
 
 pub static METHODS: &[NativeDef] = &[
@@ -140,7 +143,7 @@ fn write_member(
     if indent.is_empty() {
         out.push(':');
     } else {
-        out.push_str(": ");
+        push_small(out, ": ");
     }
     write_value(val, indent, depth + 1, out)?;
     Ok(())
@@ -161,7 +164,7 @@ fn quote(s: &str, out: &mut String) {
     // Most strings need no escape, so they are copied whole. Every character that needs one is ASCII, so the bytes
     // are enough to check.
     if !s.bytes().any(|b| b < b' ' || b == b'"' || b == b'\\') {
-        out.push_str(s);
+        push_small(out, s);
     } else {
         for c in s.chars() {
             match c {
@@ -186,6 +189,7 @@ fn parse(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
         text: text.as_str(),
         pos: 0,
         keys: Vec::new(),
+        transitions: Transitions::default(),
     };
     let result = p.value().and_then(|v| {
         p.skip_ws();
@@ -205,6 +209,8 @@ struct Parser<'a> {
     pos: usize,
     /// The property names read so far, which the objects that have them share (see `shared_key`).
     keys: Vec<Rc<str>>,
+    /// The shape transitions of the objects read so far, so that objects of one shape add a key without a lookup.
+    transitions: Transitions,
 }
 
 impl<'a> Parser<'a> {
@@ -320,7 +326,13 @@ impl<'a> Parser<'a> {
     /// The shared allocation for the property name `name`. Objects of one shape have the same names, so a name that was
     /// read before is found in `keys` and not copied again. Names past `MAX_SHARED_KEYS` are copied each time.
     fn shared_key(&mut self, name: &str) -> Rc<str> {
-        if let Some(shared) = self.keys.iter().find(|k| &***k == name) {
+        // The length and the last byte are compared before the text, which settles most of the keys that differ.
+        let last = name.as_bytes().last();
+        if let Some(shared) = self
+            .keys
+            .iter()
+            .find(|k| k.len() == name.len() && k.as_bytes().last() == last && &***k == name)
+        {
             return shared.clone();
         }
         let shared: Rc<str> = Rc::from(name);
@@ -459,7 +471,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let v = self.value()?;
             if let Value::Obj(o) = &obj {
-                obj_put(o, &key, v);
+                obj_put_cached(o, &key, v, &mut self.transitions);
             }
             self.skip_ws();
             match self.byte() {
