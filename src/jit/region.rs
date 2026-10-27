@@ -215,11 +215,15 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
                 .any(|&(next, _)| next == header)
     })?;
     let inside = |ip: usize| (header..=last).contains(&ip);
-    // A local that an index operation or a `push` names is an array. The loop reads its elements in place.
+    // A local that an index operation, a `push` or a `length` read names is an array. The loop reads its elements, or its
+    // length, in place, and the entry checks that it is one.
     let mut arrays = vec![false; proto.nlocals as usize];
     for ip in header..=last {
         if depth[ip] >= 0 {
-            if let Some(a) = index_base(code[ip]).or_else(|| push_base(proto, code[ip])) {
+            let named = index_base(code[ip])
+                .or_else(|| push_base(proto, code[ip]))
+                .or_else(|| length_base(proto, code[ip]));
+            if let Some(a) = named {
                 arrays[a as usize] = true;
             }
         }
@@ -1089,6 +1093,14 @@ fn is_push(proto: &Proto, name: u32) -> bool {
 fn push_base(proto: &Proto, op: Op) -> Option<u32> {
     match op {
         Op::GetLocalProp(s, n) if is_push(proto, n) => Some(s),
+        _ => None,
+    }
+}
+
+/// The local that a `length` read names, which is an array when the loop reads its length in place (see `plan`).
+fn length_base(proto: &Proto, op: Op) -> Option<u32> {
+    match op {
+        Op::GetLocalProp(s, n) if is_length(proto, n) => Some(s),
         _ => None,
     }
 }
