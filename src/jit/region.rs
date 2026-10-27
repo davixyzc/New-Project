@@ -43,8 +43,9 @@ const FN_MAX_DEPTH: i32 = 13;
 /// Arguments a function region takes, in xmm0 and up.
 pub(super) const MAX_ARGS: usize = 6;
 /// The bytes of a loop region's frame, below the saved `r13`: room to save the xmm registers a call
-/// clobbers, the tag cells and the row caches, and a size that keeps rsp 16-byte aligned at those calls.
-const FRAME: i32 = 184;
+/// clobbers, the tag cells, the row caches and the property caches, and a size that keeps rsp 16-byte
+/// aligned at those calls.
+const FRAME: i32 = 248;
 /// Where the tag of an element operand is kept, one byte per depth. `call_mod` saves its registers below this.
 const TAG_CELLS: i32 = 136;
 /// Where the row caches of a loop start, above the tag cells. Each array with a cache takes a key and a row, 8 bytes each
@@ -52,6 +53,11 @@ const TAG_CELLS: i32 = 136;
 const ROW_CACHE_BASE: i32 = 144;
 /// The most arrays that a loop keeps a row cache for.
 const MAX_ROW_CACHES: usize = 2;
+/// Where the property caches of a loop start, above the row caches. Each one takes the address of a property's value,
+/// 8 bytes (see `prop_address`).
+const PROP_CACHE_BASE: i32 = ROW_CACHE_BASE + 16 * MAX_ROW_CACHES as i32;
+/// The most properties that a loop keeps the address of.
+const MAX_PROP_CACHES: usize = 8;
 /// The key of an empty row cache. A key is a 32-bit index (see `row_cached`), so no key takes it.
 const NO_KEY: u64 = 1 << 40;
 /// The largest magnitude an integer copy of a local may have. It stays exact, and fits an imm32.
@@ -127,6 +133,9 @@ pub(super) struct Region {
     arrays: Vec<u32>,
     /// The arrays whose rows a loop reads by a whole key, which keep their last row in the frame (see `row_cached`).
     row_caches: Vec<u32>,
+    /// The properties that a loop reads or writes through an object local, which keep the address of their value in the
+    /// frame (see `prop_address`).
+    prop_caches: Vec<(u32, u32)>,
     /// The locals that hold objects, which a loop reads in place (see `Mark::View`). They have no register.
     pub(super) objects: Vec<u32>,
     /// The object locals that a path reads from the entry before it writes them, which the loop checks on entry.
@@ -517,6 +526,29 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
             }
         }
     }
+    // A property that the loop reads or writes through an object local keeps the address of its value, so that a later
+    // access to it skips the lookup (see `prop_address`). Accesses to one local and name share a cache.
+    let mut prop_caches: Vec<(u32, u32)> = Vec::new();
+    for ip in header..=last {
+        let stack = &marks[ip - header];
+        let keyed = match code[ip] {
+            Op::GetLocalProp(s, n) if objects[s as usize] => Some((s, n)),
+            Op::GetProp(n) => match stack.last() {
+                Some(&Mark::View(s)) => Some((s, n)),
+                _ => None,
+            },
+            Op::SetProp(n) => match stack.len().checked_sub(2).and_then(|k| stack.get(k)) {
+                Some(&Mark::View(s)) => Some((s, n)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(key) = keyed {
+            if !prop_caches.contains(&key) && prop_caches.len() < MAX_PROP_CACHES {
+                prop_caches.push(key);
+            }
+        }
+    }
     Some(Region {
         header,
         last,
@@ -529,6 +561,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         rem,
         arrays: (0..proto.nlocals).filter(|&i| arrays[i as usize]).collect(),
         row_caches,
+        prop_caches,
         objects: (0..proto.nlocals)
             .filter(|&i| objects[i as usize])
             .collect(),
@@ -601,6 +634,7 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
         rem: None,
         arrays: Vec::new(),
         row_caches: Vec::new(),
+        prop_caches: Vec::new(),
         objects: Vec::new(),
         object_guards: Vec::new(),
         object_reads: Vec::new(),
@@ -1522,6 +1556,22 @@ fn row_cache_mem(j: usize, offset: i32) -> Mem {
     }
 }
 
+/// The frame slot of the address of the property cache `j` of a loop (see `prop_address`).
+fn prop_cache_mem(j: usize) -> Mem {
+    Mem {
+        base: RSP,
+        disp: PROP_CACHE_BASE + 8 * j as i32,
+    }
+}
+
+/// The object local that a mark views, if it views one (see `Mark::View`).
+fn view_local(m: Mark) -> Option<u32> {
+    match m {
+        Mark::View(s) => Some(s),
+        _ => None,
+    }
+}
+
 /// Emits a loop region. `entry` is the label the generic code calls, with rdx set to the instruction
 /// it reached the loop at. The region returns the index of the instruction it left at, or
 /// `NOT_ENTERED` when a guard failed.
@@ -1651,6 +1701,11 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
     for j in 0..lp.row_caches.len() {
         e.a.mov_imm64(RAX, NO_KEY);
         e.a.mov_store(row_cache_mem(j, 0), RAX);
+    }
+    // Each property cache starts empty, since the object of its local may have changed since the last entry.
+    for j in 0..lp.prop_caches.len() {
+        e.a.mov_imm64(RAX, 0);
+        e.a.mov_store(prop_cache_mem(j), RAX);
     }
     for &(bits, x) in &lp.consts {
         e.a.mov_imm64(RAX, bits);
@@ -2240,6 +2295,7 @@ impl Emitter<'_, '_> {
                 }
                 self.count_down(dst);
                 self.copy_value(src, dst);
+                self.clear_prop_caches(i);
             }
             Op::SetLocal(i) | Op::PopToLocal(i)
                 if self.mark(ip, d - 1) == Mark::Elem && !self.lp.objects.contains(&i) =>
@@ -2472,7 +2528,7 @@ impl Emitter<'_, '_> {
             // The callee of a method is looked up by the call, which takes the receiver from the same local (see `Mark::Method`).
             Op::GetLocalProp(..) if matches!(self.mark(ip + 1, d), Mark::Method(..)) => {}
             Op::GetLocalProp(s, n) if self.lp.objects.contains(&s) => {
-                self.prop_read(ip, d, self.reg(d), local_mem(s), n);
+                self.prop_read(ip, d, self.reg(d), local_mem(s), n, Some(s));
             }
             Op::GetLocalProp(s, n) if is_length(self.proto, n) => {
                 // The length of the array in local `s`, which the loop checked on entry to be an array.
@@ -2510,7 +2566,7 @@ impl Emitter<'_, '_> {
             Op::GetProp(n) => {
                 let view = self.mark(ip, d - 1);
                 let obj = self.view_mem(view);
-                self.prop_read(ip, d, self.reg(d - 1), obj, n);
+                self.prop_read(ip, d, self.reg(d - 1), obj, n, view_local(view));
                 // The property's address is kept in r14 for a `SetProp` that follows (see `cache_holds`).
                 if self.r14_free() {
                     self.prop_cache = Some((ip, n, view));
@@ -2532,8 +2588,7 @@ impl Emitter<'_, '_> {
                 } else {
                     let obj = self.view_mem(view);
                     let exit = self.side_exit(ip, d);
-                    let site = self.prop_site(n);
-                    find_prop(&mut *self.a, obj, site, exit);
+                    self.prop_address(obj, view_local(view), n, exit);
                     self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
                     self.a.jcc(CC_NE, exit);
                     self.a
@@ -3173,13 +3228,57 @@ impl Emitter<'_, '_> {
         }
     }
 
+    /// The property cache of `name` on the object local `local`, when the loop keeps one (see `plan`).
+    fn prop_cache_slot(&self, local: u32, name: u32) -> Option<Mem> {
+        let j = self
+            .lp
+            .prop_caches
+            .iter()
+            .position(|&c| c == (local, name))?;
+        Some(prop_cache_mem(j))
+    }
+
+    /// Leaves in RDX the address of property `name` of the object at `obj`, which is the object local `local` when it is
+    /// one. A cached address is the one that the lookup found before: the loop adds no property to an object, and the
+    /// values of an object stay in place until one is added, so the address holds while the local keeps its object (see
+    /// `clear_prop_caches`).
+    fn prop_address(&mut self, obj: Mem, local: Option<u32>, name: u32, exit: Label) {
+        let site = self.prop_site(name);
+        match local.and_then(|s| self.prop_cache_slot(s, name)) {
+            Some(slot) => {
+                let done = self.a.label();
+                self.a.mov_load(RDX, slot);
+                self.a.test64(RDX, RDX);
+                self.a.jcc(CC_NE, done);
+                find_prop(&mut *self.a, obj, site, exit);
+                self.a.mov_store(slot, RDX);
+                self.a.bind(done);
+            }
+            None => find_prop(&mut *self.a, obj, site, exit),
+        }
+    }
+
+    /// Clears the property caches of the object local `local`, which the loop has just rebound: they hold the addresses of
+    /// the values of the object that the local held before.
+    fn clear_prop_caches(&mut self, local: u32) {
+        let slots: Vec<Mem> = (0..self.lp.prop_caches.len())
+            .filter(|&j| self.lp.prop_caches[j].0 == local)
+            .map(prop_cache_mem)
+            .collect();
+        if !slots.is_empty() {
+            self.a.mov_imm64(RAX, 0);
+        }
+        for slot in slots {
+            self.a.mov_store(slot, RAX);
+        }
+    }
+
     /// Reads the number that property `n` of the object at `obj` holds into xmm `dst`. A property that is not a number,
     /// or an object that the hint does not find, exits at `ip`, which the generic code runs, with `d` operands on the
     /// stack.
-    fn prop_read(&mut self, ip: usize, d: i32, dst: u8, obj: Mem, n: u32) {
+    fn prop_read(&mut self, ip: usize, d: i32, dst: u8, obj: Mem, n: u32, local: Option<u32>) {
         let exit = self.side_exit(ip, d);
-        let site = self.prop_site(n);
-        find_prop(&mut *self.a, obj, site, exit);
+        self.prop_address(obj, local, n, exit);
         if self.r14_free() {
             self.a.mov_rr(R14, RDX);
         }
@@ -3684,6 +3783,30 @@ mod tests {
         assert_eq!(
             plan_at(&p, 2).expect("the loop is planned").row_caches,
             vec![0]
+        );
+    }
+
+    #[test]
+    fn a_loop_that_reads_a_property_of_an_object_keeps_its_address() {
+        // `for (j = 0; j < 4; j++) s = o.x`, with `o` in local 0, `j` in local 1 and `s` in local 2, and `x` the name 0.
+        let mut p = proto(
+            vec![
+                Op::Const(0),
+                Op::PopToLocal(1),
+                Op::GetLocalProp(0, 0),
+                Op::PopToLocal(2),
+                Op::IncLocal(1),
+                Op::JumpIfLtLK(1, 1, 2),
+                Op::Return,
+            ],
+            vec![Value::Num(0.0), Value::Num(4.0)],
+            3,
+            0,
+        );
+        p.names = vec![Rc::from("x")];
+        assert_eq!(
+            plan_at(&p, 2).expect("the loop is planned").prop_caches,
+            vec![(0, 0)]
         );
     }
 
