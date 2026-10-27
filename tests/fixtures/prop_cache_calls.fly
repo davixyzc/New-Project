@@ -1,0 +1,28 @@
+// A loop reads a property of an object, then calls a method that calls a function, which adds properties to that
+// object and so moves its values. The read after the call must see the object as it is now.
+const o = {
+  x: 0,
+  add(k) {
+    this.x += k;
+    grow(this, k);
+  },
+};
+
+function grow(obj, k) {
+  if (k === 1) obj.a = 1;
+  if (k === 2) obj.b = 2;
+  if (k === 3) obj.c = 3;
+  if (k === 4) obj.d = 4;
+  if (k === 5) obj.e = 5;
+  if (k === 6) obj.f = 6;
+  if (k === 7) obj.g = 7;
+  if (k === 8) obj.h = 8;
+  if (k === 9) obj.i = 9;
+}
+
+let total = 0;
+for (let i = 0; i < 40; i++) {
+  total += o.x;
+  o.add(i % 10);
+}
+console.log(total, o.x, o.i);

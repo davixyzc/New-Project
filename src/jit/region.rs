@@ -531,8 +531,14 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
     let mut prop_caches: Vec<(u32, u32)> = Vec::new();
     for ip in header..=last {
         let stack = &marks[ip - header];
+        // The read of a method's callee is no read of the property: the call looks the callee up (see `call_method`).
+        let callee = marks.get(ip + 1 - header).and_then(|next| next.last());
         let keyed = match code[ip] {
-            Op::GetLocalProp(s, n) if objects[s as usize] => Some((s, n)),
+            Op::GetLocalProp(s, n)
+                if objects[s as usize] && !matches!(callee, Some(Mark::Method(..))) =>
+            {
+                Some((s, n))
+            }
             Op::GetProp(n) => match stack.last() {
                 Some(&Mark::View(s)) => Some((s, n)),
                 _ => None,
@@ -2702,6 +2708,8 @@ impl Emitter<'_, '_> {
         // The entry returns 1 when it declined, before it wrote anything. Then the loop leaves at the read.
         self.a.test64(RAX, RAX);
         self.a.jcc(CC_NE, exit);
+        // The entry ran script code, which may add a property to an object or replace a row, so the caches go.
+        self.forget_caches();
     }
 
     /// The xmm registers that hold a live value below `depth` operands: the locals and constants that the loop keeps in
@@ -3255,6 +3263,19 @@ impl Emitter<'_, '_> {
                 self.a.bind(done);
             }
             None => find_prop(&mut *self.a, obj, site, exit),
+        }
+    }
+
+    /// Forgets every row cache and property cache. Script code may have replaced a row, or added a property to an object,
+    /// which moves its values, so the caches of the loop are wrong after it (see `call_method`).
+    fn forget_caches(&mut self) {
+        for j in 0..self.lp.row_caches.len() {
+            self.a.mov_imm64(RAX, NO_KEY);
+            self.a.mov_store(row_cache_mem(j, 0), RAX);
+        }
+        for j in 0..self.lp.prop_caches.len() {
+            self.a.mov_imm64(RAX, 0);
+            self.a.mov_store(prop_cache_mem(j), RAX);
         }
     }
 
