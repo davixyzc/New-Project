@@ -477,18 +477,26 @@ impl fmt::Display for JsStr {
     }
 }
 
+thread_local! {
+    /// The shared string of each ASCII character, by its code.
+    static ASCII: Vec<Rc<JsStr>> = (0u8..128)
+        .map(|b| Rc::new(JsStr::new((b as char).to_string())))
+        .collect();
+}
+
 /// The one-character string for `c`. ASCII characters share cached values, so indexing a string does not allocate.
 pub fn char_value(c: char) -> Value {
-    thread_local! {
-        static ASCII: Vec<Rc<JsStr>> = (0u8..128)
-            .map(|b| Rc::new(JsStr::new((b as char).to_string())))
-            .collect();
-    }
     if c.is_ascii() {
         ASCII.with(|table| Value::Str(Rc::clone(&table[c as usize])))
     } else {
         Value::str(c.encode_utf8(&mut [0; 4]))
     }
+}
+
+/// The address of the table that `char_value` takes ASCII characters from. Native code reads the `Rc` of a character
+/// from it, so the table must not move: it lives as long as the thread.
+pub(crate) fn ascii_table() -> usize {
+    ASCII.with(|table| table.as_ptr() as usize)
 }
 
 #[derive(Clone)]
@@ -859,6 +867,37 @@ fn probe_arr_layout() -> Option<ArrLayout> {
         buf: word_of(ptr)?,
         len: word_of(len)?,
         cap: word_of(cap)?,
+    })
+}
+
+/// Where native code finds the parts of a string inside the allocation of its `Rc`: the char count, the ASCII flag and
+/// the pointer to the bytes of the text (see `str_layout`).
+#[derive(Clone, Copy)]
+pub(crate) struct StrLayout {
+    pub chars: i32,
+    pub ascii: i32,
+    pub bytes: i32,
+}
+
+/// The layout of a string for native code, when native code can rely on it. It is found once, as `arr_layout` is.
+pub(crate) fn str_layout() -> Option<StrLayout> {
+    static LAYOUT: std::sync::OnceLock<Option<StrLayout>> = std::sync::OnceLock::new();
+    *LAYOUT.get_or_init(probe_str_layout)
+}
+
+fn probe_str_layout() -> Option<StrLayout> {
+    use std::mem::{offset_of, size_of};
+    if !crate::jit::rc_layout_ok() || size_of::<String>() != 3 * size_of::<usize>() {
+        return None;
+    }
+    let s = JsStr::new(String::from("abc"));
+    // SAFETY: the `String` is the three words that the size check above confirms, and each is read as a `usize`.
+    let words: [usize; 3] = unsafe { std::mem::transmute_copy(&s.text) };
+    let word = words.iter().position(|&w| w == s.text.as_ptr() as usize)?;
+    Some(StrLayout {
+        chars: crate::jit::RC_VALUE + offset_of!(JsStr, chars) as i32,
+        ascii: crate::jit::RC_VALUE + offset_of!(JsStr, ascii) as i32,
+        bytes: crate::jit::RC_VALUE + (offset_of!(JsStr, text) + word * size_of::<usize>()) as i32,
     })
 }
 

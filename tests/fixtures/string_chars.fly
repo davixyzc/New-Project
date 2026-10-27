@@ -1,0 +1,59 @@
+// Characters and lengths of strings held in locals, and their comparisons. ASCII characters are read and compared in
+// place; wide characters, longer strings, the same string and other types take the general path.
+const ascii = "abcde fghij";
+const wide = "héllo wörld";
+const empty = "";
+
+let n = 0;
+for (let k = 0; k < 2000; k++) {
+  for (let i = 0; i < ascii.length; i++) {
+    if (ascii[i] === "e") n++;
+    if (ascii[i] !== "e") n += 0;
+  }
+}
+console.log("e count", n, ascii.length, wide.length, empty.length);
+
+const flags = [];
+for (let i = 0; i < ascii.length; i++) flags.push(ascii[i] === "f");
+console.log(flags.join(","));
+
+let text = "";
+for (let i = -2; i <= 12; i++) {
+  const a = ascii[i];
+  const w = wide[i];
+  text += (a === undefined ? "-" : a) + (w === undefined ? "-" : w) + " ";
+}
+console.log(text);
+
+const probes = [ascii[1.5], ascii[NaN], ascii[Infinity], empty[0], wide[1] === "é", "é" === wide[1]];
+console.log(String(probes[0]), String(probes[1]), String(probes[2]), String(probes[3]), probes[4], probes[5]);
+
+const same = ascii[0] === ascii[0];
+const diff = ascii[0] === ascii[1];
+const literal = ascii[4] === "e";
+const longer = "ab" === "ab";
+const withEmpty = ascii[0] === "";
+const selfEq = ascii === ascii;
+const notNum = ascii[0] === 5;
+const notUndef = ascii[99] === undefined;
+const neVal = ascii[4] !== "e";
+console.log(same, diff, literal, longer, withEmpty, selfEq, notNum, notUndef, neVal);
+
+const arr = [1, 2, 3];
+const obj = { length: 7 };
+let num = 5;
+console.log(ascii.length, arr.length, obj.length, wide.length, String(num.length), empty.length);
+
+const kept = [];
+for (let i = 0; i < ascii.length; i++) kept.push(ascii[i]);
+let rebuilt = "";
+for (let i = 0; i < kept.length; i++) if (kept[i] === "e" || kept[i] === " ") rebuilt += kept[i];
+console.log(kept.join(""), rebuilt, kept.length);
+
+let s = "aaaa";
+let seen = "";
+for (let i = 0; i < 4; i++) {
+  s = i % 2 === 0 ? "bcd" : "e";
+  seen += s[0] === "e" ? "E" : "-";
+}
+console.log(seen);

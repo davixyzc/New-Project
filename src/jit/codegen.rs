@@ -20,8 +20,8 @@ use super::types::{number_slots, Numbers};
 use super::x64::*;
 use crate::bytecode::{Op, Proto};
 use crate::value::{
-    arr_layout, cell_value_offset, entry_layout, prop_layout, ArrLayout, EntryLayout, PropHint,
-    PropLayout, Value,
+    arr_layout, ascii_table, cell_value_offset, entry_layout, prop_layout, str_layout, ArrLayout,
+    EntryLayout, PropHint, PropLayout, StrLayout, Value,
 };
 use crate::vm::{globals_slots_offset, MAX_ARRAY_GROW};
 
@@ -761,7 +761,8 @@ impl<'a> Gen<'a> {
     /// are and 0 when not. A reference that either holds is released on the way. A string, and a last reference, take
     /// `slow`, before anything has changed, so that the instruction runs in full.
     fn strict_eq_flag(&mut self, x: Mem, y: Mem, slow: Label) {
-        let (same, numbers, bools, equal, unequal, done) = (
+        let (same, numbers, strs, bools, equal, unequal, done) = (
+            self.a.label(),
             self.a.label(),
             self.a.label(),
             self.a.label(),
@@ -782,9 +783,10 @@ impl<'a> Gen<'a> {
         self.a.bind(same);
         self.a.cmp64_imm8(RAX, TAG_NUM);
         self.a.jcc(CC_E, numbers);
-        // Two strings are compared by their contents in the instruction's helper.
+        // Two strings that are one ASCII character each are compared here. Other strings are compared by their contents
+        // in the instruction's helper.
         self.a.cmp64_imm8(RAX, TAG_STR);
-        self.a.jcc(CC_E, slow);
+        self.a.jcc(CC_E, strs);
         self.a.cmp64_imm8(RAX, TAG_BOOL);
         self.a.jcc(CC_E, bools);
         self.a.cmp64_imm8(RAX, TAG_NULL);
@@ -814,12 +816,70 @@ impl<'a> Gen<'a> {
         self.a.setcc(CC_NP, RCX);
         self.a.and8(RAX, RCX);
         self.a.jmp(done);
+        self.a.bind(strs);
+        self.char_eq_flag(x, y, slow);
+        self.a.jmp(done);
         self.a.bind(equal);
         self.a.mov_imm32(RAX, 1);
         self.a.jmp(done);
         self.a.bind(unequal);
         self.a.mov_imm32(RAX, 0);
         self.a.bind(done);
+    }
+
+    /// Leaves in RAX whether the strings at `x` and `y`, which the instruction consumes, are equal, when each one is a
+    /// single ASCII character, and releases both. Other strings, and two that share an allocation, jump to `slow`, before
+    /// anything has changed.
+    fn char_eq_flag(&mut self, x: Mem, y: Mem, slow: Label) {
+        let Some(layout) = str_layout() else {
+            self.a.jmp(slow);
+            return;
+        };
+        self.check_release(x, slow);
+        self.check_release(y, slow);
+        self.a.mov_load(RCX, x.at(8));
+        self.a.mov_load(RDX, y.at(8));
+        self.a.cmp_rr64(RCX, RDX);
+        self.a.jcc(CC_E, slow);
+        for ptr in [RCX, RDX] {
+            self.a.mov_load(
+                RSI,
+                Mem {
+                    base: ptr,
+                    disp: layout.chars,
+                },
+            );
+            self.a.cmp64_imm8(RSI, 1);
+            self.a.jcc(CC_NE, slow);
+            self.a.cmp8_imm(
+                Mem {
+                    base: ptr,
+                    disp: layout.ascii,
+                },
+                0,
+            );
+            self.a.jcc(CC_E, slow);
+        }
+        self.a.mov_load(
+            R8,
+            Mem {
+                base: RCX,
+                disp: layout.bytes,
+            },
+        );
+        self.a.movzx_load8(R8, Mem { base: R8, disp: 0 });
+        self.a.mov_load(
+            R9,
+            Mem {
+                base: RDX,
+                disp: layout.bytes,
+            },
+        );
+        self.a.movzx_load8(R9, Mem { base: R9, disp: 0 });
+        self.a.cmp_rr64(R8, R9);
+        self.a.setcc(CC_E, RAX);
+        self.release_owned(x);
+        self.release_owned(y);
     }
 
     /// Stores the boolean `value` at `dst`, without a register.
@@ -1691,19 +1751,7 @@ impl<'a> Gen<'a> {
     /// anything has changed.
     fn arr_elem(&mut self, arr: Mem, key: Mem, layout: ArrLayout, miss: Label) {
         self.check_tag(arr, TAG_ARR, miss);
-        self.check_tag(key, TAG_NUM, miss);
-        // The number is a whole index when truncating it and converting it back give the same number. NaN fails the
-        // comparison, which sets the parity flag when the operands are unordered.
-        self.a.movsd_load(0, key.at(8));
-        self.a.cvttsd2si(RAX, 0);
-        self.a.cvtsi2sd(1, RAX);
-        self.a.ucomisd(0, 1);
-        self.a.jcc(CC_NE, miss);
-        self.a.jcc(CC_P, miss);
-        self.a.movsxd(RAX, RAX);
-        // A negative index is huge as an unsigned number, so the bounds below refuse it too.
-        self.a.cmp64_imm32(RAX, MAX_ARRAY_GROW as i32);
-        self.a.jcc(CC_AE, miss);
+        self.key_index(key, miss);
         self.a.mov_load(RCX, arr.at(8));
         self.a.add64_imm32(RCX, layout.vec);
         self.a.mov_load(
@@ -1724,6 +1772,68 @@ impl<'a> Gen<'a> {
         );
         self.a.shl64_imm(RAX, 4);
         self.a.add64(RDX, RAX);
+    }
+
+    /// Leaves in RAX the whole index that the number at `key` holds, as `vm::index_of` accepts it. A key that is not a
+    /// number, or not a whole index, jumps to `miss`.
+    fn key_index(&mut self, key: Mem, miss: Label) {
+        self.check_tag(key, TAG_NUM, miss);
+        // The number is a whole index when truncating it and converting it back give the same number. NaN fails the
+        // comparison, which sets the parity flag when the operands are unordered.
+        self.a.movsd_load(0, key.at(8));
+        self.a.cvttsd2si(RAX, 0);
+        self.a.cvtsi2sd(1, RAX);
+        self.a.ucomisd(0, 1);
+        self.a.jcc(CC_NE, miss);
+        self.a.jcc(CC_P, miss);
+        self.a.movsxd(RAX, RAX);
+        // A negative index is huge as an unsigned number, so the bound on the length refuses it too.
+        self.a.cmp64_imm32(RAX, MAX_ARRAY_GROW as i32);
+        self.a.jcc(CC_AE, miss);
+    }
+
+    /// Replaces the key at `key` by the character at that index of the string at `s`, when the string is ASCII and the
+    /// index is in range. The character is the shared string of its code (see `char_value`), which the slot takes a
+    /// reference to. Any other operand jumps to `miss`, before anything has changed.
+    fn str_char(&mut self, s: Mem, key: Mem, layout: StrLayout, miss: Label) {
+        self.check_tag(s, TAG_STR, miss);
+        self.key_index(key, miss);
+        self.a.mov_load(RCX, s.at(8));
+        self.a.mov_load(
+            RSI,
+            Mem {
+                base: RCX,
+                disp: layout.chars,
+            },
+        );
+        self.a.cmp_rr64(RAX, RSI);
+        self.a.jcc(CC_AE, miss);
+        // Each byte of an ASCII string is one character, so the index is a byte of the text.
+        self.a.cmp8_imm(
+            Mem {
+                base: RCX,
+                disp: layout.ascii,
+            },
+            0,
+        );
+        self.a.jcc(CC_E, miss);
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: RCX,
+                disp: layout.bytes,
+            },
+        );
+        self.a.add64(RDX, RAX);
+        self.a.movzx_load8(RCX, Mem { base: RDX, disp: 0 });
+        // The table holds one pointer to each shared string, eight bytes apart, in the order of the codes.
+        self.a.shl64_imm(RCX, 3);
+        self.a.mov_imm64(RDX, ascii_table() as u64);
+        self.a.add64(RDX, RCX);
+        self.a.mov_load(RDX, Mem { base: RDX, disp: 0 });
+        self.add_count(RDX, 1);
+        self.a.mov8_imm(key, TAG_STR);
+        self.a.mov_store(key.at(8), RDX);
     }
 
     /// Leaves the length of the array at `arr` as a number in XMM1 (and in RSI as an integer). Anything that is not an
@@ -2512,6 +2622,24 @@ impl<'a> Gen<'a> {
                         self.a.jmp(done);
                         self.a.bind(native_miss);
                     }
+                    if let Some(layout) = str_layout() {
+                        // The length of a string in a local is its number of characters, which is read here too.
+                        let native_miss = self.a.label();
+                        self.check_tag(src, TAG_STR, native_miss);
+                        self.a.mov_load(RCX, src.at(8));
+                        self.a.mov_load(
+                            RSI,
+                            Mem {
+                                base: RCX,
+                                disp: layout.chars,
+                            },
+                        );
+                        self.a.cvtsi2sd64(1, RSI);
+                        self.a.mov8_imm(dst, TAG_NUM);
+                        self.a.movsd_store(dst.at(8), 1);
+                        self.a.jmp(done);
+                        self.a.bind(native_miss);
+                    }
                 }
                 if &*self.proto.names[n as usize] == "push" {
                     // The `push` of an array is the built-in, so it is written here, without a lookup.
@@ -2602,6 +2730,13 @@ impl<'a> Gen<'a> {
                     self.load_clone(Mem { base: RDX, disp: 0 });
                     self.a.mov_store(key, RAX);
                     self.a.mov_store(key.at(8), RCX);
+                    self.a.jmp(done);
+                    self.a.bind(native_miss);
+                }
+                if let Some(layout) = str_layout() {
+                    // A character of a string in a local is read in place, into the key's slot.
+                    let native_miss = self.a.label();
+                    self.str_char(obj, key, layout, native_miss);
                     self.a.jmp(done);
                     self.a.bind(native_miss);
                 }
@@ -2860,7 +2995,8 @@ impl<'a> Gen<'a> {
                 // their pointer. Two strings compare by their contents in the helper, which this path calls for them.
                 let (x, y) = (self.temp(d - 2), self.temp(d - 1));
                 let negate = matches!(op, Op::StrictNe);
-                let (same, numbers, bools, equal, done) = (
+                let (same, numbers, strs, bools, equal, done) = (
+                    self.a.label(),
                     self.a.label(),
                     self.a.label(),
                     self.a.label(),
@@ -2884,7 +3020,7 @@ impl<'a> Gen<'a> {
                 self.a.jcc(CC_E, numbers);
                 self.a.cmp64_imm8(RAX, TAG_STR);
                 let eq = rt::strict_eq_into as *const () as usize;
-                self.a.jcc(CC_E, slow);
+                self.a.jcc(CC_E, strs);
                 self.a.cmp64_imm8(RAX, TAG_BOOL);
                 self.a.jcc(CC_E, bools);
                 self.a.cmp64_imm8(RAX, TAG_NULL);
@@ -2916,6 +3052,10 @@ impl<'a> Gen<'a> {
                 self.a.setcc(CC_E, RAX);
                 self.a.setcc(CC_NP, RCX);
                 self.a.and8(RAX, RCX);
+                self.store_result(x, negate);
+                self.a.jmp(done);
+                self.a.bind(strs);
+                self.char_eq_flag(x, y, slow);
                 self.store_result(x, negate);
                 self.a.jmp(done);
                 self.a.bind(equal);
