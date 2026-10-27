@@ -38,10 +38,41 @@ fn stringify(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> 
         _ => String::new(),
     };
     let mut out = String::new();
-    match write_value(&arg(args, 0), &indent, 0, &mut out) {
+    match write_value(
+        &arg(args, 0),
+        &indent,
+        0,
+        &mut out,
+        &mut QuotedKeys::default(),
+    ) {
         Ok(true) => Ok(Value::from_string(out)),
         Ok(false) => Ok(Value::Undef),
         Err(msg) => Err(vm.make_error("TypeError", msg)),
+    }
+}
+
+/// The quoted form of the keys that one write has met. Objects of one shape repeat their keys, and a key is shared by
+/// its allocation, so a key is quoted once and its text is copied for the objects that come after it.
+#[derive(Default)]
+struct QuotedKeys {
+    entries: Vec<(Rc<str>, String)>,
+}
+
+/// The most keys a write keeps quoted. A write that meets more keys quotes the rest each time.
+const MAX_QUOTED_KEYS: usize = 32;
+
+impl QuotedKeys {
+    /// Appends the quoted form of `key` to `out`.
+    fn push(&mut self, key: &Rc<str>, out: &mut String) {
+        if let Some((_, quoted)) = self.entries.iter().find(|(k, _)| Rc::ptr_eq(k, key)) {
+            push_small(out, quoted);
+            return;
+        }
+        let start = out.len();
+        quote(key, out);
+        if self.entries.len() < MAX_QUOTED_KEYS {
+            self.entries.push((key.clone(), out[start..].to_string()));
+        }
     }
 }
 
@@ -51,6 +82,7 @@ fn write_value(
     indent: &str,
     depth: usize,
     out: &mut String,
+    keys: &mut QuotedKeys,
 ) -> Result<bool, &'static str> {
     if depth > MAX_DEPTH {
         return Err("Converting circular structure to JSON");
@@ -75,7 +107,7 @@ fn write_value(
                     out.push(',');
                 }
                 newline(indent, depth + 1, out);
-                if !write_value(item, indent, depth + 1, out)? {
+                if !write_value(item, indent, depth + 1, out, keys)? {
                     out.push_str("null");
                 }
             }
@@ -97,11 +129,12 @@ fn write_value(
                         depth,
                         out,
                         &mut written,
+                        keys,
                     )?;
                 }
             } else {
                 for (key, val) in props.iter() {
-                    write_member(key, val, indent, depth, out, &mut written)?;
+                    write_member(key, val, indent, depth, out, &mut written, keys)?;
                 }
             }
             // An object with nothing to show is written as `{}`, with no line break inside.
@@ -124,12 +157,13 @@ fn shows(v: &Value) -> bool {
 
 /// Writes the property `key: val`, unless JSON leaves its value out. `written` tells whether a property came before it.
 fn write_member(
-    key: &str,
+    key: &Rc<str>,
     val: &Value,
     indent: &str,
     depth: usize,
     out: &mut String,
     written: &mut bool,
+    keys: &mut QuotedKeys,
 ) -> Result<(), &'static str> {
     if !shows(val) {
         return Ok(());
@@ -139,13 +173,13 @@ fn write_member(
     }
     *written = true;
     newline(indent, depth + 1, out);
-    quote(key, out);
+    keys.push(key, out);
     if indent.is_empty() {
         out.push(':');
     } else {
         push_small(out, ": ");
     }
-    write_value(val, indent, depth + 1, out)?;
+    write_value(val, indent, depth + 1, out, keys)?;
     Ok(())
 }
 
