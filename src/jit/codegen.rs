@@ -2547,6 +2547,27 @@ impl<'a> Gen<'a> {
                         self.a.jmp(done);
                         self.a.bind(native_miss);
                     }
+                    if let Some(layout) = str_layout() {
+                        // The length of a string is read here too, and the string, which is replaced, is released. A
+                        // string whose reference is the last one takes the helper, which frees it.
+                        let native_miss = self.a.label();
+                        self.check_tag(top, TAG_STR, lookup);
+                        self.check_release(top, native_miss);
+                        self.a.mov_load(RCX, top.at(8));
+                        self.a.mov_load(
+                            RSI,
+                            Mem {
+                                base: RCX,
+                                disp: layout.chars,
+                            },
+                        );
+                        self.release_owned(top);
+                        self.a.cvtsi2sd64(1, RSI);
+                        self.a.mov8_imm(top, TAG_NUM);
+                        self.a.movsd_store(top.at(8), 1);
+                        self.a.jmp(done);
+                        self.a.bind(native_miss);
+                    }
                     // The length of a string is read here, in place. Any other value takes the lookup.
                     self.check_tag(top, TAG_STR, lookup);
                     self.a.lea(RDI, top);

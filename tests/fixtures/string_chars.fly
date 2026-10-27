@@ -57,3 +57,7 @@ for (let i = 0; i < 4; i++) {
   seen += s[0] === "e" ? "E" : "-";
 }
 console.log(seen);
+
+// The length of a string that is a temporary: shared with a constant or with an array, or fresh, so that the temporary
+// holds the last reference.
+console.log((ascii + "!").length, (wide + wide).length, kept[2].length, "xyz".length, (1 + ascii).length, (ascii + "").length);
