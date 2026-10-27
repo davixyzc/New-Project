@@ -25,7 +25,9 @@ use super::types::Numbers;
 use super::x64::*;
 use super::Batch;
 use crate::bytecode::{Op, Proto};
-use crate::value::{arr_layout, cell_value_offset, entry_layout, prop_layout, PropHint, Value};
+use crate::value::{
+    arr_layout, cell_value_offset, entry_layout, epoch_address, prop_layout, PropHint, Value,
+};
 use crate::vm::MAX_ARRAY_GROW;
 use std::mem::offset_of;
 
@@ -45,7 +47,7 @@ pub(super) const MAX_ARGS: usize = 6;
 /// The bytes of a loop region's frame, below the saved `r13`: room to save the xmm registers a call
 /// clobbers, the tag cells, the row caches and the property caches, and a size that keeps rsp 16-byte
 /// aligned at those calls.
-const FRAME: i32 = 248;
+const FRAME: i32 = 264;
 /// Where the tag of an element operand is kept, one byte per depth. `call_mod` saves its registers below this.
 const TAG_CELLS: i32 = 136;
 /// Where the row caches of a loop start, above the tag cells. Each array with a cache takes a key and a row, 8 bytes each
@@ -53,8 +55,8 @@ const TAG_CELLS: i32 = 136;
 const ROW_CACHE_BASE: i32 = 144;
 /// The most arrays that a loop keeps a row cache for.
 const MAX_ROW_CACHES: usize = 2;
-/// Where the property caches of a loop start, above the row caches. Each one takes the address of a property's value,
-/// 8 bytes (see `prop_address`).
+/// Where the property caches of a loop start, above the row caches. Each one takes the address of a property's value, 8
+/// bytes (see `prop_address`). The count of structural changes that they were last checked at follows them.
 const PROP_CACHE_BASE: i32 = ROW_CACHE_BASE + 16 * MAX_ROW_CACHES as i32;
 /// The most properties that a loop keeps the address of.
 const MAX_PROP_CACHES: usize = 8;
@@ -531,14 +533,8 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
     let mut prop_caches: Vec<(u32, u32)> = Vec::new();
     for ip in header..=last {
         let stack = &marks[ip - header];
-        // The read of a method's callee is no read of the property: the call looks the callee up (see `call_method`).
-        let callee = marks.get(ip + 1 - header).and_then(|next| next.last());
         let keyed = match code[ip] {
-            Op::GetLocalProp(s, n)
-                if objects[s as usize] && !matches!(callee, Some(Mark::Method(..))) =>
-            {
-                Some((s, n))
-            }
+            Op::GetLocalProp(s, n) if objects[s as usize] => Some((s, n)),
             Op::GetProp(n) => match stack.last() {
                 Some(&Mark::View(s)) => Some((s, n)),
                 _ => None,
@@ -1562,11 +1558,20 @@ fn row_cache_mem(j: usize, offset: i32) -> Mem {
     }
 }
 
-/// The frame slot of the address of the property cache `j` of a loop (see `prop_address`).
+/// The frame slot of the address that the property cache `j` of a loop holds (see `prop_address`).
 fn prop_cache_mem(j: usize) -> Mem {
     Mem {
         base: RSP,
         disp: PROP_CACHE_BASE + 8 * j as i32,
+    }
+}
+
+/// The frame slot of the count of structural changes that the property caches of a loop were last checked at (see
+/// `check_structure`).
+fn prop_epoch_mem() -> Mem {
+    Mem {
+        base: RSP,
+        disp: PROP_CACHE_BASE + 8 * MAX_PROP_CACHES as i32,
     }
 }
 
@@ -1712,6 +1717,10 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
     for j in 0..lp.prop_caches.len() {
         e.a.mov_imm64(RAX, 0);
         e.a.mov_store(prop_cache_mem(j), RAX);
+    }
+    if !lp.prop_caches.is_empty() {
+        e.epoch_into(RAX);
+        e.a.mov_store(prop_epoch_mem(), RAX);
     }
     for &(bits, x) in &lp.consts {
         e.a.mov_imm64(RAX, bits);
@@ -2632,8 +2641,7 @@ impl Emitter<'_, '_> {
         };
         let exit = self.side_exit(read as usize, d - 3);
         let obj = local_mem(s);
-        let site = self.prop_site(n);
-        find_prop(&mut *self.a, obj, site, exit);
+        self.prop_address(obj, Some(s), n, exit);
         self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_FUNC);
         self.a.jcc(CC_NE, exit);
         self.a.mov_load(RCX, Mem { base: RDX, disp: 8 });
@@ -2708,8 +2716,10 @@ impl Emitter<'_, '_> {
         // The entry returns 1 when it declined, before it wrote anything. Then the loop leaves at the read.
         self.a.test64(RAX, RAX);
         self.a.jcc(CC_NE, exit);
-        // The entry ran script code, which may add a property to an object or replace a row, so the caches go.
-        self.forget_caches();
+        // The entry ran script code, which may replace a row, so the row caches go. That code may also have changed an
+        // object, which the property caches notice from the count of structural changes.
+        self.forget_row_caches();
+        self.check_structure();
     }
 
     /// The xmm registers that hold a live value below `depth` operands: the locals and constants that the loop keeps in
@@ -3249,7 +3259,7 @@ impl Emitter<'_, '_> {
     /// Leaves in RDX the address of property `name` of the object at `obj`, which is the object local `local` when it is
     /// one. A cached address is the one that the lookup found before: the loop adds no property to an object, and the
     /// values of an object stay in place until one is added, so the address holds while the local keeps its object (see
-    /// `clear_prop_caches`).
+    /// `clear_prop_caches`). A call can change an object, which `check_structure` notices after the call.
     fn prop_address(&mut self, obj: Mem, local: Option<u32>, name: u32, exit: Label) {
         let site = self.prop_site(name);
         match local.and_then(|s| self.prop_cache_slot(s, name)) {
@@ -3266,16 +3276,37 @@ impl Emitter<'_, '_> {
         }
     }
 
-    /// Forgets every row cache and property cache. Script code may have replaced a row, or added a property to an object,
-    /// which moves its values, so the caches of the loop are wrong after it (see `call_method`).
-    fn forget_caches(&mut self) {
+    /// Loads the count of structural changes into `dst` (see `epoch_address`).
+    fn epoch_into(&mut self, dst: u8) {
+        self.a.mov_imm64(dst, epoch_address());
+        self.a.mov_load(dst, Mem { base: dst, disp: 0 });
+    }
+
+    /// Drops the property caches when the count of structural changes has moved since they were last checked. Script code
+    /// that a call runs is the only code in a loop that can change an object, so the count is checked after each call.
+    fn check_structure(&mut self) {
+        if self.lp.prop_caches.is_empty() {
+            return;
+        }
+        let done = self.a.label();
+        self.epoch_into(RAX);
+        self.a.mov_load(RSI, prop_epoch_mem());
+        self.a.cmp_rr64(RAX, RSI);
+        self.a.jcc(CC_E, done);
+        self.a.mov_store(prop_epoch_mem(), RAX);
+        self.a.mov_imm64(RAX, 0);
+        for j in 0..self.lp.prop_caches.len() {
+            self.a.mov_store(prop_cache_mem(j), RAX);
+        }
+        self.a.bind(done);
+    }
+
+    /// Forgets every row cache. Script code may have replaced a row of an array, so the row caches of the loop are wrong
+    /// after it (see `call_method`). The property caches check the count of structural changes instead.
+    fn forget_row_caches(&mut self) {
         for j in 0..self.lp.row_caches.len() {
             self.a.mov_imm64(RAX, NO_KEY);
             self.a.mov_store(row_cache_mem(j, 0), RAX);
-        }
-        for j in 0..self.lp.prop_caches.len() {
-            self.a.mov_imm64(RAX, 0);
-            self.a.mov_store(prop_cache_mem(j), RAX);
         }
     }
 

@@ -10,6 +10,21 @@ use crate::bytecode::Proto;
 use crate::collection::Collection;
 use crate::vm::Vm;
 
+/// The number of changes that move the values of an object, change its shape, or free an object. A cache of the address of
+/// a property's value, which native code keeps, holds while this count stays the same (see `epoch_address`).
+static STRUCT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts one change to the values or the shape of an object, or the freeing of one.
+fn bump_epoch() {
+    use std::sync::atomic::Ordering::Relaxed;
+    STRUCT_EPOCH.store(STRUCT_EPOCH.load(Relaxed).wrapping_add(1), Relaxed);
+}
+
+/// The address of the count of structural changes, which native code reads to check the caches it keeps.
+pub fn epoch_address() -> u64 {
+    &STRUCT_EPOCH as *const std::sync::atomic::AtomicU64 as u64
+}
+
 /// The own properties of an object, in the order they were added. Objects that add the same keys in the same order share
 /// a `Shape`, which holds those keys, so a site that reads a property checks the shape of the object instead of the key
 /// (see `PropHint`), and an object keeps only its values. An object with more keys than a shape holds, or one that loses
@@ -133,6 +148,12 @@ impl Shape {
         let shape = leak_shape(keys);
         self.next.borrow_mut().push(shape);
         shape
+    }
+}
+
+impl Drop for Props {
+    fn drop(&mut self) {
+        bump_epoch();
     }
 }
 
@@ -272,6 +293,7 @@ impl Props {
         };
         self.make_dict();
         self.id = next_dict_id();
+        bump_epoch();
         self.values.remove(i);
         if let Some(dict) = &mut self.dict {
             dict.keys.remove(i);
@@ -293,6 +315,7 @@ impl Props {
     /// `push`, which records in `hint` the shape transition that it makes, so that a site which adds the same key to
     /// objects of the same shape can make the same transition without looking it up.
     fn push_hinted(&mut self, key: Rc<str>, v: Value, hint: Option<&PropHint>) {
+        bump_epoch();
         if self.dict.is_none() && self.shape.keys.len() < SHAPE_KEYS {
             let from = self.id;
             self.shape = self.shape.with_key(&key);
@@ -314,6 +337,7 @@ impl Props {
     /// Turns the object into dictionary mode, which keeps its own keys and their index.
     fn make_dict(&mut self) {
         if self.dict.is_none() {
+            bump_epoch();
             let keys = self.shape.keys.clone();
             let index = keys
                 .iter()
@@ -499,10 +523,8 @@ impl Value {
 
     /// A new Map or Set, which holds the entries `c`.
     pub fn collection(c: Collection) -> Value {
-        let props = Props {
-            collection: Some(Box::new(c)),
-            ..Props::default()
-        };
+        let mut props = Props::default();
+        props.collection = Some(Box::new(c));
         Value::Obj(Rc::new(RefCell::new(props)))
     }
 
@@ -654,10 +676,9 @@ pub fn find_setter(obj: &ObjRef, name: &str) -> Option<Option<Value>> {
 
 /// A new object with no own properties, whose prototype is `proto`.
 pub fn new_obj(proto: Option<ObjRef>) -> ObjRef {
-    Rc::new(RefCell::new(Props {
-        proto,
-        ..Props::default()
-    }))
+    let mut props = Props::default();
+    props.proto = proto;
+    Rc::new(RefCell::new(props))
 }
 
 /// The prototypes of the built-in errors, by kind. Each kind inherits from the prototype of `Error`, which is first.
