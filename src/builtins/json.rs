@@ -159,11 +159,24 @@ fn newline(indent: &str, depth: usize, out: &mut String) {
     }
 }
 
+/// The bytes that a JSON string writes escaped: the control characters, the quote and the backslash.
+const ESCAPED: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut b = 0usize;
+    while b < 0x20 {
+        table[b] = true;
+        b += 1;
+    }
+    table[b'"' as usize] = true;
+    table[b'\\' as usize] = true;
+    table
+};
+
 fn quote(s: &str, out: &mut String) {
     out.push('"');
     // Most strings need no escape, so they are copied whole. Every character that needs one is ASCII, so the bytes
     // are enough to check.
-    if !s.bytes().any(|b| b < b' ' || b == b'"' || b == b'\\') {
+    if !s.bytes().any(|b| ESCAPED[usize::from(b)]) {
         push_small(out, s);
     } else {
         for c in s.chars() {
@@ -363,7 +376,22 @@ impl<'a> Parser<'a> {
     fn string(&mut self) -> Result<Cow<'a, str>, String> {
         let text = self.text;
         self.pos += 1; // opening quote
-                       // The text from `run` on has not been copied into `out` yet. `out` is only made once an escape is read.
+                       // A string without an escape is a slice of the text, up to its closing quote, which one scan finds. A string
+                       // with an escape, or one that is not closed, takes the loop below from the same point.
+        let bytes = text.as_bytes();
+        let mut end = self.pos;
+        while let Some(&b) = bytes.get(end) {
+            if b == b'"' {
+                let plain = &text[self.pos..end];
+                self.pos = end + 1;
+                return Ok(Cow::Borrowed(plain));
+            }
+            if b == b'\\' {
+                break;
+            }
+            end += 1;
+        }
+        // The text from `run` on has not been copied into `out` yet. `out` is only made once an escape is read.
         let mut run = self.pos;
         let mut out: Option<String> = None;
         loop {
