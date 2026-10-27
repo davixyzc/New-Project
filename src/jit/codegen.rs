@@ -34,7 +34,7 @@ const TAG_STR: u8 = 4;
 pub(super) const TAG_ARR: u8 = 5;
 const TAG_CELL: u8 = 9;
 pub(super) const TAG_OBJ: u8 = 6;
-const TAG_FUNC: u8 = 7;
+pub(super) const TAG_FUNC: u8 = 7;
 pub(super) const TAG_NATIVE: u8 = 8;
 /// Bit `n` is set when tag `n` owns a reference (see `Value::owns_ref`).
 pub(super) const OWNING: u32 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 9);

@@ -60,3 +60,22 @@ console.log(p.x);
 const slot = { v: "s", set(k) { this.v = k; } };
 for (let i = 0; i < 3; i++) slot.set(i);
 console.log(slot.v);
+
+// Numbers that stay in registers across a call, which clobbers them all: the loop's sums and its counter survive it.
+const acc = { n: 0, add(k) { this.n += k; } };
+let live = 0.25;
+for (let i = 0; i < 50; i++) {
+  const x = i * 0.5;
+  acc.add(x);
+  live += x * 0.125;
+}
+console.log(acc.n, live);
+
+// The same, when the call declines: the registers are restored before the interpreter takes over.
+const mixed = { n: "m", add(k) { this.n += k; } };
+let sum = 0.5;
+for (let i = 0; i < 3; i++) {
+  mixed.add(i * 0.5);
+  sum += 1.25;
+}
+console.log(mixed.n, sum);

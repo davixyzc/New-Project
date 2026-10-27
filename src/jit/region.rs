@@ -18,7 +18,7 @@
 
 use super::codegen::{
     emit_mod_const, find_global, find_prop, int_divisor, local_uses, magic, successors, PropSite,
-    OWNING, TAG_ARR, TAG_BOOL, TAG_NATIVE, TAG_NUM, TAG_OBJ,
+    OWNING, TAG_ARR, TAG_BOOL, TAG_FUNC, TAG_NATIVE, TAG_NUM, TAG_OBJ,
 };
 use super::rt;
 use super::types::Numbers;
@@ -166,6 +166,9 @@ enum Mark {
     /// The `this` of a method, which a function region reads in place from a copy in its frame (see `emit_function`).
     /// Only a property read or write takes it, and it has no register or slot to write back.
     Receiver,
+    /// The property `name` of the object in local `s`, which a call takes as its callee (see `method_read`). It has no
+    /// register or slot: the call looks the property up, and a side exit resumes at the read, at instruction `read`.
+    Method(u32, u32, u32),
 }
 
 /// Plans a loop region for the loop whose back jumps go to `header`. `None` if the loop has an
@@ -918,9 +921,24 @@ fn push_base(proto: &Proto, op: Op) -> Option<u32> {
     }
 }
 
-/// Whether a kind is a `push` or its receiver, which only the call of the `push` takes (see `step`).
+/// Whether a kind is a `push` or its receiver, which only the call of the `push` takes (see `step`), or a method, which
+/// only its call takes too.
 fn is_receiver(m: &Mark) -> bool {
-    matches!(m, Mark::Push(_) | Mark::Array(_))
+    matches!(m, Mark::Push(_) | Mark::Array(_) | Mark::Method(..))
+}
+
+/// Whether the read at `ip` is the callee of a method call: a property of an object local, which the next instruction
+/// reads as the receiver, as in `local.name(...)`. The call looks the property up (see `Mark::Method`).
+fn method_read(proto: &Proto, objects: &[bool], ip: usize, op: Op) -> bool {
+    match op {
+        Op::GetLocalProp(s, n) => {
+            objects[s as usize]
+                && !is_push(proto, n)
+                && !is_length(proto, n)
+                && proto.code.get(ip + 1) == Some(&Op::GetLocal(s))
+        }
+        _ => false,
+    }
 }
 
 /// Pops `n` operand kinds from the stack of kinds, and returns them from the top down.
@@ -999,6 +1017,9 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
             }
             state.push(Mark::Num);
         }
+        Op::GetLocalProp(s, n) if method_read(proto, objects, ip, op) => {
+            state.push(Mark::Method(s, n, ip as u32))
+        }
         Op::GetLocalProp(s, n) if objects[s as usize] && !is_push(proto, n) => {
             state.push(Mark::Num)
         }
@@ -1040,6 +1061,24 @@ fn step(proto: &Proto, ip: usize, op: Op, state: &mut Vec<Mark>, kinds: &Kinds) 
                 return false;
             }
             state.push(Mark::Num);
+        }
+        // A method call on the object that the callee was read from. The call looks the callee up, and a side exit
+        // resumes at the read, so no operand below the callee may need a side exit.
+        Op::Call(1)
+            if matches!(
+                state.as_slice(),
+                [.., Mark::Method(s, _, _), Mark::View(v), Mark::Num] if s == v
+            ) =>
+        {
+            let n = state.len();
+            if state[..n - 3]
+                .iter()
+                .any(|m| is_receiver(m) || *m == Mark::Math)
+            {
+                return false;
+            }
+            state.truncate(n - 3);
+            state.push(Mark::This);
         }
         // `sqrt` of a number, called on an object: the callee is the built-in, the object is released, and the result is a
         // number.
@@ -1596,56 +1635,73 @@ pub(super) fn emit_function(
     let nlocals = proto.nlocals as i32;
     let frame = (8 * (nlocals + 8) + 104 + 15) / 16 * 16;
     let (wrapper, body, overflow) = (a.label(), a.label(), a.label());
-
-    // The wrapper and the batch entries share one frame (see `enter_frame`). The body keeps to the
-    // other registers, and restores rbp itself.
-    a.bind(wrapper);
-    enter_frame(a);
-    for j in 0..function.nparams {
-        a.movsd_load(
-            j as u8,
-            Mem {
-                base: RDI,
-                disp: 8 * j as i32,
-            },
-        );
-    }
-    a.call_label(body);
-    // A method's body gives its status in rax, since it can decline. Any other function returns 0 there.
-    if !function.receiver {
-        a.mov_imm32(RAX, 0);
-    }
-    leave_frame(a);
-    // A body that finds the stack too low returns through the entry that called it, with its frame
-    // still in place, so the entry returns 1.
-    a.bind(overflow);
-    a.lea(
-        RSP,
-        Mem {
-            base: R13,
-            disp: STACK_BUDGET,
-        },
-    );
-    a.mov_imm32(RAX, 1);
-    unwind_frame(a);
-
-    a.bind(body);
-    a.cmp_rr64(RSP, R13);
-    a.jcc(CC_B, overflow);
-    a.push_reg(RBP);
-    a.mov_rr(RBP, RSP);
-    a.sub_rsp32(frame);
     if function.receiver {
-        // The receiver comes in rsi. Its value is copied into the frame, which takes no reference of its own: the caller
-        // keeps the receiver alive for the call.
+        // A method needs no wrapper. Nothing a method calls can call it back, so it needs neither the stack budget nor the
+        // registers that a wrapper saves: its body saves rbp, and nothing else. The caller passes the arguments in rdi,
+        // and the receiver in rsi.
+        a.bind(wrapper);
+        a.push_reg(RBP);
+        a.mov_rr(RBP, RSP);
+        a.sub_rsp32(frame);
+        // The receiver's value is copied into the frame, which takes no reference of its own: the caller keeps the
+        // receiver alive for the call.
         let receiver = receiver_mem(nlocals);
         a.mov_load(RAX, Mem { base: RSI, disp: 0 });
         a.mov_store(receiver, RAX);
         a.mov_load(RAX, Mem { base: RSI, disp: 8 });
         a.mov_store(receiver.at(8), RAX);
-    }
-    for i in 0..function.nparams {
-        a.movsd_store(frame_local(i), i as u8);
+        for j in 0..function.nparams {
+            a.movsd_load(
+                j as u8,
+                Mem {
+                    base: RDI,
+                    disp: 8 * j as i32,
+                },
+            );
+            a.movsd_store(frame_local(j), j as u8);
+        }
+    } else {
+        // The wrapper and the batch entries share one frame (see `enter_frame`). The body keeps to the
+        // other registers, and restores rbp itself.
+        a.bind(wrapper);
+        enter_frame(a);
+        for j in 0..function.nparams {
+            a.movsd_load(
+                j as u8,
+                Mem {
+                    base: RDI,
+                    disp: 8 * j as i32,
+                },
+            );
+        }
+        a.call_label(body);
+        // A method's body gives its status in rax, since it can decline. Any other function returns 0 there.
+        if !function.receiver {
+            a.mov_imm32(RAX, 0);
+        }
+        leave_frame(a);
+        // A body that finds the stack too low returns through the entry that called it, with its frame
+        // still in place, so the entry returns 1.
+        a.bind(overflow);
+        a.lea(
+            RSP,
+            Mem {
+                base: R13,
+                disp: STACK_BUDGET,
+            },
+        );
+        a.mov_imm32(RAX, 1);
+        unwind_frame(a);
+
+        a.bind(body);
+        a.cmp_rr64(RSP, R13);
+        a.jcc(CC_B, overflow);
+        a.push_reg(RBP);
+        a.mov_rr(RBP, RSP);
+        a.sub_rsp32(frame);
+        for i in 0..function.nparams {
+            a.movsd_store(frame_local(i), i as u8);
+        }
     }
     let at: Vec<Label> = (lp.header..=lp.last).map(|_| a.label()).collect();
     let not_entered = a.label();
@@ -1658,7 +1714,7 @@ pub(super) fn emit_function(
         exits: Vec::new(),
         not_entered,
         slow: Vec::new(),
-        body: Some(body),
+        body: Some(if function.receiver { wrapper } else { body }),
         nlocals,
         sides: Vec::new(),
     };
@@ -2064,6 +2120,8 @@ impl Emitter<'_, '_> {
                 self.copy_value(value, to);
                 self.count_up(to);
             }
+            // The callee of a method is looked up by the call, which takes the receiver from the same local (see `Mark::Method`).
+            Op::GetLocalProp(..) if matches!(self.mark(ip + 1, d), Mark::Method(..)) => {}
             Op::GetLocalProp(s, n) if self.lp.objects.contains(&s) => {
                 self.prop_read(ip, d, self.reg(d), local_mem(s), n);
             }
@@ -2126,10 +2184,125 @@ impl Emitter<'_, '_> {
                 }
                 self.a.sse(SSE_SQRT, self.reg(d - 3), self.reg(d - 1));
             }
+            Op::Call(1) if matches!(self.mark(ip, d - 3), Mark::Method(..)) => {
+                self.call_method(ip, d)
+            }
             Op::Call(_) if self.lp.function.is_none() => self.push_call(ip, d),
             Op::Call(argc) => self.call(d, argc as i32),
             _ => unreachable!("the planners admit only the operations above"),
         }
+    }
+
+    /// The call of a method (see `Mark::Method`). The callee is looked up on the object in the local, which must hold a
+    /// closure whose prototype is a method entry for one argument. The entry takes the argument as a double on the
+    /// native stack, and the receiver's address. The entry clobbers every xmm register, so the live ones are saved
+    /// around the call. A closure of another kind, or a call that the entry declines, leaves the loop at the read of
+    /// the callee, where the generic code makes the call (see `side_exit`).
+    fn call_method(&mut self, ip: usize, d: i32) {
+        let Mark::Method(s, n, read) = self.mark(ip, d - 3) else {
+            unreachable!("the planner admits a call only of a method's callee (see `step`)")
+        };
+        let exit = self.side_exit(read as usize, d - 3);
+        let obj = local_mem(s);
+        let site = self.prop_site(n);
+        find_prop(&mut *self.a, obj, site, exit);
+        self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_FUNC);
+        self.a.jcc(CC_NE, exit);
+        self.a.mov_load(RCX, Mem { base: RDX, disp: 8 });
+        self.a.add64_imm32(RCX, super::RC_VALUE);
+        self.a.mov_load(
+            RDX,
+            Mem {
+                base: RCX,
+                disp: std::mem::offset_of!(crate::value::Closure, proto) as i32,
+            },
+        );
+        self.a.add64_imm32(RDX, super::RC_VALUE);
+        self.a.mov32_load(
+            R9,
+            Mem {
+                base: RDX,
+                disp: std::mem::offset_of!(Proto, method_argc) as i32,
+            },
+        );
+        self.a.cmp64_imm32(R9, 1);
+        self.a.jcc(CC_NE, exit);
+        self.a.mov_load(
+            RAX,
+            Mem {
+                base: RDX,
+                disp: std::mem::offset_of!(Proto, method_entry) as i32,
+            },
+        );
+        self.a.test64(RAX, RAX);
+        self.a.jcc(CC_E, exit);
+        // The live registers are saved in the slots below the argument, and the room keeps the stack aligned.
+        let live = self.live_registers(ip, d - 3);
+        let saved = live.len() as i32;
+        let room = 16 * ((saved + 2) / 2);
+        self.a.sub_rsp32(room);
+        for (k, &x) in live.iter().enumerate() {
+            self.a.movsd_store(
+                Mem {
+                    base: RSP,
+                    disp: 8 * k as i32,
+                },
+                x,
+            );
+        }
+        let arg = self.reg(d - 1);
+        self.a.movsd_store(
+            Mem {
+                base: RSP,
+                disp: 8 * saved,
+            },
+            arg,
+        );
+        self.a.lea(
+            RDI,
+            Mem {
+                base: RSP,
+                disp: 8 * saved,
+            },
+        );
+        self.a.lea(RSI, obj);
+        self.a.call_reg(RAX);
+        for (k, &x) in live.iter().enumerate() {
+            self.a.movsd_load(
+                x,
+                Mem {
+                    base: RSP,
+                    disp: 8 * k as i32,
+                },
+            );
+        }
+        self.a.add_rsp32(room);
+        // The entry returns 1 when it declined, before it wrote anything. Then the loop leaves at the read.
+        self.a.test64(RAX, RAX);
+        self.a.jcc(CC_NE, exit);
+    }
+
+    /// The xmm registers that hold a live value below `depth` operands: the locals and constants that the loop keeps in
+    /// registers, and the operands below `depth` that have one.
+    fn live_registers(&self, ip: usize, depth: i32) -> Vec<u8> {
+        let mut live: Vec<u8> = self
+            .lp
+            .locals
+            .iter()
+            .filter_map(|&(_, home)| match home {
+                Home::Reg(x) => Some(x),
+                Home::Mem(_) => None,
+            })
+            .collect();
+        live.extend(self.lp.consts.iter().map(|&(_, x)| x));
+        for k in 0..depth {
+            if has_register(&self.mark(ip, k)) {
+                live.push(self.reg(k));
+            }
+        }
+        live.sort_unstable();
+        live.dedup();
+        live
     }
 
     /// The probe of a `push` on the array in local `s`: the local must hold an array with room for one more element.
@@ -2383,7 +2556,7 @@ impl Emitter<'_, '_> {
                     self.a.movsd_store(slot.at(8), x);
                     self.a.bind(done);
                 }
-                Mark::Push(_) | Mark::Array(_) => {
+                Mark::Push(_) | Mark::Array(_) | Mark::Method(..) => {
                     unreachable!("a receiver is never on the stack at a side exit (see `step`)")
                 }
                 Mark::View(s) => {
