@@ -231,7 +231,22 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
     let mut resumes = Vec::new();
     let mut entries = vec![header];
     let mut exits = Vec::new();
-    let mut uses = vec![0u32; proto.nlocals as usize];
+    // The loops that enclose each instruction inside the region: a back jump and its target bound one of them. A use
+    // counts sixteen times for each loop around it, since the loop's instructions run once per iteration.
+    let mut nest = vec![0u32; code.len()];
+    for ip in header..=last {
+        if depth[ip] < 0 {
+            continue;
+        }
+        for (t, _) in successors(code[ip], ip, depth[ip]) {
+            if (header..=ip).contains(&t) {
+                for k in t..=ip {
+                    nest[k] += 1;
+                }
+            }
+        }
+    }
+    let mut uses = vec![0u64; proto.nlocals as usize];
     let mut other_writes = vec![false; proto.nlocals as usize];
     let mut mod_uses = vec![0u32; proto.nlocals as usize];
     // The divisor of the first `local % c` on each local, and whether a later one differs or the local is
@@ -241,7 +256,8 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
     let mut decremented = vec![false; proto.nlocals as usize];
     let mut reads = Vec::new();
     let mut deepest = 0;
-    let mut wanted: Vec<u64> = Vec::new();
+    // The constants the region uses, by their bits, with the weight of their uses.
+    let mut wanted: Vec<(u64, u64)> = Vec::new();
     for ip in 0..code.len() {
         let d = depth[ip];
         if d < 0 {
@@ -276,8 +292,10 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         }
         deepest = deepest.max(d + 1);
         if let Some(bits) = constant_of(proto, op) {
-            if !wanted.contains(&bits) {
-                wanted.push(bits);
+            let weight = 16u64.saturating_pow(nest[ip]);
+            match wanted.iter_mut().find(|(b, _)| *b == bits) {
+                Some((_, w)) => *w = w.saturating_add(weight),
+                None => wanted.push((bits, weight)),
             }
         }
         for (next, next_depth) in successors(op, ip, d) {
@@ -290,8 +308,9 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
                 }
             }
         }
+        let weight = 16u64.saturating_pow(nest[ip]);
         for i in local_uses(op) {
-            uses[i as usize] += 1;
+            uses[i as usize] = uses[i as usize].saturating_add(weight);
         }
         match op {
             Op::SetLocal(i) | Op::PopToLocal(i) | Op::AddToLocal(i) => {
@@ -365,17 +384,16 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
             .any(|&(l, h)| l == i && matches!(h, Home::Reg(_)))
     });
     let rem = if int_local.is_some() { rem } else { None };
-    // Constants take registers from the top down, which must not reach the operand registers.
-    let fits = TEMP_BASE as usize + deepest as usize + wanted.len() <= 16;
-    let consts: Vec<(u64, u8)> = if fits {
-        wanted
-            .iter()
-            .enumerate()
-            .map(|(n, &bits)| (bits, (15 - n) as u8))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Constants take registers from the top down, which must not reach the operand registers. The most used ones
+    // take them, and the others load into a scratch register where they are used.
+    let free = 16usize.saturating_sub(TEMP_BASE as usize + deepest as usize);
+    wanted.sort_by_key(|&(_, weight)| std::cmp::Reverse(weight));
+    let consts: Vec<(u64, u8)> = wanted
+        .iter()
+        .take(free)
+        .enumerate()
+        .map(|(n, &(bits, _))| (bits, (15 - n) as u8))
+        .collect();
     // A read is only safe where the analysis knows the local is a number. Elsewhere the entry must
     // check it.
     let mut guards: Vec<u32> = Vec::new();
@@ -2801,13 +2819,11 @@ impl Emitter<'_, '_> {
         // A negative index is huge as an unsigned number, so the bounds below refuse it too.
         self.a.cmp64_imm32(RAX, MAX_ARRAY_GROW as i32);
         self.a.jcc(CC_AE, exit);
-        self.a.mov_rr(RCX, R8);
-        self.a.add64_imm32(RCX, layout.vec);
         self.a.mov_load(
             RSI,
             Mem {
-                base: RCX,
-                disp: layout.len,
+                base: R8,
+                disp: layout.vec + layout.len,
             },
         );
         self.a.cmp_rr64(RAX, RSI);
@@ -2815,8 +2831,8 @@ impl Emitter<'_, '_> {
         self.a.mov_load(
             RDX,
             Mem {
-                base: RCX,
-                disp: layout.buf,
+                base: R8,
+                disp: layout.vec + layout.buf,
             },
         );
         self.a.shl64_imm(RAX, 4);

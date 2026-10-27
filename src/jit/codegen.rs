@@ -501,12 +501,28 @@ pub(super) fn int_divisor(c: f64) -> Option<u32> {
 /// `join` after the code, which is where the result is ready.
 pub(super) fn emit_mod_const(a: &mut Asm, c: u32, src: u8, dst: u8, slow: Label, join: Label) {
     let (m, s) = magic(c);
+    let general = a.label();
     a.cvttsd2si(RAX, src);
     a.cvtsi2sd(0, RAX);
     // The integer converted back must equal x. A NaN compares unordered, which the parity check catches.
     a.ucomisd(0, src);
     a.jcc(CC_NE, slow);
     a.jcc(CC_P, slow);
+    // A positive x is its own dividend, and its remainder is not negative: x - c * ((x * m) >> s), with no sign to take.
+    a.test32(RAX, RAX);
+    a.jcc(CC_LE, general);
+    a.movsxd(RCX, RAX);
+    a.mov_rr(R8, RCX);
+    a.mov_imm64(R10, m);
+    a.imul64(R8, R10);
+    a.shr64_imm(R8, s);
+    a.imul64_imm(R8, R8, c as i32);
+    a.sub64(RCX, R8);
+    a.xorpd(dst, dst);
+    a.cvtsi2sd64(dst, RCX);
+    a.jmp(join);
+    // Any other x: a negative one takes the sign of its remainder, and -0 keeps its sign bit.
+    a.bind(general);
     // rcx = x and r8 = |x|, which is at most 2^31: `neg` sets the sign flag when x is positive, and then
     // cmovs takes x back. r9 = |x| - q * c, where q = (|x| * m) >> s is |x| / c.
     a.movsxd(RCX, RAX);
