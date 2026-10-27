@@ -124,7 +124,8 @@ pub(super) fn find_prop(a: &mut Asm, obj: Mem, site: PropSite, miss: Label) {
     );
     a.cmp_rr64(RAX, RSI);
     a.jcc(CC_NE, miss);
-    // The position that the hint holds must be inside the values.
+    // The position that the hint holds is inside the values without a check. The shape names the keys of the object, and
+    // there is one value for each key (see `Props::push_hinted`), and the hint's position was found in that shape.
     a.mov32_load(
         RAX,
         Mem {
@@ -132,15 +133,6 @@ pub(super) fn find_prop(a: &mut Asm, obj: Mem, site: PropSite, miss: Label) {
             disp: std::mem::offset_of!(PropHint, index) as i32,
         },
     );
-    a.mov_load(
-        RSI,
-        Mem {
-            base: RCX,
-            disp: layout.values + layout.len,
-        },
-    );
-    a.cmp_rr64(RAX, RSI);
-    a.jcc(CC_AE, miss);
     a.mov_load(
         RDX,
         Mem {
