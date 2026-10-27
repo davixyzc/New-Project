@@ -995,6 +995,10 @@ pub fn num_to_string(n: f64) -> String {
         push_int(&mut text, n as i64);
         return text;
     }
+    let mut text = String::new();
+    if push_short_decimal(&mut text, n) {
+        return text;
+    }
     let sign = if n < 0.0 { "-" } else { "" };
     let (digits, point) = shortest_digits(n.abs());
     let k = digits.len() as i32;
@@ -1199,6 +1203,11 @@ pub fn key_order(props: &Props) -> Vec<usize> {
     indices.into_iter().map(|(_, i)| i).chain(names).collect()
 }
 
+/// Whether `key` is an array index, which JavaScript lists before the other keys of an object.
+pub fn is_index_key(key: &str) -> bool {
+    array_index(key).is_some()
+}
+
 /// An array index spelled the way JavaScript spells it: digits with no leading zero, below 2^32 - 1.
 fn array_index(key: &str) -> Option<u32> {
     let bytes = key.as_bytes();
@@ -1242,13 +1251,49 @@ fn append_text(s: &mut String, v: &Value) {
     }
 }
 
-/// Appends the JavaScript text of a finite number. An integer is written without a temporary string.
+/// Appends the JavaScript text of a finite number. An integer, and a number with few digits after the point, are written
+/// without a temporary string.
 pub fn push_number(out: &mut String, n: f64) {
     if n.fract() == 0.0 && n.abs() < 9.0e15 {
         push_int(out, n as i64);
-    } else {
+    } else if !push_short_decimal(out, n) {
         out.push_str(&num_to_string(n));
     }
+}
+
+/// Appends `n` when its shortest text has few digits after the point, and tells whether it did. Such a number is `m / 10^d`
+/// for a whole `m` and a small `d`, and that text reads back as `n` exactly when the division gives `n`, since both
+/// operands are exact. The gap to the next double bounds how close two such texts can be: while `10^-d` is wider than
+/// that gap, at most one text reads back as `n`, and it is the one JavaScript writes.
+fn push_short_decimal(out: &mut String, n: f64) -> bool {
+    let x = n.abs();
+    // Below 1e-6 JavaScript writes an exponent, and from 2^53 on a scaled whole number is no longer exact.
+    if !(1e-6..9.007_199_254_740_992e15).contains(&x) {
+        return false;
+    }
+    let gap = f64::from_bits(x.to_bits() + 1) - x;
+    let mut scale = 1.0_f64;
+    for d in 1..=8u32 {
+        scale *= 10.0;
+        if 1.0 / scale <= gap {
+            break;
+        }
+        let m = (x * scale).round();
+        if m / scale == x {
+            if n < 0.0 {
+                out.push('-');
+            }
+            let unit = 10u64.pow(d);
+            let frac = m as u64 % unit;
+            push_int(out, (m as u64 / unit) as i64);
+            out.push('.');
+            for place in (0..d).rev() {
+                out.push(char::from(b'0' + (frac / 10u64.pow(place) % 10) as u8));
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// The two digits of each number from 00 to 99, so that an integer is written two digits at a time.

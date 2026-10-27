@@ -1,0 +1,36 @@
+// Numbers that are not whole are written the way JavaScript writes them, both by String and inside JSON. Object keys that
+// are array indices come first in JSON, and JSON reads whole numbers of every size back.
+const values = [];
+for (let i = 1; i <= 40; i++) {
+  values.push(i * 1.5, i / 8, i / 40, -i / 16, i * 0.1, i / 3);
+}
+values.push(
+  0.1 + 0.2,
+  1e-6,
+  1.5e-6,
+  9.999e-7,
+  123456.789,
+  1234567.125,
+  0.12345678,
+  1.23456789,
+  4503599627370495.5,
+  1e15 + 0.5,
+  0.000123,
+  2.5e-5,
+  0.5e-5,
+  1 / 1024,
+  3.14159,
+  2.675,
+  1.005,
+  65536.0009765625,
+  -0.5
+);
+
+let out = "";
+for (const v of values) {
+  out += String(v) + " " + JSON.stringify([v]) + "\n";
+}
+console.log(out);
+console.log(JSON.stringify({ b: 1, "2": 2, a: 3, "1": 4 }));
+console.log(JSON.parse("[-0, 0, 1, -1, 123456789012345, 1234567890123456, 1.5, 1e3, -12]").map(String).join(" "));
+console.log(JSON.parse('{"a":1,"a":2,"b":[1,2]}').a);

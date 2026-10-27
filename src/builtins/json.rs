@@ -1,9 +1,10 @@
 //! The `JSON` object: `JSON.stringify` and `JSON.parse`.
 
 use std::borrow::Cow;
+use std::rc::Rc;
 
 use crate::builtins::{arg, table_object};
-use crate::value::{key_order, obj_set, push_number, to_str, NativeDef, Value};
+use crate::value::{is_index_key, key_order, obj_put, push_number, to_str, NativeDef, Value};
 use crate::vm::Vm;
 
 pub static METHODS: &[NativeDef] = &[
@@ -19,6 +20,9 @@ pub static METHODS: &[NativeDef] = &[
 
 /// Nesting depth at which we give up, which also catches cyclic structures.
 const MAX_DEPTH: usize = 512;
+
+/// The most property names that a parse keeps shared, so that they are not copied again (see `Parser::shared_key`).
+const MAX_SHARED_KEYS: usize = 64;
 
 pub fn json_object() -> Value {
     table_object(METHODS)
@@ -77,22 +81,25 @@ fn write_value(
         }
         Value::Obj(o) => {
             let props = o.borrow();
-            let sep = if indent.is_empty() { ":" } else { ": " };
             out.push('{');
             let mut written = false;
-            for i in key_order(&props) {
-                let val = props.value(i);
-                if !shows(val) {
-                    continue;
+            // Index keys come first, in ascending order, so an object that has them is ordered by its positions. Any other
+            // object is written in the order of its properties, which needs no list of positions.
+            if props.iter().any(|(k, _)| is_index_key(k)) {
+                for i in key_order(&props) {
+                    write_member(
+                        props.key(i),
+                        props.value(i),
+                        indent,
+                        depth,
+                        out,
+                        &mut written,
+                    )?;
                 }
-                if written {
-                    out.push(',');
+            } else {
+                for (key, val) in props.iter() {
+                    write_member(key, val, indent, depth, out, &mut written)?;
                 }
-                written = true;
-                newline(indent, depth + 1, out);
-                quote(props.key(i), out);
-                out.push_str(sep);
-                write_value(val, indent, depth + 1, out)?;
             }
             // An object with nothing to show is written as `{}`, with no line break inside.
             if written {
@@ -112,6 +119,34 @@ fn shows(v: &Value) -> bool {
     )
 }
 
+/// Writes the property `key: val`, unless JSON leaves its value out. `written` tells whether a property came before it.
+fn write_member(
+    key: &str,
+    val: &Value,
+    indent: &str,
+    depth: usize,
+    out: &mut String,
+    written: &mut bool,
+) -> Result<(), &'static str> {
+    if !shows(val) {
+        return Ok(());
+    }
+    if *written {
+        out.push(',');
+    }
+    *written = true;
+    newline(indent, depth + 1, out);
+    quote(key, out);
+    if indent.is_empty() {
+        out.push(':');
+    } else {
+        out.push_str(": ");
+    }
+    write_value(val, indent, depth + 1, out)?;
+    Ok(())
+}
+
+#[inline]
 fn newline(indent: &str, depth: usize, out: &mut String) {
     if !indent.is_empty() {
         out.push('\n');
@@ -150,6 +185,7 @@ fn parse(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let mut p = Parser {
         text: text.as_str(),
         pos: 0,
+        keys: Vec::new(),
     };
     let result = p.value().and_then(|v| {
         p.skip_ws();
@@ -167,6 +203,8 @@ fn parse(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
 struct Parser<'a> {
     text: &'a str,
     pos: usize,
+    /// The property names read so far, which the objects that have them share (see `shared_key`).
+    keys: Vec<Rc<str>>,
 }
 
 impl<'a> Parser<'a> {
@@ -180,7 +218,15 @@ impl<'a> Parser<'a> {
         &text[self.pos..]
     }
 
+    /// Skips the whitespace at the current position. The common case, which has none, is checked inline.
+    #[inline]
     fn skip_ws(&mut self) {
+        if matches!(self.byte(), Some(b'\t'..=b'\r' | b' ' | 0x80..=0xff)) {
+            self.skip_whitespace_run();
+        }
+    }
+
+    fn skip_whitespace_run(&mut self) {
         loop {
             match self.byte() {
                 // The whitespace `char::is_whitespace` accepts: the ASCII ones here, and some other characters below.
@@ -231,7 +277,63 @@ impl<'a> Parser<'a> {
         Ok(v)
     }
 
+    /// A whole number of up to 15 digits, with an optional minus sign, read without the float parser, which gives the same
+    /// value. It is taken only when no other character continues the number, and `number` reads the rest.
+    fn whole_number(&mut self) -> Option<f64> {
+        let bytes = self.text.as_bytes();
+        let negative = bytes.get(self.pos) == Some(&b'-');
+        let digits = self.pos + usize::from(negative);
+        let mut at = digits;
+        let mut n: u64 = 0;
+        while at - digits < 15 {
+            match bytes.get(at) {
+                Some(&b @ b'0'..=b'9') => {
+                    n = n * 10 + u64::from(b - b'0');
+                    at += 1;
+                }
+                _ => break,
+            }
+        }
+        let continues = matches!(
+            bytes.get(at),
+            Some(b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+        );
+        if at == digits || continues {
+            return None;
+        }
+        self.pos = at;
+        let v = n as f64;
+        Some(if negative { -v } else { v })
+    }
+
+    /// The code of an escaped low surrogate that the text continues with, which is consumed, if there is one.
+    fn low_surrogate(&mut self) -> Option<u32> {
+        let hex = self.rest().strip_prefix("\\u")?.get(..4)?;
+        let code = u32::from_str_radix(hex, 16).ok()?;
+        if !(0xdc00..0xe000).contains(&code) {
+            return None;
+        }
+        self.pos += 6;
+        Some(code)
+    }
+
+    /// The shared allocation for the property name `name`. Objects of one shape have the same names, so a name that was
+    /// read before is found in `keys` and not copied again. Names past `MAX_SHARED_KEYS` are copied each time.
+    fn shared_key(&mut self, name: &str) -> Rc<str> {
+        if let Some(shared) = self.keys.iter().find(|k| &***k == name) {
+            return shared.clone();
+        }
+        let shared: Rc<str> = Rc::from(name);
+        if self.keys.len() < MAX_SHARED_KEYS {
+            self.keys.push(shared.clone());
+        }
+        shared
+    }
+
     fn number(&mut self) -> Result<Value, String> {
+        if let Some(n) = self.whole_number() {
+            return Ok(Value::Num(n));
+        }
         let start = self.pos;
         while matches!(
             self.byte(),
@@ -292,8 +394,20 @@ impl<'a> Parser<'a> {
                     let window = &rest[..rest.char_indices().nth(4).map_or(rest.len(), |(i, _)| i)];
                     let code = u32::from_str_radix(window, 16)
                         .map_err(|_| self.error("Bad unicode escape"))?;
-                    s.push(char::from_u32(code).unwrap_or('\u{fffd}'));
                     self.pos += window.len();
+                    // A high surrogate followed by an escaped low surrogate is one character past the Basic Multilingual Plane.
+                    let pair = if (0xd800..0xdc00).contains(&code) {
+                        self.low_surrogate()
+                    } else {
+                        None
+                    };
+                    let character = match pair {
+                        Some(low) => {
+                            char::from_u32(0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00))
+                        }
+                        None => char::from_u32(code),
+                    };
+                    s.push(character.unwrap_or('\u{fffd}'));
                 }
                 other => s.push(other),
             }
@@ -336,7 +450,8 @@ impl<'a> Parser<'a> {
             if self.byte() != Some(b'"') {
                 return Err(self.error("Expected property name"));
             }
-            let key = self.string()?;
+            let name = self.string()?;
+            let key = self.shared_key(&name);
             self.skip_ws();
             if self.byte() != Some(b':') {
                 return Err(self.error("Expected ':'"));
@@ -344,7 +459,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let v = self.value()?;
             if let Value::Obj(o) = &obj {
-                obj_set(o, &key, v);
+                obj_put(o, &key, v);
             }
             self.skip_ws();
             match self.byte() {

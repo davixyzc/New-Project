@@ -1,0 +1,19 @@
+// Strings of every length up to 20, with a control character, a quote, a backslash or an accented character at every
+// position, are written and read back as JavaScript writes and reads them. Escapes are read at every position too.
+const specials = ["\u0001", "\u001f", '"', "\\", "\n", "\t", "é"];
+let out = "";
+for (let len = 0; len <= 20; len++) {
+  for (let at = 0; at < len; at++) {
+    for (const sp of specials) {
+      let s = "";
+      for (let k = 0; k < len; k++) s += k === at ? sp : "x";
+      const text = JSON.stringify([s, { k: s }]);
+      out += text + " " + JSON.parse(text)[0].length + " " + JSON.parse(text)[1].k.length + "\n";
+    }
+  }
+}
+console.log(out);
+
+const escaped = JSON.parse('["a\\"b\\\\c\\u0041\\n\\/", "\\u00e9\\ud83d\\ude00", "xxxxxxxx\\"yyyyyyyy\\\\zzzzzzzz"]');
+console.log(escaped.join("|"), escaped[2].length);
+console.log(JSON.stringify(["😀x", "x😀", "😀"]), JSON.parse('"\\ud83d\\ude00"') === "😀");
