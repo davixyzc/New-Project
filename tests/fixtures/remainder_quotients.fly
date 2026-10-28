@@ -1,0 +1,21 @@
+// Remainders by a divisor that is a variable, in loops, where the quotient is 0, 1, 2 or more.
+function rem(a, m) {
+  return a % m;
+}
+let sum = 0;
+let last = 0;
+for (let m = 1; m <= 40; m++) {
+  for (let a = 0; a < 200; a++) {
+    const r = a % m;
+    sum += r;
+    last = r;
+  }
+}
+console.log(sum, last);
+let big = 0;
+for (let k = 0; k < 500; k++) big += (4000000000 + k * 3) % (1000 + k);
+console.log(big);
+let neg = 0;
+for (let a = -50; a < 50; a++) neg += (a % 7 + 7) % 7;
+console.log(neg);
+console.log(rem(5, 3), rem(6, 3), rem(7, 3), rem(9, 3), rem(0, 4), rem(4, 4), rem(3, 4));
