@@ -1,0 +1,24 @@
+// Two-level indexed reads and stores in loops, with their keys still pending: keys in both orders, a store that
+// reads the element it replaces, and elements that hold text, which leave the loop at the read or the store.
+const grid = [];
+for (let r = 0; r < 4; r++) {
+  const row = [];
+  for (let c = 0; c < 5; c++) row.push(r * 10 + c * 0.5);
+  grid.push(row);
+}
+let s = 0;
+for (let r = 0; r < 4; r++) {
+  for (let c = 0; c < 5; c++) {
+    s += grid[r][c] * (c < r ? 2 : 1);
+    grid[c % 4][r] = s * 0.25 + r;
+  }
+}
+console.log(s, grid.map((row) => row.join(" ")).join("|"));
+
+const names = [[1, 2], ["a", 4], [5, 6]];
+for (let i = 0; i < 3; i++) {
+  for (let j = 0; j < 2; j++) {
+    names[i][j] = names[i][j] + 1;
+  }
+}
+console.log(names.map((row) => row.join(",")).join(";"));

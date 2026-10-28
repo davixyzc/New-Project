@@ -2392,7 +2392,12 @@ impl Emitter<'_, '_> {
 
     /// Emits `op` at instruction `ip`, which runs with `d` operands on the stack.
     fn op(&mut self, op: Op, d: i32, ip: usize) {
-        if !reads_in_place(op) {
+        let in_place = match op {
+            // A read that binds its element to a local, and a read of an object's element, write locals: they copy first.
+            Op::GetIndexLocal(_) => !self.binds_element(ip) && !self.lp.object_reads.contains(&ip),
+            _ => reads_in_place(op),
+        };
+        if !in_place {
             self.materialize(d);
         }
         let (x, y) = (self.reg(d - 1), self.reg(d - 2));
@@ -2783,9 +2788,10 @@ impl Emitter<'_, '_> {
             }
             Op::GetIndexLocal(a) => {
                 let exit = self.side_exit(ip, d);
-                let (key, tag) = (self.reg(d - 1), self.tag_cell(d - 1));
+                let key = self.operand(d - 1);
+                let (dst, tag) = (self.reg(d - 1), self.tag_cell(d - 1));
                 self.a.mov_load(R8, local_mem(a).at(8));
-                self.elem_read(key, key, tag, self.mark(ip, d - 1) == Mark::Int, exit);
+                self.elem_read(key, dst, tag, self.mark(ip, d - 1) == Mark::Int, exit);
             }
             Op::GetIndex2Local(a) => {
                 let exit = self.side_exit(ip, d);
