@@ -626,7 +626,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
     }
     // A property that the loop reads or writes through an object local keeps the address of its value, so that a later
     // access to it skips the lookup (see `prop_address`). Accesses to one local and name share a cache.
-    let mut prop_caches: Vec<(u32, u32)> = Vec::new();
+    let mut keyed_at: Vec<(usize, (u32, u32))> = Vec::new();
     for ip in header..=last {
         let stack = &marks[ip - header];
         let keyed = match code[ip] {
@@ -642,10 +642,50 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
             _ => None,
         };
         if let Some(key) = keyed {
-            if !prop_caches.contains(&key) && prop_caches.len() < MAX_PROP_CACHES {
-                prop_caches.push(key);
+            keyed_at.push((ip, key));
+        }
+    }
+    // The loop that encloses `ip` most closely: the latest-starting one that contains it, and the shortest of those.
+    let innermost = |ip: usize| {
+        let mut best = (header, last);
+        for q in header..=last {
+            if depth[q] < 0 {
+                continue;
+            }
+            for (t, _) in successors(code[q], q, depth[q]) {
+                if t <= ip && ip <= q && (t > best.0 || (t == best.0 && q < best.1)) {
+                    best = (t, q);
+                }
             }
         }
+        best
+    };
+    // An access whose local is rebound in its innermost loop, where it is the only access to the key, reads an address
+    // that the rebinding clears before the next iteration: the cache would never hit, so the key keeps none.
+    let useless = |ip: usize, key: (u32, u32)| {
+        let (t, q) = innermost(ip);
+        let rebound = (t..=q).any(|k| {
+            depth[k] >= 0 && matches!(code[k], Op::PopToLocal(i) | Op::SetLocal(i) if i == key.0)
+        });
+        let once = keyed_at
+            .iter()
+            .filter(|&&(k, other)| other == key && (t..=q).contains(&k))
+            .count()
+            == 1;
+        rebound && once
+    };
+    let mut prop_caches: Vec<(u32, u32)> = Vec::new();
+    for &(_, key) in &keyed_at {
+        if prop_caches.contains(&key) || prop_caches.len() >= MAX_PROP_CACHES {
+            continue;
+        }
+        if keyed_at
+            .iter()
+            .all(|&(ip, other)| other != key || useless(ip, key))
+        {
+            continue;
+        }
+        prop_caches.push(key);
     }
     Some(Region {
         header,
@@ -2404,6 +2444,8 @@ impl Emitter<'_, '_> {
             Op::GetLocal(i) if self.lp.objects.contains(&i) => {}
             Op::GetLocal(i) if self.lp.arrays.contains(&i) => {}
             Op::GetLocal(i) => self.read_local(i, self.reg(d)),
+            // The store that a fused element read already did (see `binds_element`) does nothing.
+            Op::PopToLocal(_) if ip > 0 && self.binds_element(ip - 1) => {}
             Op::PopToLocal(i) if self.lp.objects.contains(&i) => {
                 // The value is moved from the operand, or copied from the object local it views, and the local's
                 // old value is released. Every check comes before any count changes, so a side exit leaves them
@@ -2585,6 +2627,27 @@ impl Emitter<'_, '_> {
                 self.a.mov_rr(RSP, RBP);
                 self.a.pop_reg(RBP);
                 self.a.ret();
+            }
+            // An element bound to an object local is copied into the local directly, and the `PopToLocal` after it does
+            // nothing (see `binds_element`). Every check comes before any count changes, as in that `PopToLocal`.
+            Op::GetIndexLocal(a) if self.binds_element(ip) => {
+                let exit = self.side_exit(ip, d);
+                let key = self.reg(d - 1);
+                let Some(&Op::PopToLocal(i)) = self.proto.code.get(ip + 1) else {
+                    unreachable!("a bound element is followed by its store (see `binds_element`)")
+                };
+                self.a.mov_load(R8, local_mem(a).at(8));
+                self.elem_addr(key, self.mark(ip, d - 1) == Mark::Int, exit);
+                self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_OBJ);
+                self.a.jcc(CC_NE, exit);
+                let (element, dst) = (Mem { base: RDX, disp: 0 }, local_mem(i));
+                // The element is an object, so its copy always counts one more reference, and the old value of the local
+                // is released first, which the check of its last reference must allow (see `release_checked`).
+                self.release_checked(dst, exit);
+                self.a.mov_load(R11, element.at(8));
+                self.a.add64_mem_imm8(Mem { base: R11, disp: 0 }, 1);
+                self.copy_value(element, dst);
+                self.clear_prop_caches(i);
             }
             Op::GetIndexLocal(a) if self.lp.object_reads.contains(&ip) => {
                 // The element must be an object. It is copied to the operand, and the copy counts one more reference.
@@ -3383,6 +3446,21 @@ impl Emitter<'_, '_> {
         self.a.bind(plain);
     }
 
+    /// Releases the reference of the value at `m`, when it owns one, after `check_last` has ruled out the last one. Both
+    /// steps share one check of the owning tag, so that a store of an object local takes one pass over the old value.
+    fn release_checked(&mut self, m: Mem, exit: Label) {
+        let plain = self.a.label();
+        self.a.movzx_load8(R9, m);
+        self.a.mov_imm32(R10, OWNING);
+        self.a.bt(R10, R9);
+        self.a.jcc(CC_AE, plain);
+        self.a.mov_load(R11, m.at(8));
+        self.a.cmp64_mem_imm8(Mem { base: R11, disp: 0 }, 1);
+        self.a.jcc(CC_BE, exit);
+        self.a.add64_mem_imm8(Mem { base: R11, disp: 0 }, -1);
+        self.a.bind(plain);
+    }
+
     /// Releases the reference of the value at `m`, when it owns one. It must not be the last one (see `check_last`).
     fn count_down(&mut self, m: Mem) {
         let plain = self.a.label();
@@ -3432,11 +3510,21 @@ impl Emitter<'_, '_> {
             Mark::View(s) => Some(s),
             _ => None,
         };
+        // The store itself is a resume point, which is no reason to refuse it: a jump to it is what would break the address.
         (at + 1..=ip).all(|k| {
             !self.is_jump_target(k)
-                && !self.lp.resumes.contains(&k)
-                && (k == ip || window_op(self.proto.code[k], view_slot))
+                && (k == ip
+                    || (!self.lp.resumes.contains(&k) && window_op(self.proto.code[k], view_slot)))
         })
+    }
+
+    /// Whether the element read at `ip` is stored straight into an object local: it is one of the reads that the loop
+    /// keeps as objects (see `Region::object_reads`), and the store after it is not a jump target, so nothing reaches
+    /// the store without the read.
+    fn binds_element(&self, ip: usize) -> bool {
+        self.lp.object_reads.contains(&ip)
+            && matches!(self.proto.code.get(ip + 1), Some(Op::PopToLocal(i)) if self.lp.objects.contains(i))
+            && !self.is_jump_target(ip + 1)
     }
 
     /// Whether an instruction other than the one before `k` jumps to `k`.

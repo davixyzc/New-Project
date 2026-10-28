@@ -1,0 +1,44 @@
+// Objects that a loop binds from an array, reads and updates in place. The same object bound in a row, an element that is
+// not an object (which the loop declines), and stores that a conditional expression reaches by a jump must all give
+// the same result as the generic code.
+const pts = [];
+for (let i = 0; i < 6; i++) pts.push({ x: i, y: i * 2, m: 1 + (i % 3), v: 0 });
+let total = 0;
+for (let step = 0; step < 5; step++) {
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    for (let j = 0; j < pts.length; j++) {
+      if (i === j) continue;
+      const b = pts[j];
+      const dx = b.x - a.x;
+      a.v += dx * b.m * 0.5;
+      if (dx > 2) a.x += 1;
+      else a.y -= 1;
+      a.m = a.m + (dx < 0 ? 1 : 0.5);
+      a.y += dx > 1 ? 0.25 : 0.125;
+    }
+  }
+  for (const p of pts) p.x += 0.25;
+  total += pts[0].x;
+}
+console.log(total.toFixed(6), pts.map((p) => p.v.toFixed(3)).join(" "));
+
+// An element that is a number is not an object, so the loop leaves at it, and the generic code adds it.
+const mixed = [{ n: 1 }, { n: 2 }, 7, { n: 4 }];
+let s = 0;
+for (let k = 0; k < 4; k++) {
+  const q = mixed[k];
+  if (typeof q === "object") s += q.n;
+  else s += q;
+}
+console.log(s);
+
+// The same object is bound in every iteration, so the old and the new value are one object.
+const same = mixed[0];
+let t = 0;
+for (let k = 0; k < 3; k++) {
+  const q = same;
+  t += q.n;
+  q.n += 1;
+}
+console.log(t, same.n);
