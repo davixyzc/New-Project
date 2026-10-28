@@ -919,6 +919,7 @@ impl Compiler {
             method_argc: Cell::new(u32::MAX),
             closure_entry: Cell::new(0),
             closure_argc: Cell::new(u32::MAX),
+            fast_mask: Cell::new(0),
             closure_bool: Cell::new(false),
             factory: Cell::new(0),
             names: fs.names,

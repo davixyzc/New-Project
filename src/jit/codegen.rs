@@ -1631,6 +1631,19 @@ impl<'a> Gen<'a> {
             self.load_proto(callee);
             let (not_method, not_closure, not_numeric) =
                 (self.a.label(), self.a.label(), self.a.label());
+            // A callee whose specialised entries take another number of arguments is not tested for them: the bit of `argc`
+            // in `Proto::fast_mask` is clear, so none of them takes this call.
+            if argc < 32 {
+                self.a.mov32_load(
+                    R9,
+                    Mem {
+                        base: RDX,
+                        disp: std::mem::offset_of!(Proto, fast_mask) as i32,
+                    },
+                );
+                self.a.bt_imm(R9, argc as u8);
+                self.a.jcc(CC_AE, not_numeric);
+            }
             self.method_call(d, argc, not_method, generic, done);
             self.a.bind(not_method);
             self.closure_numbers_call(d, argc, not_closure, generic, done);
@@ -3372,6 +3385,7 @@ mod tests {
             method_argc: std::cell::Cell::new(u32::MAX),
             closure_entry: Default::default(),
             closure_argc: std::cell::Cell::new(u32::MAX),
+            fast_mask: std::cell::Cell::new(0),
             closure_bool: Default::default(),
             factory: Default::default(),
             protos: Vec::new(),
@@ -3417,6 +3431,7 @@ mod tests {
             method_argc: std::cell::Cell::new(u32::MAX),
             closure_entry: Default::default(),
             closure_argc: std::cell::Cell::new(u32::MAX),
+            fast_mask: std::cell::Cell::new(0),
             closure_bool: Default::default(),
             factory: Default::default(),
             protos: Vec::new(),

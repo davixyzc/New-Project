@@ -425,6 +425,12 @@ impl Asm {
         self.op(None, false, &[0x0F, 0xA3], bit, Rm::Reg(mask));
     }
 
+    /// `bt r32, bit`, for a bit given as a number: sets CF to bit `bit` of `r`.
+    pub fn bt_imm(&mut self, r: u8, bit: u8) {
+        self.op(None, false, &[0x0F, 0xBA], 4, Rm::Reg(r));
+        self.code.push(bit);
+    }
+
     // ----- control flow -----------------------------------------------------
 
     pub fn jmp(&mut self, label: Label) {

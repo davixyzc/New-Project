@@ -4099,6 +4099,7 @@ mod tests {
             method_argc: std::cell::Cell::new(u32::MAX),
             closure_entry: Default::default(),
             closure_argc: std::cell::Cell::new(u32::MAX),
+            fast_mask: std::cell::Cell::new(0),
             closure_bool: Default::default(),
             factory: Default::default(),
             protos: Vec::new(),

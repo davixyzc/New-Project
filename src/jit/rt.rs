@@ -372,15 +372,16 @@ pub unsafe extern "C" fn call_factory(
     let Value::Func(f) = &*callee else {
         return 1;
     };
-    let proto = f.proto.clone();
-    if argc != proto.nparams as usize || !matches!(*this, Value::Undef) {
+    if argc != f.proto.nparams as usize || !matches!(*this, Value::Undef) {
         return 1;
     }
-    let child = proto.protos[proto.factory.get() as usize - 1].clone();
+    let child = f.proto.protos[f.proto.factory.get() as usize - 1].clone();
+    // Each captured parameter moves into the closure, which leaves its argument undefined. `factory_child` admits a factory
+    // only when its captures name distinct parameters, so no argument is moved twice.
     let upvals: Vec<Value> = child
         .upvals
         .iter()
-        .map(|u| (*args.add(u.index as usize)).clone())
+        .map(|u| ptr::replace(args.add(u.index as usize), Value::Undef))
         .collect();
     let made = Value::Func(Rc::new(crate::value::Closure {
         proto: child,

@@ -1,0 +1,29 @@
+// Factories whose closures take their captured parameters from the call, which moves them. The values are numbers, text
+// and objects, and a parameter that the closure reads twice.
+function pair(a, b) {
+  return () => a + b;
+}
+function twice(a) {
+  return () => a * 2 + a;
+}
+function labelled(name, count) {
+  return () => name + ":" + count;
+}
+function holder(obj, list) {
+  return () => obj.n + list.length;
+}
+let total = 0;
+for (let i = 0; i < 200; i++) {
+  total += pair(i, 1)();
+  total += twice(i)();
+  total += holder({ n: i }, [i, i])();
+}
+console.log(total);
+let s = "";
+for (let i = 0; i < 3; i++) s += labelled("n" + i, i)();
+console.log(s);
+const kept = [];
+for (let i = 0; i < 5; i++) kept.push(holder({ n: i }, [1, 2, 3]));
+let sum = 0;
+for (let i = 0; i < kept.length; i++) sum += kept[i]();
+console.log(sum, kept.length);

@@ -220,6 +220,9 @@ pub struct Proto {
     pub closure_entry: Cell<usize>,
     /// The number of arguments that `closure_entry` takes. It is `u32::MAX` when there is no such entry.
     pub closure_argc: Cell<u32>,
+    /// The argument counts of the specialised entries above, one bit each (see `entry_mask`). A call whose count has no bit
+    /// here takes none of them, so native code does not test them.
+    pub fast_mask: Cell<u32>,
     /// Whether `closure_entry` returns a boolean.
     pub closure_bool: Cell<bool>,
     /// One more than the index of the closure that the function returns, when it is a factory (see `factory_child`), and
@@ -259,11 +262,27 @@ fn factory_child(proto: &Proto) -> u32 {
         .upvals
         .iter()
         .all(|u| u.from_local && u.by_value && (u.index as usize) < proto.nparams as usize);
-    if captures_params {
+    // The call moves each captured parameter out of its argument, so no two captures may name the same one.
+    let distinct = inner
+        .upvals
+        .iter()
+        .enumerate()
+        .all(|(i, u)| inner.upvals[..i].iter().all(|v| v.index != u.index));
+    if captures_params && distinct {
         child as u32 + 1
     } else {
         0
     }
+}
+
+/// The bits of the argument counts that the specialised entries take: bit `n` is set when an entry takes `n` arguments.
+/// An entry that takes 32 or more arguments sets them all, so that no call is spared its tests.
+fn entry_mask(counts: [u32; 3]) -> u32 {
+    counts.iter().fold(0, |mask, &n| match n {
+        u32::MAX => mask,
+        n if n < 32 => mask | (1 << n),
+        _ => u32::MAX,
+    })
 }
 
 impl Proto {
@@ -305,6 +324,11 @@ impl Proto {
                             .set(if self.has_rest { u32::MAX } else { nparams });
                         self.closure_bool.set(returns_bool);
                     }
+                    self.fast_mask.set(entry_mask([
+                        self.numeric_argc.get(),
+                        self.method_argc.get(),
+                        self.closure_argc.get(),
+                    ]));
                 }
                 compiled
             })
