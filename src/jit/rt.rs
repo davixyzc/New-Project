@@ -398,7 +398,10 @@ pub unsafe extern "C" fn call_factory(
         }
         ptr::write(arg, Value::Undef);
     }
-    *callee = made;
+    // The callee was a function, so the factory's reference is released as an `Rc`, without the drop glue of a `Value`.
+    if let Value::Func(factory) = ptr::replace(callee, made) {
+        drop(factory);
+    }
     0
 }
 
