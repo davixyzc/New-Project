@@ -2965,16 +2965,8 @@ impl Emitter<'_, '_> {
             },
         );
         self.a.add64_imm32(RDX, super::RC_VALUE);
-        self.a.mov32_load(
-            R9,
-            Mem {
-                base: RDX,
-                disp: std::mem::offset_of!(Proto, method_argc) as i32,
-            },
-        );
-        self.a.cmp64_imm32(R9, 1);
-        self.a.jcc(CC_NE, exit);
         // A loop that runs the callee's body in place (see `with_inline`) checks that the callee is that body's function.
+        // That function takes the one argument of the call, so the argument count is not checked for it.
         let inlined = self
             .lp
             .inline
@@ -2988,6 +2980,15 @@ impl Emitter<'_, '_> {
             self.inline_body(ip, d, s, exit);
             return;
         }
+        self.a.mov32_load(
+            R9,
+            Mem {
+                base: RDX,
+                disp: std::mem::offset_of!(Proto, method_argc) as i32,
+            },
+        );
+        self.a.cmp64_imm32(R9, 1);
+        self.a.jcc(CC_NE, exit);
         self.a.mov_load(
             RAX,
             Mem {
