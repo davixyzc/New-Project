@@ -1,0 +1,60 @@
+0 0 0 
+1 1 97 a
+2 2 195 ab
+3 3 294 abc
+4 4 394 abcd
+5 5 495 abcde
+6 6 597 abcdef
+7 7 700 abcdefg
+8 8 804 abcdefgh
+9 9 909 abcdefghi
+10 10 1015 abcdefghij
+11 11 1122 abcdefghijk
+12 12 1230 abcdefghijkl
+13 13 1339 abcdefghijklm
+14 14 1449 abcdefghijklmn
+15 15 1560 abcdefghijklmno
+16 16 1672 abcdefghijklmnop
+17 17 1785 abcdefghijklmnopq
+18 18 1899 abcdefghijklmnopqr
+19 19 2014 abcdefghijklmnopqrs
+20 20 2130 abcdefghijklmnopqrst
+21 21 2247 abcdefghijklmnopqrstu
+22 22 2365 abcdefghijklmnopqrstuv
+23 23 2484 abcdefghijklmnopqrstuvw
+24 24 2604 abcdefghijklmnopqrstuvwx
+25 25 2725 abcdefghijklmnopqrstuvwxy
+26 26 2847 abcdefghijklmnopqrstuvwxyz
+27 27 2944 abcdefghijklmnopqrstuvwxyza
+28 28 3042 abcdefghijklmnopqrstuvwxyzab
+29 29 3141 abcdefghijklmnopqrstuvwxyzabc
+30 30 3241 abcdefghijklmnopqrstuvwxyzabcd
+31 31 3342 abcdefghijklmnopqrstuvwxyzabcde
+32 32 3444 abcdefghijklmnopqrstuvwxyzabcdef
+33 33 3547 abcdefghijklmnopqrstuvwxyzabcdefg
+34 34 3651 abcdefghijklmnopqrstuvwxyzabcdefgh
+35 35 3756 abcdefghijklmnopqrstuvwxyzabcdefghi
+36 36 3862 abcdefghijklmnopqrstuvwxyzabcdefghij
+37 37 3969 abcdefghijklmnopqrstuvwxyzabcdefghijk
+38 38 4077 abcdefghijklmnopqrstuvwxyzabcdefghijkl
+39 39 4186 abcdefghijklmnopqrstuvwxyzabcdefghijklm
+40 40 4296 abcdefghijklmnopqrstuvwxyzabcdefghijklmn
+hot 12873000
+shared 14 48 100 0123456789abcd
+shared 15 48 120 0123456789abcdx
+shared 16 48 121 0123456789abcdxy
+shared 17 48 122 0123456789abcdxyz
+shared 18 48 119 0123456789abcdxyzw
+piece 2 97 ab
+piece 2 97 ab
+piece 2 97 ab
+piece 2 97 ab
+piece 36 48 0123456789abcdefghijklmnopqrstuvwxyz
+piece 3 101 end
+joined 52 ab+ab+ab+ab+0123456789abcdefghijklmnopqrstuvwxyz+end
+equal true found 1
+order true true true
+accent 13 231 233 éééé
+slice klmno uvwxyz 0123
+trim padded X
+sorted aa abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz1 ac b

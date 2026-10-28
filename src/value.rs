@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell, RefMut};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::rc::Rc;
@@ -471,24 +472,144 @@ impl Closure {
     }
 }
 
-/// The text of a string value. It keeps its character count and whether every character is ASCII, so `length` and
-/// indexing take constant time for ASCII text, which is the usual case.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct JsStr {
-    text: String,
-    chars: usize,
-    ascii: bool,
+/// The longest text that a string keeps inside its own allocation, rather than in a buffer of its own. It is the most that
+/// fits a 64-byte `JsStr`, which makes the `Rc` around it an 80-byte block, a whole number of the allocator's 16-byte
+/// grains, so that a short string costs one block.
+const INLINE_BYTES: usize = 15;
+
+/// Copies `src`, which is at most `INLINE_BYTES` long, to the start of `dst`. Each move has a fixed size, so it compiles to
+/// plain loads and stores rather than a call to `memcpy`, whose set-up costs about as much as a short copy. Where two
+/// moves overlap they copy the same bytes, so together they cover all of `src`.
+#[inline(always)]
+fn copy_short(dst: &mut [u8], src: &[u8]) {
+    let n = src.len();
+    if n >= 8 {
+        dst[..8].copy_from_slice(&src[..8]);
+        dst[n - 8..n].copy_from_slice(&src[n - 8..]);
+    } else if n >= 4 {
+        dst[..4].copy_from_slice(&src[..4]);
+        dst[n - 4..n].copy_from_slice(&src[n - 4..]);
+    } else if n > 0 {
+        // One to three bytes: the first, the middle and the last cover them all.
+        dst[0] = src[0];
+        dst[n / 2] = src[n / 2];
+        dst[n - 1] = src[n - 1];
+    }
 }
 
+/// The text of a string value. It keeps its character count and whether every character is ASCII, so `length` and
+/// indexing take constant time for ASCII text, which is the usual case. Short text is kept inside the value, so a short
+/// string is one allocation, and long text is in a buffer of its own.
+pub struct JsStr {
+    /// Where the text starts, which native code reads. It points into this value while the text is inline, so it is set
+    /// once the value is in its `Rc` (see `into_rc`), and again whenever the text moves to another buffer.
+    bytes: *const u8,
+    chars: usize,
+    /// The length of the text in bytes.
+    len: usize,
+    ascii: bool,
+    /// The text while it is long. While it is short, this is empty and owns no buffer.
+    heap: String,
+    /// The text while it is short: its first `len` bytes.
+    inline: [u8; INLINE_BYTES],
+}
+
+// A string's `Rc` is one 80-byte block, as `INLINE_BYTES` assumes.
+const _: () = assert!(std::mem::size_of::<JsStr>() == 64);
+
 impl JsStr {
-    pub fn new(text: String) -> JsStr {
-        let ascii = text.is_ascii();
-        let chars = if ascii {
-            text.len()
+    /// The string for `text`, which is kept as its buffer when it is long, and copied into the value when it is short.
+    pub fn new(text: String) -> Rc<JsStr> {
+        let (chars, ascii) = JsStr::scan(&text);
+        if text.len() <= INLINE_BYTES {
+            return JsStr::joined(&[text.as_str()], chars, ascii);
+        }
+        let len = text.len();
+        JsStr {
+            bytes: ptr::null(),
+            chars,
+            len,
+            ascii,
+            heap: text,
+            inline: [0; INLINE_BYTES],
+        }
+        .into_rc()
+    }
+
+    /// A string with a copy of `text`.
+    pub fn copied(text: &str) -> Rc<JsStr> {
+        let (chars, ascii) = JsStr::scan(text);
+        JsStr::joined(&[text], chars, ascii)
+    }
+
+    /// The string whose text is `parts` one after another, copied into the value. The caller knows the character count of
+    /// that text and whether it is all ASCII, so it is not scanned.
+    pub(crate) fn joined(parts: &[&str], chars: usize, ascii: bool) -> Rc<JsStr> {
+        let len: usize = parts.iter().map(|part| part.len()).sum();
+        // The text is copied in where the value stays, so that the value is not moved after it is built.
+        let mut rc = Rc::new(JsStr {
+            bytes: ptr::null(),
+            chars,
+            len,
+            ascii,
+            heap: String::new(),
+            inline: [0; INLINE_BYTES],
+        });
+        let value = Rc::get_mut(&mut rc).expect("a new Rc is unique");
+        if len > INLINE_BYTES {
+            value.heap = String::with_capacity(len);
+            for part in parts {
+                value.heap.push_str(part);
+            }
         } else {
-            text.chars().count()
-        };
-        JsStr { text, chars, ascii }
+            let mut at = 0;
+            for part in parts {
+                copy_short(&mut value.inline[at..], part.as_bytes());
+                at += part.len();
+            }
+        }
+        value.point_at_text();
+        rc
+    }
+
+    /// The character count of `text`, and whether every character is ASCII.
+    fn scan(text: &str) -> (usize, bool) {
+        if text.is_ascii() {
+            (text.len(), true)
+        } else {
+            (text.chars().count(), false)
+        }
+    }
+
+    /// The value in its `Rc`, which is where it stays. The text is pointed at only then, because a value that moved
+    /// after that would leave `bytes` at the address it had before.
+    fn into_rc(self) -> Rc<JsStr> {
+        let mut rc = Rc::new(self);
+        Rc::get_mut(&mut rc)
+            .expect("a new Rc is unique")
+            .point_at_text();
+        rc
+    }
+
+    /// Points `bytes` at the text, which is inline or in the buffer of `heap`.
+    fn point_at_text(&mut self) {
+        self.bytes = self.as_str().as_ptr();
+    }
+
+    /// The text.
+    pub fn as_str(&self) -> &str {
+        if self.len > INLINE_BYTES {
+            &self.heap
+        } else {
+            self.inline_text()
+        }
+    }
+
+    /// The text while it is short.
+    fn inline_text(&self) -> &str {
+        // SAFETY: the first `len` bytes of `inline` are whole strings that were copied in from valid text, so they are
+        // valid UTF-8. This is called only for short text, so `len` is within `inline`.
+        unsafe { std::str::from_utf8_unchecked(&self.inline[..self.len]) }
     }
 
     /// The length in characters.
@@ -501,37 +622,83 @@ impl JsStr {
         self.ascii
     }
 
-    /// A string whose character count and ASCII flag the caller knows, so that `new` does not scan it.
-    pub(crate) fn counted(text: String, chars: usize, ascii: bool) -> JsStr {
-        JsStr { text, chars, ascii }
-    }
-
     /// Appends `more`, whose character count and ASCII flag the caller knows, so that it is not scanned.
     fn push_counted(&mut self, more: &str, chars: usize, ascii: bool) {
         self.chars += chars;
         self.ascii = self.ascii && ascii;
-        push_small(&mut self.text, more);
+        self.append(more);
+        self.point_at_text();
+    }
+
+    /// Appends `more` to the text. Text that grows past the inline length moves into a buffer of its own, which has room
+    /// to grow.
+    fn append(&mut self, more: &str) {
+        let len = self.len + more.len();
+        if len <= INLINE_BYTES {
+            copy_short(&mut self.inline[self.len..], more.as_bytes());
+        } else {
+            if self.len <= INLINE_BYTES {
+                let mut heap = String::with_capacity(2 * len);
+                heap.push_str(self.inline_text());
+                self.heap = heap;
+            }
+            push_small(&mut self.heap, more);
+        }
+        self.len = len;
     }
 }
 
 impl std::ops::Deref for JsStr {
-    type Target = String;
+    type Target = str;
 
-    fn deref(&self) -> &String {
-        &self.text
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Debug for JsStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
     }
 }
 
 impl fmt::Display for JsStr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.text)
+        f.write_str(self.as_str())
+    }
+}
+
+// Equality, order and hashing go by the text. The address in `bytes` differs between two equal strings.
+impl PartialEq for JsStr {
+    fn eq(&self, other: &JsStr) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for JsStr {}
+
+impl PartialOrd for JsStr {
+    fn partial_cmp(&self, other: &JsStr) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for JsStr {
+    fn cmp(&self, other: &JsStr) -> Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Hash for JsStr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
     }
 }
 
 thread_local! {
     /// The shared string of each ASCII character, by its code.
     static ASCII: Vec<Rc<JsStr>> = (0u8..128)
-        .map(|b| Rc::new(JsStr::new((b as char).to_string())))
+        .map(|b| JsStr::copied((b as char).encode_utf8(&mut [0; 4])))
         .collect();
 }
 
@@ -568,12 +735,12 @@ pub enum Value {
 
 impl Value {
     pub fn str(s: &str) -> Value {
-        Value::Str(Rc::new(JsStr::new(s.to_string())))
+        Value::Str(JsStr::copied(s))
     }
 
-    /// A string value that takes over `s`, without copying it.
+    /// A string value that takes over `s`. Long text is kept without a copy, and short text is copied into the value.
     pub fn from_string(s: String) -> Value {
-        Value::Str(Rc::new(JsStr::new(s)))
+        Value::Str(JsStr::new(s))
     }
 
     pub fn arr(items: Vec<Value>) -> Value {
@@ -982,18 +1149,14 @@ pub(crate) fn str_layout() -> Option<StrLayout> {
 }
 
 fn probe_str_layout() -> Option<StrLayout> {
-    use std::mem::{offset_of, size_of};
-    if !crate::jit::rc_layout_ok() || size_of::<String>() != 3 * size_of::<usize>() {
+    use std::mem::offset_of;
+    if !crate::jit::rc_layout_ok() {
         return None;
     }
-    let s = JsStr::new(String::from("abc"));
-    // SAFETY: the `String` is the three words that the size check above confirms, and each is read as a `usize`.
-    let words: [usize; 3] = unsafe { std::mem::transmute_copy(&s.text) };
-    let word = words.iter().position(|&w| w == s.text.as_ptr() as usize)?;
     Some(StrLayout {
         chars: crate::jit::RC_VALUE + offset_of!(JsStr, chars) as i32,
         ascii: crate::jit::RC_VALUE + offset_of!(JsStr, ascii) as i32,
-        bytes: crate::jit::RC_VALUE + (offset_of!(JsStr, text) + word * size_of::<usize>()) as i32,
+        bytes: crate::jit::RC_VALUE + offset_of!(JsStr, bytes) as i32,
     })
 }
 
@@ -1557,14 +1720,11 @@ pub fn concat_owned(old: Value, rhs: Value) -> Value {
             let (more, chars, ascii) = appended(&rhs, &mut digits);
             if Rc::get_mut(&mut s).is_none() {
                 // A shared string is copied with `more` already appended, so the copy is made once and counted once.
-                let mut copy = String::with_capacity(s.len() * 2 + 16);
-                push_small(&mut copy, &s);
-                push_small(&mut copy, &more);
-                return Value::Str(Rc::new(JsStr::counted(
-                    copy,
+                return Value::Str(JsStr::joined(
+                    &[s.as_str(), &more],
                     s.char_count() + chars,
                     s.is_ascii() && ascii,
-                )));
+                ));
             }
             let buf = Rc::get_mut(&mut s).unwrap();
             buf.push_counted(&more, chars, ascii);
@@ -1661,5 +1821,67 @@ pub fn loose_eq(a: &Value, b: &Value) -> bool {
             Value::Arr(_) | Value::Obj(_) | Value::Func(_),
         ) => loose_eq(a, &Value::str(&to_str(b))),
         _ => strict_eq(a, b),
+    }
+}
+
+#[cfg(test)]
+mod str_tests {
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+
+    fn hash_of(s: &JsStr) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        s.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn the_bytes_pointer_is_the_text_inline_and_on_the_heap() {
+        for text in [
+            "",
+            "abc",
+            "0123456789abcde",
+            "0123456789abcdef",
+            "0123456789abcdefghijklmnopqrstuvwxyz",
+        ] {
+            let s = JsStr::copied(text);
+            assert_eq!(s.as_str(), text);
+            assert_eq!(s.bytes, s.as_str().as_ptr());
+        }
+    }
+
+    #[test]
+    fn growing_past_the_inline_limit_keeps_the_bytes_pointer_on_the_text() {
+        let mut s = JsStr::copied("0123456789ab");
+        for more in ["xy", "z", "uvwxyz"] {
+            Rc::get_mut(&mut s)
+                .unwrap()
+                .push_counted(more, more.len(), true);
+            assert_eq!(s.bytes, s.as_str().as_ptr());
+        }
+        assert_eq!(s.as_str(), "0123456789abxyzuvwxyz");
+        assert_eq!(s.char_count(), 21);
+    }
+
+    #[test]
+    fn equal_text_is_equal_whatever_buffer_holds_it() {
+        let built = JsStr::joined(&["0123456789", "abcdefghijklm"], 23, true);
+        let owned = JsStr::new("0123456789abcdefghijklm".to_string());
+        assert!(*built == *owned);
+        assert_eq!(hash_of(&built), hash_of(&owned));
+        let short = JsStr::joined(&["ab", "c"], 3, true);
+        assert!(*short == *JsStr::copied("abc"));
+        assert!(JsStr::copied("abc") < JsStr::copied("abc0123456789abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn counts_stay_right_across_the_inline_limit() {
+        let mut s = JsStr::copied("ç");
+        for _ in 0..12 {
+            Rc::get_mut(&mut s).unwrap().push_counted("é", 1, false);
+        }
+        assert_eq!(s.char_count(), 13);
+        assert_eq!(s.len(), 26);
+        assert!(!s.is_ascii());
     }
 }

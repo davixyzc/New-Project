@@ -4,9 +4,7 @@ use std::rc::Rc;
 
 use crate::builtins::arg;
 use crate::builtins::array::bounds;
-use crate::value::{
-    num_to_string, push_small, to_num, to_str, JsStr, NativeDef, Value, MAX_STRING_LEN,
-};
+use crate::value::{num_to_string, to_num, to_str, JsStr, NativeDef, Value, MAX_STRING_LEN};
 use crate::vm::Vm;
 
 pub static METHODS: &[NativeDef] = &[
@@ -149,7 +147,7 @@ pub fn char_at(s: &JsStr, i: usize) -> Option<char> {
 fn this_str(this: &Value) -> Rc<JsStr> {
     match this {
         Value::Str(s) => Rc::clone(s),
-        other => Rc::new(JsStr::new(to_str(other))),
+        other => JsStr::new(to_str(other)),
     }
 }
 
@@ -328,9 +326,7 @@ fn trim_end(_vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, Value> 
 /// another string is scanned.
 fn piece(text: &str, source_ascii: bool) -> Value {
     if source_ascii {
-        let mut owned = String::with_capacity(text.len());
-        push_small(&mut owned, text);
-        Value::Str(Rc::new(JsStr::counted(owned, text.len(), true)))
+        Value::Str(JsStr::joined(&[text], text.len(), true))
     } else {
         Value::str(text)
     }
