@@ -1,0 +1,10 @@
+// Conditional expressions and logical operators in a loop, with operands that are still pending when they branch.
+let x = 2, y = 5, w = 0, count = 0;
+for (let i = 0; i < 30; i++) {
+  w = x * 2 + (i < 10 ? y : x) - (x < y && i > 3 ? 1 : 0);
+  if (i % 3 === 0 || x > y) count += w;
+  if (!(x > i) && y !== i) count -= 1;
+  x = x + 0.5 * (i % 2);
+  y = (y < 6 ? y + 1 : y - 2);
+}
+console.log(w, count, x, y);

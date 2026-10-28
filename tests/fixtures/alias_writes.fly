@@ -1,0 +1,9 @@
+// Locals that change while an operand that reads them waits below, or that are the operand of their own update.
+let p = 1, q = 2, r = 0;
+for (let i = 0; i < 20; i++) {
+  r = p + (p = p * 2);
+  q += q;
+  p = p + q - (q = q + 1);
+  r += (r = r * 0.5) + p;
+}
+console.log(p, q, r);

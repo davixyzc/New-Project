@@ -78,6 +78,18 @@ enum Home {
     Mem(Mem),
 }
 
+/// An operand that is read where it is, rather than copied into its depth's register first (see `Emitter::operand`).
+#[derive(Clone, Copy)]
+enum Src {
+    /// A register that holds a local, or a constant of the pool.
+    Reg(u8),
+    /// The frame slot of a local.
+    Mem(Mem),
+}
+
+/// The depths that can hold a pending operand. An operand depth is never near this many.
+const PENDING: usize = 32;
+
 /// What a function region needs to know about its function.
 pub(super) struct Function {
     pub(super) nparams: u32,
@@ -1750,6 +1762,8 @@ pub(super) fn emit(a: &mut Asm, lp: &Region, entry: Label, proto: &Proto, depth:
         sides: Vec::new(),
         prop_cache: None,
         inline: None,
+        pending: [None; PENDING],
+        jumped_to: jump_targets(proto),
     };
     e.a.bind(entry);
     e.a.push_reg(R13);
@@ -2173,6 +2187,8 @@ pub(super) fn emit_function(
         sides: Vec::new(),
         prop_cache: None,
         inline: None,
+        pending: [None; PENDING],
+        jumped_to: jump_targets(proto),
     };
     e.body_ops();
     let a = e.a;
@@ -2203,6 +2219,60 @@ pub(super) fn emit_function(
     }
 }
 
+/// Whether `op` reads its operands where they are and writes nothing but its own result, so that the pending operands
+/// stay pending across it (see `Emitter::operand`). Every other operator first copies them into their registers.
+fn reads_in_place(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Const(_)
+            | Op::True
+            | Op::False
+            | Op::GetLocal(_)
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Lt
+            | Op::Le
+            | Op::Gt
+            | Op::Ge
+            | Op::Eq
+            | Op::StrictEq
+            | Op::Ne
+            | Op::StrictNe
+            | Op::AddToLocal(_)
+            | Op::SetIndexLocal(_)
+            | Op::JumpIfFalse(_)
+            | Op::JumpIfTrue(_)
+            | Op::JumpIfNotLt(_)
+            | Op::JumpIfNotLe(_)
+            | Op::JumpIfNotGt(_)
+            | Op::JumpIfNotGe(_)
+            | Op::JumpIfStrictEq(_)
+            | Op::JumpIfNotStrictEq(_)
+            | Op::JumpIfLtLK(..)
+            | Op::JumpIfNotLtLK(..)
+            | Op::JumpIfLtLL(..)
+            | Op::JumpIfNotLtLL(..)
+    )
+}
+
+/// Which instructions a jump reaches other than by falling through from the one before. A jump leaves its operands in
+/// their registers, so the instruction that it reaches expects them there (see `Emitter::bind_at`).
+fn jump_targets(proto: &Proto) -> Vec<bool> {
+    let mut targets = vec![false; proto.code.len()];
+    for (j, &op) in proto.code.iter().enumerate() {
+        for (t, _) in successors(op, j, 0) {
+            if j + 1 != t {
+                if let Some(target) = targets.get_mut(t) {
+                    *target = true;
+                }
+            }
+        }
+    }
+    targets
+}
+
 struct Emitter<'a, 'b> {
     a: &'b mut Asm,
     proto: &'a Proto,
@@ -2220,12 +2290,18 @@ struct Emitter<'a, 'b> {
     body: Option<Label>,
     /// The locals of a function region, whose operand spill slots sit below them.
     nlocals: i32,
-    /// The side exits of the element operations: the stub, the instruction, and the operand depth before it.
-    sides: Vec<(Label, usize, i32)>,
+    /// The side exits of the element operations: the stub, the instruction, the operand depth before it, and the pending
+    /// operands that the stub copies into their registers before it spills (see `side_exit`).
+    sides: Vec<(Label, usize, i32, Vec<(i32, Src)>)>,
     /// The last `GetProp` that kept its property's address in r14: its instruction, its name, and its object's view.
     prop_cache: Option<(usize, u32, Mark)>,
     /// The body of the method that the loop runs in place, with its own receiver and operands (see `inline_body`).
     inline: Option<InlineCtx>,
+    /// The operands that are read where they are, by depth, rather than copied into their registers yet (see
+    /// `Emitter::operand`).
+    pending: [Option<Src>; PENDING],
+    /// Whether a jump reaches each instruction other than by falling through from the one before (see `jump_targets`).
+    jumped_to: Vec<bool>,
 }
 
 impl Emitter<'_, '_> {
@@ -2234,7 +2310,7 @@ impl Emitter<'_, '_> {
         let lp = self.lp;
         for ip in lp.header..=lp.last {
             let at = self.at[ip - lp.header];
-            self.a.bind(at);
+            self.bind_at(at, ip);
             let d = self.depth[ip];
             if d < 0 {
                 self.a.ud2();
@@ -2252,6 +2328,7 @@ impl Emitter<'_, '_> {
                 .iter()
                 .any(|&(n, _)| n == next)
             {
+                self.materialize(PENDING as i32);
                 let target = self.target(next as u32);
                 self.a.jmp(target);
             }
@@ -2264,7 +2341,7 @@ impl Emitter<'_, '_> {
             self.call_mod(dst);
             self.a.jmp(join);
         }
-        for (stub, ip, d) in std::mem::take(&mut self.sides) {
+        for (stub, ip, d, pending) in std::mem::take(&mut self.sides) {
             self.a.bind(stub);
             if self.body.is_some() {
                 // A function declines before it writes anything, so the call runs in the interpreter, and the frame is
@@ -2274,6 +2351,9 @@ impl Emitter<'_, '_> {
                 self.a.pop_reg(RBP);
                 self.a.ret();
                 continue;
+            }
+            for (k, src) in pending {
+                self.load_src(k, src);
             }
             self.spill(ip, d);
             self.writeback();
@@ -2312,11 +2392,14 @@ impl Emitter<'_, '_> {
 
     /// Emits `op` at instruction `ip`, which runs with `d` operands on the stack.
     fn op(&mut self, op: Op, d: i32, ip: usize) {
+        if !reads_in_place(op) {
+            self.materialize(d);
+        }
         let (x, y) = (self.reg(d - 1), self.reg(d - 2));
         match op {
-            Op::Const(k) => self.load_number(number(self.proto, k), d),
-            Op::True => self.load_number(1.0, d),
-            Op::False => self.load_number(0.0, d),
+            Op::Const(k) => self.push_number(number(self.proto, k), d),
+            Op::True => self.push_number(1.0, d),
+            Op::False => self.push_number(0.0, d),
             // A function's `this` and callee have no register, and the code of a function starts
             // from nothing, so these take no code.
             Op::Pop if self.lp.function.is_none() && self.mark(ip, d - 1) == Mark::Owned => {
@@ -2443,7 +2526,7 @@ impl Emitter<'_, '_> {
             // An array is read in its slot by the `push` that takes it (see `Op::Call`), so it has no register.
             Op::GetLocal(i) if self.lp.objects.contains(&i) => {}
             Op::GetLocal(i) if self.lp.arrays.contains(&i) => {}
-            Op::GetLocal(i) => self.read_local(i, self.reg(d)),
+            Op::GetLocal(i) => self.push_local(i, d),
             // The store that a fused element read already did (see `binds_element`) does nothing.
             Op::PopToLocal(_) if ip > 0 && self.binds_element(ip - 1) => {}
             Op::PopToLocal(i) if self.lp.objects.contains(&i) => {
@@ -2475,17 +2558,22 @@ impl Emitter<'_, '_> {
                 self.write_local(i, x);
             }
             Op::SetLocal(i) | Op::PopToLocal(i) => self.write_local(i, x),
-            Op::AddToLocal(i) => self.update_local(i, SSE_ADD, x),
+            Op::AddToLocal(i) => {
+                // The pending operands below the top are copied out first, since the local is written.
+                self.materialize(d - 1);
+                let x = self.operand(d - 1);
+                self.update_local(i, SSE_ADD, x);
+            }
             Op::IncLocal(i) => self.step_counter(i, SSE_ADD, 1, ip),
             Op::DecLocal(i) => self.step_counter(i, SSE_SUB, -1, ip),
             Op::AddLK(i, k) => self.with_constant(i, k, SSE_ADD, self.reg(d)),
             Op::SubLK(i, k) => self.with_constant(i, k, SSE_SUB, self.reg(d)),
             Op::MulLK(i, k) => self.with_constant(i, k, SSE_MUL, self.reg(d)),
             Op::ModLK(i, k) => self.mod_constant(i, k, self.reg(d)),
-            Op::Add => self.a.sse(SSE_ADD, y, x),
-            Op::Sub => self.a.sse(SSE_SUB, y, x),
-            Op::Mul => self.a.sse(SSE_MUL, y, x),
-            Op::Div => self.a.sse(SSE_DIV, y, x),
+            Op::Add => self.arith(SSE_ADD, d),
+            Op::Sub => self.arith(SSE_SUB, d),
+            Op::Mul => self.arith(SSE_MUL, d),
+            Op::Div => self.arith(SSE_DIV, d),
             Op::Mod => match self.magic_divisor(ip) {
                 Some((n, c)) => self.mod_top(y, n, c, self.mark(ip, d - 2) == Mark::Int),
                 None => {
@@ -2506,28 +2594,40 @@ impl Emitter<'_, '_> {
             }
             // `a < b` is `b > a`, and an unordered compare (NaN) sets CF, so the `above` tests are false.
             Op::Lt => {
+                let (x, y) = self.operands(d);
                 self.a.ucomisd(x, y);
-                self.set(y, CC_A);
+                let dst = self.reg(d - 2);
+                self.set(dst, CC_A);
             }
             Op::Le => {
+                let (x, y) = self.operands(d);
                 self.a.ucomisd(x, y);
-                self.set(y, CC_AE);
+                let dst = self.reg(d - 2);
+                self.set(dst, CC_AE);
             }
             Op::Gt => {
+                let (x, y) = self.operands(d);
                 self.a.ucomisd(y, x);
-                self.set(y, CC_A);
+                let dst = self.reg(d - 2);
+                self.set(dst, CC_A);
             }
             Op::Ge => {
+                let (x, y) = self.operands(d);
                 self.a.ucomisd(y, x);
-                self.set(y, CC_AE);
+                let dst = self.reg(d - 2);
+                self.set(dst, CC_AE);
             }
             Op::Eq | Op::StrictEq => {
+                let (x, y) = self.operands(d);
                 self.a.ucomisd(y, x);
-                self.set_equal(y, true);
+                let dst = self.reg(d - 2);
+                self.set_equal(dst, true);
             }
             Op::Ne | Op::StrictNe => {
+                let (x, y) = self.operands(d);
                 self.a.ucomisd(y, x);
-                self.set_equal(y, false);
+                let dst = self.reg(d - 2);
+                self.set_equal(dst, false);
             }
             Op::Not => {
                 self.zero_test(x);
@@ -2538,6 +2638,8 @@ impl Emitter<'_, '_> {
                 self.a.jmp(target);
             }
             Op::JumpIfFalse(t) => {
+                self.materialize(d - 1);
+                let x = self.operand(d - 1);
                 self.zero_test(x);
                 self.jump_if(t, CC_E);
             }
@@ -2551,19 +2653,27 @@ impl Emitter<'_, '_> {
                 self.jump_if(t, CC_NE);
             }
             Op::JumpIfTrue(t) => {
+                self.materialize(d - 1);
+                let x = self.operand(d - 1);
                 self.zero_test(x);
                 self.jump_if(t, CC_NE);
             }
             Op::JumpIfNotLt(t) => {
+                self.materialize(d - 2);
+                let (x, y) = self.operands(d);
                 self.a.ucomisd(x, y);
                 self.jump_if(t, CC_BE);
             }
             Op::JumpIfNotLe(t) => {
+                self.materialize(d - 2);
+                let (x, y) = self.operands(d);
                 self.a.ucomisd(x, y);
                 self.jump_if(t, CC_B);
             }
             // Equal numbers set ZF and not PF, since an unordered (NaN) comparison sets both.
             Op::JumpIfStrictEq(t) => {
+                self.materialize(d - 2);
+                let (x, y) = self.operands(d);
                 self.a.ucomisd(x, y);
                 let not_equal = self.a.label();
                 self.a.jcc(CC_P, not_equal);
@@ -2571,37 +2681,47 @@ impl Emitter<'_, '_> {
                 self.a.bind(not_equal);
             }
             Op::JumpIfNotStrictEq(t) => {
+                self.materialize(d - 2);
+                let (x, y) = self.operands(d);
                 self.a.ucomisd(x, y);
                 self.jump_if(t, CC_P);
                 self.jump_if(t, CC_NE);
             }
             Op::JumpIfNotGt(t) => {
+                self.materialize(d - 2);
+                let (x, y) = self.operands(d);
                 self.a.ucomisd(y, x);
                 self.jump_if(t, CC_BE);
             }
             Op::JumpIfNotGe(t) => {
+                self.materialize(d - 2);
+                let (x, y) = self.operands(d);
                 self.a.ucomisd(y, x);
                 self.jump_if(t, CC_B);
             }
             Op::JumpIfLtLK(i, k, t) => {
+                self.materialize(d);
                 let local = self.local_src(i, 1);
                 let c = self.constant(number(self.proto, k).to_bits(), 0);
                 self.a.ucomisd(c, local);
                 self.jump_if(t, CC_A);
             }
             Op::JumpIfNotLtLK(i, k, t) => {
+                self.materialize(d);
                 let local = self.local_src(i, 1);
                 let c = self.constant(number(self.proto, k).to_bits(), 0);
                 self.a.ucomisd(c, local);
                 self.jump_if(t, CC_BE);
             }
             Op::JumpIfLtLL(p, q, t) => {
+                self.materialize(d);
                 let a = self.local_src(p, 0);
                 let b = self.local_src(q, 1);
                 self.a.ucomisd(b, a);
                 self.jump_if(t, CC_A);
             }
             Op::JumpIfNotLtLL(p, q, t) => {
+                self.materialize(d);
                 let a = self.local_src(p, 0);
                 let b = self.local_src(q, 1);
                 self.a.ucomisd(b, a);
@@ -2681,12 +2801,15 @@ impl Emitter<'_, '_> {
                 self.elem_read(key, row, tag, self.mark(ip, d - 1) == Mark::Int, exit);
             }
             Op::SetIndexLocal(a) => {
+                // The key and the value are read where they are. The exit copies the pending operands back first (see
+                // `side_exit`), so it is taken before they are read.
                 let exit = self.side_exit(ip, d);
                 let boolean = self.mark(ip, d - 1) == Mark::Bool;
-                let (key, value) = (self.reg(d - 2), self.reg(d - 1));
+                let (value, key) = self.operands(d);
+                let dst = self.reg(d - 2);
                 self.a.mov_load(R8, local_mem(a).at(8));
                 self.elem_write(key, value, boolean, self.mark(ip, d - 2) == Mark::Int, exit);
-                self.a.movapd_rr(key, value);
+                self.a.movapd_rr(dst, value);
             }
             Op::SetIndex2Local(a) => {
                 let exit = self.side_exit(ip, d);
@@ -3139,12 +3262,83 @@ impl Emitter<'_, '_> {
         self.a.cvtsi2sd(left, RDX);
     }
 
-    /// Loads the number `n` as the operand at depth `d`.
-    fn load_number(&mut self, n: f64, d: i32) {
+    /// Binds the label of instruction `ip`. A jump that reaches it leaves every operand in its register, so the code that
+    /// falls through to it copies the pending operands first.
+    fn bind_at(&mut self, at: Label, ip: usize) {
+        if self.jumped_to[ip] {
+            self.materialize(PENDING as i32);
+        }
+        self.a.bind(at);
+    }
+
+    /// Copies the pending operands at depths below `below` into their registers.
+    fn materialize(&mut self, below: i32) {
+        for k in 0..(below.max(0) as usize).min(PENDING) {
+            if let Some(src) = self.pending[k].take() {
+                self.load_src(k as i32, src);
+            }
+        }
+    }
+
+    /// Copies the pending operand `src` into the register of depth `k`.
+    fn load_src(&mut self, k: i32, src: Src) {
+        let dst = self.reg(k);
+        match src {
+            Src::Reg(r) => {
+                if r != dst {
+                    self.a.movapd_rr(dst, r);
+                }
+            }
+            Src::Mem(m) => self.a.movsd_load(dst, m),
+        }
+    }
+
+    /// The register of the operand at depth `k`, for an operator that only reads it. A pending operand is read where it
+    /// is, so it is not copied for this read.
+    fn operand(&mut self, k: i32) -> u8 {
+        match self.pending[k as usize].take() {
+            Some(Src::Reg(r)) => r,
+            Some(Src::Mem(m)) => {
+                let dst = self.reg(k);
+                self.a.movsd_load(dst, m);
+                dst
+            }
+            None => self.reg(k),
+        }
+    }
+
+    /// The registers of the operands of an operator at height `d`: the right one (at depth `d - 1`), then the left one.
+    fn operands(&mut self, d: i32) -> (u8, u8) {
+        let x = self.operand(d - 1);
+        let y = self.operand(d - 2);
+        (x, y)
+    }
+
+    /// Pushes the number `n` at depth `d`. A constant of the pool is read where it is, and another one is loaded into the
+    /// register of the depth.
+    fn push_number(&mut self, n: f64, d: i32) {
         let c = self.constant(n.to_bits(), self.reg(d));
         if c != self.reg(d) {
-            self.a.movapd_rr(self.reg(d), c);
+            self.pending[d as usize] = Some(Src::Reg(c));
         }
+    }
+
+    /// Pushes local `i` at depth `d`, to be read where the local is.
+    fn push_local(&mut self, i: u32, d: i32) {
+        self.pending[d as usize] = Some(match self.home(i) {
+            Home::Reg(x) => Src::Reg(x),
+            Home::Mem(m) => Src::Mem(m),
+        });
+    }
+
+    /// `left op right`, into the register of the left operand, for the operators that read both operands in place.
+    fn arith(&mut self, sse: u8, d: i32) {
+        let (x, y) = self.operands(d);
+        let dst = self.reg(d - 2);
+        if y != dst {
+            self.a.movapd_rr(dst, y);
+        }
+        self.a.sse(sse, dst, x);
     }
 
     /// The byte where the tag of the element operand at depth `k` is kept, which a side exit writes back.
@@ -3200,6 +3394,8 @@ impl Emitter<'_, '_> {
                     exit,
                     cont,
                 }),
+                pending: [None; PENDING],
+                jumped_to: jump_targets(&inl.proto),
             };
             body.emit_inline();
         }
@@ -3213,7 +3409,7 @@ impl Emitter<'_, '_> {
     fn emit_inline(&mut self) {
         for ip in 0..self.proto.code.len() {
             let at = self.at[ip];
-            self.a.bind(at);
+            self.bind_at(at, ip);
             let d = self.depth[ip];
             if d < 0 {
                 self.a.ud2();
@@ -3222,6 +3418,7 @@ impl Emitter<'_, '_> {
                 self.op(op, d, ip);
             }
         }
+        self.materialize(PENDING as i32);
         if let Some(ctx) = self.inline {
             self.a.jmp(ctx.cont);
         }
@@ -3241,7 +3438,11 @@ impl Emitter<'_, '_> {
             return ctx.exit;
         }
         let stub = self.a.label();
-        self.sides.push((stub, ip, d));
+        // The operands still pending here are read where they are, so the stub copies them into their registers first.
+        let pending: Vec<(i32, Src)> = (0..PENDING)
+            .filter_map(|k| self.pending[k].map(|src| (k as i32, src)))
+            .collect();
+        self.sides.push((stub, ip, d, pending));
         stub
     }
 

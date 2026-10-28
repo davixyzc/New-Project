@@ -1,0 +1,17 @@
+// Operands that wait in their registers across the operators of a loop: both orders of two pending
+// operands, a constant on either side, and a compare of a local with a constant or another local.
+const K = 3.5;
+let a = 1.25, b = -2, c = 7, total = 0, acc = 0;
+for (let i = 0; i < 50; i++) {
+  total += a - b;
+  total += b - a;
+  total += K - c;
+  total += c - K;
+  total += a * K - b / K;
+  total += (i - K) * (c + a);
+  acc = acc + (a < b ? 1 : 0) + (b <= c ? 2 : 0) + (K >= a ? 4 : 0) + (c > K ? 8 : 0);
+  if (K < i) total -= 0.5;
+  if (i <= c) total += 0.25;
+  a = a + 0.5;
+}
+console.log(total.toFixed(4), acc, a, b, c);

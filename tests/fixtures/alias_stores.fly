@@ -1,0 +1,33 @@
+// Indexed stores in loops whose key and value are still pending when the store takes its generic path: an element that
+// holds text, a key past the end of the array, and boolean elements. The stores that stay on the fast path go on too.
+const xs = [1, 2, 3, 4];
+let t = 0;
+for (let i = 0; i < 8; i++) {
+  const k = i % 4;
+  xs[k] = i * 0.5 + k;
+  t += xs[k];
+}
+xs[1] = "text";
+for (let i = 0; i < 6; i++) {
+  const k = i % 4;
+  xs[k] = k * 10 + i;
+  t += i;
+}
+for (let i = 0; i < 5; i++) {
+  xs[i + 6] = i - 1;
+}
+const flags = [];
+for (let i = 0; i < 6; i++) flags.push(false);
+for (let i = 0; i < 6; i++) flags[i] = i % 3 === 0;
+let c = 0;
+for (let i = 0; i < 6; i++) if (flags[i]) c += i + 1;
+console.log(t, xs.length, xs.join(","), c);
+
+// The same in a function, whose locals live in its frame, with a store that leaves the loop part way.
+function fill(arr, n) {
+  for (let i = 0; i < n; i++) arr[i] = i * 2 + n;
+  return arr;
+}
+const ys = [0, 0, "x", 0, 0];
+fill(ys, 5);
+console.log(ys.join(" "));

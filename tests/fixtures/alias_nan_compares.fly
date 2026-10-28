@@ -1,0 +1,14 @@
+// Comparisons with NaN, with equal numbers, and with zeros of either sign, where the operands are still pending.
+const nan = 0 / 0;
+let hits = 0, s = 0, z = -0;
+for (let i = 0; i < 12; i++) {
+  if (nan < i) hits += 1;
+  if (nan <= i) hits += 10;
+  if (nan > i) hits += 100;
+  if (i >= nan) hits += 1000;
+  if (nan === nan) hits += 10000;
+  if (nan !== nan) hits += 100000;
+  if (z === 0) hits += 1000000;
+  s = s + (z < 0 ? 1 : 0) + (i === i ? 2 : 0) + (i <= 5 ? 4 : 0) + (nan ? 8 : 0);
+}
+console.log(hits, s);
