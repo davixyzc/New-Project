@@ -1750,18 +1750,20 @@ impl<'a> Gen<'a> {
     }
 
     /// `a % b` on whole numbers, which `value::js_mod` gives by the same integer division. The dividend must be a whole
-    /// number in 32 bits with its sign bit clear (so -0 is refused too), and the divisor a positive whole number in 32
+    /// number below 2^53 with its sign bit clear (so -0 is refused too), and the divisor a positive whole number in 32
     /// bits. Then the remainder replaces `a` and the code jumps to `done`. Any other pair jumps to `miss`, before
     /// anything has changed.
     fn int_mod(&mut self, a: Mem, b: Mem, miss: Label, done: Label) {
+        let (wide, store) = (self.a.label(), self.a.label());
         self.check_tag(a, TAG_NUM, miss);
         self.check_tag(b, TAG_NUM, miss);
         self.a.mov_load(RAX, a.at(8));
         self.a.test64(RAX, RAX);
         self.a.jcc(CC_S, miss);
+        // A whole dividend converts back to the same double only when it is an exact 64-bit integer.
         self.a.movsd_load(0, a.at(8));
-        self.a.cvttsd2si(RCX, 0);
-        self.a.cvtsi2sd(1, RCX);
+        self.a.cvttsd2si64(RCX, 0);
+        self.a.cvtsi2sd64(1, RCX);
         self.a.ucomisd(0, 1);
         self.a.jcc(CC_NE, miss);
         self.a.jcc(CC_P, miss);
@@ -1775,9 +1777,28 @@ impl<'a> Gen<'a> {
         self.a.test32(R8, R8);
         self.a.jcc(CC_E, miss);
         self.a.jcc(CC_L, miss);
+        // A dividend below 2^31 takes the 32-bit division, which is the common case.
+        self.a.mov_rr(R9, RCX);
+        self.a.shr64_imm(R9, 31);
         self.a.mov_rr(RAX, RCX);
         self.a.mov_imm32(RDX, 0);
+        self.a.jcc(CC_NE, wide);
         self.a.idiv32(R8);
+        self.a.jmp(store);
+        // A dividend below 2^53 is exact as a double. Its quotient by c, rounded, cannot reach the next whole number,
+        // which is at least 1/c away, so the truncated quotient is the exact one.
+        self.a.bind(wide);
+        self.a.mov_rr(R9, RCX);
+        self.a.shr64_imm(R9, 53);
+        self.a.jcc(CC_NE, miss);
+        self.a.cvtsi2sd64(0, RCX);
+        self.a.cvtsi2sd64(1, R8);
+        self.a.sse(SSE_DIV, 0, 1);
+        self.a.cvttsd2si64(RDX, 0);
+        self.a.imul64(RDX, R8);
+        self.a.sub64(RCX, RDX);
+        self.a.mov_rr(RDX, RCX);
+        self.a.bind(store);
         self.a.cvtsi2sd(0, RDX);
         self.a.mov8_imm(a, TAG_NUM);
         self.a.movsd_store(a.at(8), 0);

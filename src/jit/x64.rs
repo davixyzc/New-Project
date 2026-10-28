@@ -251,6 +251,11 @@ impl Asm {
         self.op(Some(0xF2), false, &[0x0F, 0x2C], dst, Rm::Reg(src));
     }
 
+    /// `cvttsd2si dst64, src`: truncates to a 64-bit integer (0x8000000000000000 when out of range).
+    pub fn cvttsd2si64(&mut self, dst: u8, src: u8) {
+        self.op(Some(0xF2), true, &[0x0F, 0x2C], dst, Rm::Reg(src));
+    }
+
     /// `cvtsi2sd dst, src32`.
     pub fn cvtsi2sd(&mut self, dst: u8, src: u8) {
         self.op(Some(0xF2), false, &[0x0F, 0x2A], dst, Rm::Reg(src));
