@@ -43,10 +43,10 @@ const FN_TEMP_BASE: u8 = 2;
 const FN_MAX_DEPTH: i32 = 13;
 /// Arguments a function region takes, in xmm0 and up.
 pub(super) const MAX_ARGS: usize = 6;
-/// The bytes of a loop region's frame, below the saved `r13`: room to save the xmm registers a call
-/// clobbers, the tag cells, the row caches and the property caches, and a size that keeps rsp 16-byte
-/// aligned at those calls.
-const FRAME: i32 = 264;
+/// The bytes of a loop region's frame, below the saved `r14`, `r15` and `r13`: room to save the xmm registers a call
+/// clobbers, the tag cells, the row caches, and the property caches with the epoch that follows them, and a size that
+/// keeps rsp 16-byte aligned at those calls.
+const FRAME: i32 = 296;
 /// Where the tag of an element operand is kept, one byte per depth. `call_mod` saves its registers below this.
 const TAG_CELLS: i32 = 136;
 /// Where the row caches of a loop start, above the tag cells. Each read of a row takes a key and a row, 8 bytes each
@@ -59,6 +59,8 @@ const MAX_ROW_CACHES: usize = 4;
 const PROP_CACHE_BASE: i32 = ROW_CACHE_BASE + 16 * MAX_ROW_CACHES as i32;
 /// The most properties that a loop keeps the address of.
 const MAX_PROP_CACHES: usize = 8;
+// The property caches and the epoch after them must lie in the frame, which is below the saved registers.
+const _: () = assert!(PROP_CACHE_BASE + 8 * (MAX_PROP_CACHES as i32 + 1) <= FRAME - 8);
 /// The key of an empty row cache. A key is a 32-bit index (see `row_cached`), so no key takes it.
 const NO_KEY: u64 = 1 << 40;
 /// The largest magnitude an integer copy of a local may have. It stays exact, and fits an imm32.
