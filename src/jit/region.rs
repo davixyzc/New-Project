@@ -2815,7 +2815,10 @@ impl Emitter<'_, '_> {
                 let dst = self.reg(d - 2);
                 self.a.mov_load(R8, local_mem(a).at(8));
                 self.elem_write(key, value, boolean, self.mark(ip, d - 2) == Mark::Int, exit);
-                self.a.movapd_rr(dst, value);
+                // A statement drops the result, so nothing reads it and it is not copied.
+                if !self.discards(ip) {
+                    self.a.movapd_rr(dst, value);
+                }
             }
             Op::SetIndex2Local(a) => {
                 let exit = self.side_exit(ip, d);
@@ -3067,6 +3070,11 @@ impl Emitter<'_, '_> {
         live
     }
 
+    /// Whether the operator at `ip` is followed by a `Pop`, which drops its result, as a statement does.
+    fn discards(&self, ip: usize) -> bool {
+        matches!(self.proto.code.get(ip + 1), Some(&Op::Pop))
+    }
+
     /// The probe of a `push` on the array in local `s`: the local must hold an array with room for one more element.
     /// Anything else leaves the loop at `ip`, where the generic code runs the instruction. Nothing is on the stack
     /// before the probe, so the side exit writes back the operands below it, and no more.
@@ -3076,20 +3084,18 @@ impl Emitter<'_, '_> {
         self.a.cmp8_imm(local_mem(s), TAG_ARR);
         self.a.jcc(CC_NE, exit);
         self.a.mov_load(R8, local_mem(s).at(8));
-        self.a.mov_rr(RCX, R8);
-        self.a.add64_imm32(RCX, layout.vec);
         self.a.mov_load(
             RAX,
             Mem {
-                base: RCX,
-                disp: layout.len,
+                base: R8,
+                disp: layout.vec + layout.len,
             },
         );
         self.a.mov_load(
             RDX,
             Mem {
-                base: RCX,
-                disp: layout.cap,
+                base: R8,
+                disp: layout.vec + layout.cap,
             },
         );
         self.a.cmp_rr64(RAX, RDX);
@@ -3107,20 +3113,18 @@ impl Emitter<'_, '_> {
         let value = self.reg(d - 1);
         let boolean = self.mark(ip, d - 1) == Mark::Bool;
         self.a.mov_load(R8, local_mem(s).at(8));
-        self.a.mov_rr(RCX, R8);
-        self.a.add64_imm32(RCX, layout.vec);
         self.a.mov_load(
             RSI,
             Mem {
-                base: RCX,
-                disp: layout.len,
+                base: R8,
+                disp: layout.vec + layout.len,
             },
         );
         self.a.mov_load(
             RDX,
             Mem {
-                base: RCX,
-                disp: layout.buf,
+                base: R8,
+                disp: layout.vec + layout.buf,
             },
         );
         self.a.mov_rr(RAX, RSI);
@@ -3137,12 +3141,15 @@ impl Emitter<'_, '_> {
         self.a.add64_imm8(RSI, 1);
         self.a.mov_store(
             Mem {
-                base: RCX,
-                disp: layout.len,
+                base: R8,
+                disp: layout.vec + layout.len,
             },
             RSI,
         );
-        self.a.cvtsi2sd(self.reg(d - 3), RSI);
+        // A statement drops the new length, so nothing reads it and it is not converted.
+        if !self.discards(ip) {
+            self.a.cvtsi2sd(self.reg(d - 3), RSI);
+        }
     }
 
     /// A call of the function's own body with `argc` arguments, which are the top operands. The callee

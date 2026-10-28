@@ -1,0 +1,8 @@
+669 5001 true true
+1000 3000 false true true
+2001000 2000
+999.5 [ 998, 998.5, 999, 999.5 ]
+false [ false, false ]
+2000 s0 1 1999
+[ 1998, 'w1999', 'w1997' ]
+2000 false true false

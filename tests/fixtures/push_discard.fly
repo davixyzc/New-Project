@@ -1,0 +1,50 @@
+// Pushes and element stores in statement context, where their results are dropped, and in expression context, where they are read.
+const sieve = [];
+for (let i = 0; i <= 5000; i++) sieve.push(true);
+let primes = 0;
+for (let i = 2; i <= 5000; i++) {
+  if (sieve[i]) {
+    primes++;
+    for (let j = i * 2; j <= 5000; j += i) sieve[j] = false;
+  }
+}
+console.log(primes, sieve.length, sieve[4999], sieve[4973]);
+
+const flags = [];
+for (let i = 0; i < 3000; i++) flags.push(i % 3 === 0);
+let count = 0;
+for (let i = 0; i < 3000; i++) {
+  if (flags[i]) count++;
+  flags[i] = !flags[i];
+}
+console.log(count, flags.length, flags[0], flags[1], flags[2999]);
+
+// A push whose result is summed, and stores whose results are assigned.
+const lengths = [];
+let total = 0;
+for (let i = 0; i < 2000; i++) total += lengths.push(i);
+console.log(total, lengths.length);
+const cells = [0, 0, 0, 0];
+let last = 0;
+for (let i = 0; i < 2000; i++) last = cells[i % 4] = i * 0.5;
+console.log(last, cells);
+const bits = [false, false];
+let seen = false;
+for (let i = 0; i < 2000; i++) seen = bits[i & 1] = i % 5 === 0;
+console.log(seen, bits);
+
+// Numbers pushed, then text, which leaves the loop at the push that finds a reference.
+const mixed = [];
+for (let i = 0; i < 2000; i++) {
+  if (i % 100 === 0) mixed.push("s" + i);
+  else mixed.push(i);
+}
+console.log(mixed.length, mixed[0], mixed[1], mixed[1999]);
+
+// Stores that replace text with numbers, and a store at the end that grows the array.
+const words = ["a", "b", "c"];
+for (let i = 0; i < 2000; i++) words[i % 3] = i % 2 === 0 ? i : "w" + i;
+console.log(words);
+const holes = [];
+for (let i = 0; i < 2000; i++) holes[i] = i % 7 === 0;
+console.log(holes.length, holes[1999], holes[7], holes[8]);
