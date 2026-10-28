@@ -502,7 +502,7 @@ pub(super) fn emit_mod_const(
     whole: bool,
 ) {
     let (m, s) = magic(c);
-    let general = a.label();
+    let (big, general) = (a.label(), a.label());
     a.cvttsd2si(RAX, src);
     if whole {
         // A whole x truncates exactly, unless it is out of the 32-bit range, which truncates to the most negative int.
@@ -515,7 +515,35 @@ pub(super) fn emit_mod_const(
         a.jcc(CC_NE, slow);
         a.jcc(CC_P, slow);
     }
+    if whole && c <= 1 << 30 {
+        // A x from 1 to 2c - 1 has the remainder x, or x - c when x is at least c. One unsigned compare of x - 1 tests the
+        // range: 0, a negative x and an x from 2c on all fail it, since 2c - 2 is below 2^31. Zero is left out, since the
+        // remainder of -0 keeps its sign, which the general path takes. A x that is not known to be whole is left to the
+        // reciprocal, since a large one would pay for this test without using it.
+        a.lea(
+            RCX,
+            Mem {
+                base: RAX,
+                disp: -1,
+            },
+        );
+        a.cmp32_imm32(RCX, (2 * c - 2) as i32);
+        a.jcc(CC_A, big);
+        a.lea(
+            RCX,
+            Mem {
+                base: RAX,
+                disp: -(c as i32),
+            },
+        );
+        a.cmp32_imm32(RAX, c as i32);
+        a.cmov(CC_AE, RAX, RCX);
+        a.xorpd(dst, dst);
+        a.cvtsi2sd64(dst, RAX);
+        a.jmp(join);
+    }
     // A positive x is its own dividend, and its remainder is not negative: x - c * ((x * m) >> s), with no sign to take.
+    a.bind(big);
     a.test32(RAX, RAX);
     a.jcc(CC_LE, general);
     a.movsxd(RCX, RAX);

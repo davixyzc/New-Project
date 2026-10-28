@@ -28,7 +28,6 @@ use crate::bytecode::{Op, Proto};
 use crate::value::{
     arr_layout, cell_value_offset, entry_layout, epoch_address, prop_layout, PropHint, Value,
 };
-use crate::vm::MAX_ARRAY_GROW;
 use std::mem::offset_of;
 
 /// The xmm registers that hold locals of a loop, from xmm2 up. xmm0 and xmm1 are scratch.
@@ -50,11 +49,11 @@ pub(super) const MAX_ARGS: usize = 6;
 const FRAME: i32 = 264;
 /// Where the tag of an element operand is kept, one byte per depth. `call_mod` saves its registers below this.
 const TAG_CELLS: i32 = 136;
-/// Where the row caches of a loop start, above the tag cells. Each array with a cache takes a key and a row, 8 bytes each
+/// Where the row caches of a loop start, above the tag cells. Each read of a row takes a key and a row, 8 bytes each
 /// (see `row_cached`).
 const ROW_CACHE_BASE: i32 = 144;
-/// The most arrays that a loop keeps a row cache for.
-const MAX_ROW_CACHES: usize = 2;
+/// The most reads of rows that a loop keeps a row cache for.
+const MAX_ROW_CACHES: usize = 4;
 /// Where the property caches of a loop start, above the row caches. Each one takes the address of a property's value, 8
 /// bytes (see `prop_address`). The count of structural changes that they were last checked at follows them.
 const PROP_CACHE_BASE: i32 = ROW_CACHE_BASE + 16 * MAX_ROW_CACHES as i32;
@@ -145,8 +144,9 @@ pub(super) struct Region {
     /// The locals that hold arrays. A loop reads and writes their elements in place, so they have no register,
     /// and the loop checks on entry that they hold an array.
     arrays: Vec<u32>,
-    /// The arrays whose rows a loop reads by a whole key, which keep their last row in the frame (see `row_cached`).
-    row_caches: Vec<u32>,
+    /// The reads of rows by a whole key (the `GetIndex2Local` at each one), which keep their last row in the frame (see
+    /// `row_cached`).
+    row_caches: Vec<usize>,
     /// The properties that a loop reads or writes through an object local, which keep the address of their value in the
     /// frame (see `prop_address`).
     prop_caches: Vec<(u32, u32)>,
@@ -831,21 +831,17 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
             resumes.push(ip);
         }
     }
-    // An array whose rows the loop reads by a whole key keeps its last row in the frame (see `row_cached`). A loop that
-    // stores into the array, or rebinds its local, keeps none, which is stricter than needed: no store replaces a row.
-    // Two arrays at most take a cache.
-    let mut row_caches: Vec<u32> = Vec::new();
+    // A read of a row by a whole key keeps the last row it read in the frame (see `row_cached`). A loop that stores into the
+    // array, or rebinds its local, keeps none, which is stricter than needed: no store replaces a row. Each read has its own
+    // cache, so that two reads of one array, one by a key that changes and one by a key that stays, do not evict each other.
+    let mut row_caches: Vec<usize> = Vec::new();
     for ip in header..=last {
         if let Op::GetIndex2Local(a) = code[ip] {
             let replaced = (header..=last).any(|j| {
                 matches!(code[j], Op::SetIndexLocal(b) | Op::SetLocal(b) | Op::PopToLocal(b) if b == a)
             });
-            if depth[ip] >= 0
-                && !replaced
-                && !row_caches.contains(&a)
-                && row_caches.len() < MAX_ROW_CACHES
-            {
-                row_caches.push(a);
+            if depth[ip] >= 0 && !replaced && row_caches.len() < MAX_ROW_CACHES {
+                row_caches.push(ip);
             }
         }
     }
@@ -2456,6 +2452,7 @@ fn reads_in_place(op: Op) -> bool {
             | Op::Ne
             | Op::StrictNe
             | Op::AddToLocal(_)
+            | Op::GetIndex2Local(_)
             | Op::SetIndexLocal(_)
             | Op::JumpIfFalse(_)
             | Op::JumpIfTrue(_)
@@ -3030,16 +3027,24 @@ impl Emitter<'_, '_> {
             }
             Op::GetIndex2Local(a) => {
                 let exit = self.side_exit(ip, d);
-                let (row, key, tag) = (self.reg(d - 2), self.reg(d - 1), self.tag_cell(d - 2));
                 let whole = self.mark(ip, d - 2) == Mark::Int;
-                self.a.mov_load(R8, local_mem(a).at(8));
-                match self.row_slots(a) {
+                // The row key and the key are read where they are, and the element is written to the depth of the row.
+                let (row, key, tag) = (
+                    self.operand(d - 2),
+                    self.operand(d - 1),
+                    self.tag_cell(d - 2),
+                );
+                match self.row_slots(ip) {
                     Some((key_slot, row_slot)) if whole => {
-                        self.row_cached(row, key_slot, row_slot, exit)
+                        self.row_cached(row, key_slot, row_slot, local_mem(a).at(8), exit)
                     }
-                    _ => self.elem_row(row, whole, exit),
+                    _ => {
+                        self.a.mov_load(R8, local_mem(a).at(8));
+                        self.elem_row(row, whole, exit)
+                    }
                 }
-                self.elem_read(key, row, tag, self.mark(ip, d - 1) == Mark::Int, exit);
+                let dst = self.reg(d - 2);
+                self.elem_read(key, dst, tag, self.mark(ip, d - 1) == Mark::Int, exit);
             }
             Op::SetIndexLocal(a) => {
                 // The key and the value are read where they are. The exit copies the pending operands back first (see
@@ -3760,10 +3765,7 @@ impl Emitter<'_, '_> {
             self.a.jcc(CC_NE, exit);
             self.a.jcc(CC_P, exit);
         }
-        self.a.movsxd(RAX, RAX);
-        // A negative index is huge as an unsigned number, so the bounds below refuse it too.
-        self.a.cmp64_imm32(RAX, MAX_ARRAY_GROW as i32);
-        self.a.jcc(CC_AE, exit);
+        // The index is zero-extended, so a negative one is huge as an unsigned number, and the bound below refuses it.
         self.a.mov_load(
             RSI,
             Mem {
@@ -3821,9 +3823,9 @@ impl Emitter<'_, '_> {
         }
     }
 
-    /// The key and row slots of the row cache of array `a`, when the loop keeps one (see `row_caches`).
-    fn row_slots(&self, a: u32) -> Option<(Mem, Mem)> {
-        let j = self.lp.row_caches.iter().position(|&b| b == a)?;
+    /// The key and row slots of the row cache of the read at `ip`, when the loop keeps one (see `row_caches`).
+    fn row_slots(&self, ip: usize) -> Option<(Mem, Mem)> {
+        let j = self.lp.row_caches.iter().position(|&b| b == ip)?;
         Some((row_cache_mem(j, 0), row_cache_mem(j, 8)))
     }
 
@@ -3832,7 +3834,7 @@ impl Emitter<'_, '_> {
     /// checks, which passed when the key was stored. The rows of the array do not change while the loop runs: an element
     /// store exits before it overwrites a reference (see `elem_write`), and a loop keeps no cache for an array it rebinds
     /// (see `plan`). An empty slot holds `NO_KEY`, which no key takes.
-    fn row_cached(&mut self, key: u8, key_slot: Mem, row_slot: Mem, exit: Label) {
+    fn row_cached(&mut self, key: u8, key_slot: Mem, row_slot: Mem, array: Mem, exit: Label) {
         let (miss, done) = (self.a.label(), self.a.label());
         self.a.cvttsd2si(RCX, key);
         self.a.mov_load(RAX, key_slot);
@@ -3841,6 +3843,7 @@ impl Emitter<'_, '_> {
         self.a.mov_load(R8, row_slot);
         self.a.jmp(done);
         self.a.bind(miss);
+        self.a.mov_load(R8, array);
         self.elem_row(key, true, exit);
         self.a.mov_store(key_slot, RCX);
         self.a.mov_store(row_slot, R8);
@@ -4583,9 +4586,10 @@ mod tests {
             3,
             0,
         );
+        // The read `a[j][j]` is the `GetIndex2Local` at instruction 4, which keeps the cache.
         assert_eq!(
             plan_at(&p, 2).expect("the loop is planned").row_caches,
-            vec![0]
+            vec![4]
         );
     }
 

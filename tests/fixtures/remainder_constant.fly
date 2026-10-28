@@ -1,0 +1,52 @@
+// Remainders by literal divisors, in loops (whole counters, and values that are not whole) and in functions, with
+// zeros, -0, NaN, infinities and values outside the 32-bit range. The divisors include 2^30 and 2^30 + 1, where the
+// fast path for whole values stops.
+function f2(x) { return x % 2; }
+function f7(x) { return x % 7; }
+function f120(x) { return x % 120; }
+function f1073741824(x) { return x % 1073741824; }
+function f1073741825(x) { return x % 1073741825; }
+function f2147483647(x) { return x % 2147483647; }
+const edge = [-0, 0, 2147483647, -2147483648, 2147483648, 3e9, -3e9, 9007199254740993, 3.5, -3.5, 0.1, NaN, Infinity, -Infinity, 119, 120, 121, 239, 240, 241, 1073741824, 1073741825];
+{
+  for (let i = 0; i < edge.length; i++) { const r = edge[i] % 2; console.log(2, i, String(r), 1 / r); }
+  for (let v = -60; v <= 60; v++) { const r = v % 2; console.log(2, 'w', v, String(r), 1 / r); }
+  for (let v = -20; v <= 20; v++) { const r = (v + 0.5) % 2; console.log(2, 'f', v, String(r), 1 / r); }
+  for (let i = 0; i < edge.length; i++) { const r = f2(edge[i]); console.log(2, 'c', i, String(r), 1 / r); }
+  for (let v = -60; v <= 60; v++) { const r = f2(v * 1000003); console.log(2, 'g', v, String(r), 1 / r); }
+}
+{
+  for (let i = 0; i < edge.length; i++) { const r = edge[i] % 7; console.log(7, i, String(r), 1 / r); }
+  for (let v = -60; v <= 60; v++) { const r = v % 7; console.log(7, 'w', v, String(r), 1 / r); }
+  for (let v = -20; v <= 20; v++) { const r = (v + 0.5) % 7; console.log(7, 'f', v, String(r), 1 / r); }
+  for (let i = 0; i < edge.length; i++) { const r = f7(edge[i]); console.log(7, 'c', i, String(r), 1 / r); }
+  for (let v = -60; v <= 60; v++) { const r = f7(v * 1000003); console.log(7, 'g', v, String(r), 1 / r); }
+}
+{
+  for (let i = 0; i < edge.length; i++) { const r = edge[i] % 120; console.log(120, i, String(r), 1 / r); }
+  for (let v = -60; v <= 60; v++) { const r = v % 120; console.log(120, 'w', v, String(r), 1 / r); }
+  for (let v = -20; v <= 20; v++) { const r = (v + 0.5) % 120; console.log(120, 'f', v, String(r), 1 / r); }
+  for (let i = 0; i < edge.length; i++) { const r = f120(edge[i]); console.log(120, 'c', i, String(r), 1 / r); }
+  for (let v = -60; v <= 60; v++) { const r = f120(v * 1000003); console.log(120, 'g', v, String(r), 1 / r); }
+}
+{
+  for (let i = 0; i < edge.length; i++) { const r = edge[i] % 1073741824; console.log(1073741824, i, String(r), 1 / r); }
+  for (let v = -60; v <= 60; v++) { const r = v % 1073741824; console.log(1073741824, 'w', v, String(r), 1 / r); }
+  for (let v = -20; v <= 20; v++) { const r = (v + 0.5) % 1073741824; console.log(1073741824, 'f', v, String(r), 1 / r); }
+  for (let i = 0; i < edge.length; i++) { const r = f1073741824(edge[i]); console.log(1073741824, 'c', i, String(r), 1 / r); }
+  for (let v = -60; v <= 60; v++) { const r = f1073741824(v * 1000003); console.log(1073741824, 'g', v, String(r), 1 / r); }
+}
+{
+  for (let i = 0; i < edge.length; i++) { const r = edge[i] % 1073741825; console.log(1073741825, i, String(r), 1 / r); }
+  for (let v = -60; v <= 60; v++) { const r = v % 1073741825; console.log(1073741825, 'w', v, String(r), 1 / r); }
+  for (let v = -20; v <= 20; v++) { const r = (v + 0.5) % 1073741825; console.log(1073741825, 'f', v, String(r), 1 / r); }
+  for (let i = 0; i < edge.length; i++) { const r = f1073741825(edge[i]); console.log(1073741825, 'c', i, String(r), 1 / r); }
+  for (let v = -60; v <= 60; v++) { const r = f1073741825(v * 1000003); console.log(1073741825, 'g', v, String(r), 1 / r); }
+}
+{
+  for (let i = 0; i < edge.length; i++) { const r = edge[i] % 2147483647; console.log(2147483647, i, String(r), 1 / r); }
+  for (let v = -60; v <= 60; v++) { const r = v % 2147483647; console.log(2147483647, 'w', v, String(r), 1 / r); }
+  for (let v = -20; v <= 20; v++) { const r = (v + 0.5) % 2147483647; console.log(2147483647, 'f', v, String(r), 1 / r); }
+  for (let i = 0; i < edge.length; i++) { const r = f2147483647(edge[i]); console.log(2147483647, 'c', i, String(r), 1 / r); }
+  for (let v = -60; v <= 60; v++) { const r = f2147483647(v * 1000003); console.log(2147483647, 'g', v, String(r), 1 / r); }
+}
