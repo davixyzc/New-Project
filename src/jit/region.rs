@@ -46,7 +46,7 @@ pub(super) const MAX_ARGS: usize = 6;
 /// The bytes of a loop region's frame, below the saved `r14`, `r15` and `r13`: room to save the xmm registers a call
 /// clobbers, the tag cells, the row caches, and the property caches with the epoch that follows them, and a size that
 /// keeps rsp 16-byte aligned at those calls.
-const FRAME: i32 = 296;
+const FRAME: i32 = 312;
 /// Where the tag of an element operand is kept, one byte per depth. `call_mod` saves its registers below this.
 const TAG_CELLS: i32 = 136;
 /// Where the row caches of a loop start, above the tag cells. Each read of a row takes a key and a row, 8 bytes each
@@ -54,13 +54,18 @@ const TAG_CELLS: i32 = 136;
 const ROW_CACHE_BASE: i32 = 144;
 /// The most reads of rows that a loop keeps a row cache for.
 const MAX_ROW_CACHES: usize = 4;
-/// Where the property caches of a loop start, above the row caches. Each one takes the address of a property's value, 8
+/// Where the argument of an inlined body is kept, as a value: its tag here and its payload 8 bytes up (see `arg_payload`).
+/// It lies above the row caches and below the property caches, which do not overlap it.
+const ARG_SLOT: i32 = ROW_CACHE_BASE + 16 * MAX_ROW_CACHES as i32;
+/// Where the property caches of a loop start, above the argument. Each one takes the address of a property's value, 8
 /// bytes (see `prop_address`). The count of structural changes that they were last checked at follows them.
-const PROP_CACHE_BASE: i32 = ROW_CACHE_BASE + 16 * MAX_ROW_CACHES as i32;
+const PROP_CACHE_BASE: i32 = ARG_SLOT + 16;
 /// The most properties that a loop keeps the address of.
 const MAX_PROP_CACHES: usize = 8;
-// The property caches and the epoch after them must lie in the frame, which is below the saved registers.
+// The property caches and the epoch after them must lie in the frame, which is below the saved registers. The argument
+// and the caches must not overlap.
 const _: () = assert!(PROP_CACHE_BASE + 8 * (MAX_PROP_CACHES as i32 + 1) <= FRAME - 8);
+const _: () = assert!(ARG_SLOT + 16 <= PROP_CACHE_BASE);
 /// The key of an empty row cache. A key is a 32-bit index (see `row_cached`), so no key takes it.
 const NO_KEY: u64 = 1 << 40;
 /// The largest magnitude an integer copy of a local may have. It stays exact, and fits an imm32.
@@ -196,10 +201,6 @@ struct InlineCtx {
     exit: Label,
     cont: Label,
 }
-
-/// The payload of the argument of an inlined body. The loop keeps it in its frame, below the property caches, since
-/// the argument is a number and the body reads it as one.
-const ARG_SLOT: i32 = 240;
 
 fn arg_payload() -> Mem {
     Mem {

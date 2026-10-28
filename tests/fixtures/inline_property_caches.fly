@@ -1,0 +1,19 @@
+// A loop that calls a method in place and reads many properties of objects. Its property caches and the argument of the
+// inlined body must keep their own slots in the frame, so the sums and the stored properties must match a call.
+const a = { x: 1, y: 2, z: 3, u: 4, v: 5, w: 6, n: 0 };
+const b = { x: 10, y: 20, z: 30, u: 40, v: 50, w: 60, n: 0 };
+const acc = {
+  total: 0,
+  add(k) {
+    this.total += k;
+  },
+};
+let s = 0;
+for (let i = 0; i < 200; i++) {
+  acc.add(i % 7);
+  s += a.x + a.y + a.z + a.u + a.v + a.w + b.x + b.y + b.z + b.u + b.v + b.w;
+  a.n += a.x;
+  b.n = b.n + b.w;
+  acc.add(a.v - b.u);
+}
+console.log(s, acc.total, a.n, b.n);
