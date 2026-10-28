@@ -4093,6 +4093,7 @@ mod tests {
             closure_entry: Default::default(),
             closure_argc: std::cell::Cell::new(u32::MAX),
             closure_bool: Default::default(),
+            factory: Default::default(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams,

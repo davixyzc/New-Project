@@ -222,6 +222,10 @@ pub struct Proto {
     pub closure_argc: Cell<u32>,
     /// Whether `closure_entry` returns a boolean.
     pub closure_bool: Cell<bool>,
+    /// One more than the index of the closure that the function returns, when it is a factory (see `factory_child`), and
+    /// zero for any other function. Native code makes that closure itself, without a call (see `rt::call_factory`). It is
+    /// set when the function is first compiled.
+    pub factory: Cell<u32>,
     pub protos: Vec<Rc<Proto>>,
     pub upvals: Vec<UpvalDesc>,
     pub nparams: u32,
@@ -232,16 +236,50 @@ pub struct Proto {
     pub native: crate::jit::Slot,
 }
 
+/// The `call_argc` of a factory: no call has this many arguments, so every call of it leaves the direct path, which makes
+/// the closure instead (see `Proto::factory`). It is a positive number, so that native code can compare it as a 32-bit
+/// immediate.
+pub const FACTORY_ARGC: u32 = 0x7FFF_FFFE;
+
+/// One more than the index of the closure that `proto` returns, when it is a factory, and zero for any other function. A
+/// factory is not an arrow and takes no rest parameter, and its code begins by making a closure and returning it, where
+/// every variable that the closure captures is a parameter that nothing writes (see `UpvalDesc`).
+fn factory_child(proto: &Proto) -> u32 {
+    if proto.is_arrow || proto.has_rest {
+        return 0;
+    }
+    let child = match proto.code.as_slice() {
+        [Op::Closure(i), Op::Return, ..] => *i as usize,
+        _ => return 0,
+    };
+    let Some(inner) = proto.protos.get(child) else {
+        return 0;
+    };
+    let captures_params = inner
+        .upvals
+        .iter()
+        .all(|u| u.from_local && u.by_value && (u.index as usize) < proto.nparams as usize);
+    if captures_params {
+        child as u32 + 1
+    } else {
+        0
+    }
+}
+
 impl Proto {
     /// The function's native code, if it has any.
     pub fn native(&self) -> Option<&crate::jit::Native> {
         self.native
             .get_or_init(|| {
+                self.factory.set(factory_child(self));
                 let compiled = crate::jit::compile(self);
                 if let Some(code) = &compiled {
                     // A function with a numeric entry has no `call_entry`: native code tries `numeric_entry` first,
                     // and the helpers try it too.
-                    if !code.has_numeric_entry() {
+                    // A factory has no direct entry: a call of it makes the closure instead (see `factory_child`).
+                    if self.factory.get() != 0 {
+                        self.call_argc.set(FACTORY_ARGC);
+                    } else if !code.has_numeric_entry() {
                         self.call_entry.set(code.entry() as usize);
                         self.call_frame_len.set(code.frame_len());
                         self.call_argc.set(if self.has_rest {

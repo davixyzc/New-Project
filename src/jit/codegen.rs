@@ -1118,7 +1118,15 @@ impl<'a> Gen<'a> {
     /// have room for its frame. The arguments are already in place, at the top of this frame, and they become the
     /// callee's parameters. Any other call jumps to `generic`, which calls the helper. The callee must already be
     /// checked to be a closure, and RCX and RDX must hold it and its prototype (see `load_proto`).
-    fn closure_call(&mut self, ip: usize, d: i32, argc: u32, generic: Label, ran: Label) {
+    fn closure_call(
+        &mut self,
+        ip: usize,
+        d: i32,
+        argc: u32,
+        generic: Label,
+        ran: Label,
+        done: Label,
+    ) {
         let argc = argc as i32;
         let nlocals = self.proto.nlocals as i32;
         // The callee's frame starts at its first argument, which is `base` bytes above this frame's base.
@@ -1139,8 +1147,9 @@ impl<'a> Gen<'a> {
             .mov_load(R8, proto_field(std::mem::offset_of!(Proto, call_entry)));
         self.a
             .mov32_load(R9, proto_field(std::mem::offset_of!(Proto, call_argc)));
+        let not_direct = self.a.label();
         self.a.cmp64_imm32(R9, argc);
-        self.a.jcc(CC_NE, generic);
+        self.a.jcc(CC_NE, not_direct);
         // The frame stack has room for one more frame.
         self.a.mov_load(
             R10,
@@ -1299,6 +1308,13 @@ impl<'a> Gen<'a> {
         self.a.mov_rr(RAX, R8);
         self.a.call_reg(RAX);
         self.a.jmp(ran);
+        // A call that the direct entry does not take. A factory makes its closure here (see `factory_call`), and any other
+        // call goes to the generic call. R9 still holds the function's `call_argc`.
+        self.a.bind(not_direct);
+        self.a.cmp64_imm32(R9, crate::bytecode::FACTORY_ARGC as i32);
+        self.a.jcc(CC_NE, generic);
+        self.factory_call(d, argc as u32, done);
+        self.a.jmp(generic);
     }
 
     /// Leaves the closure in `callee` in RCX, and its prototype in RDX, as `closure_call` and `numeric_call` read them.
@@ -1528,6 +1544,25 @@ impl<'a> Gen<'a> {
 
     /// A plain call. `rt::call_plain` pushes the callee's frame when it can, and then native code
     /// runs the callee's code itself. Otherwise the call has already run when the helper returns.
+    /// Calls the helper that makes the closure of a factory (see `rt::call_factory`), with the callee, its `this` and the
+    /// arguments of the call at depth `d`. The helper replaces the callee with the closure, and the call goes to `done`. A
+    /// call that the helper declines falls through, with nothing changed.
+    fn factory_call(&mut self, d: i32, argc: u32, done: Label) {
+        let argc = argc as i32;
+        let callee = self.temp(d - argc - 2);
+        let this = self.temp(d - argc - 1);
+        let first = self.temp(d - argc);
+        self.a.lea(RDI, callee);
+        self.a.lea(RSI, this);
+        self.a.lea(RDX, first);
+        self.a.mov_imm32(RCX, argc as u32);
+        self.a
+            .mov_imm64(RAX, rt::call_factory as *const () as usize as u64);
+        self.a.call_reg(RAX);
+        self.a.test64(RAX, RAX);
+        self.a.jcc(CC_E, done);
+    }
+
     fn plain_call(&mut self, ip: usize, d: i32, argc: u32) {
         let (generic, done, ran, closure_path) = (
             self.a.label(),
@@ -1602,7 +1637,7 @@ impl<'a> Gen<'a> {
             self.a.bind(not_closure);
             self.numeric_call(d, argc, not_numeric, generic, done);
             self.a.bind(not_numeric);
-            self.closure_call(ip, d, argc, generic, ran);
+            self.closure_call(ip, d, argc, generic, ran, done);
         }
         self.a.bind(generic);
         self.a.mov_rr(RDI, RBX);
@@ -3338,6 +3373,7 @@ mod tests {
             closure_entry: Default::default(),
             closure_argc: std::cell::Cell::new(u32::MAX),
             closure_bool: Default::default(),
+            factory: Default::default(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,
@@ -3382,6 +3418,7 @@ mod tests {
             closure_entry: Default::default(),
             closure_argc: std::cell::Cell::new(u32::MAX),
             closure_bool: Default::default(),
+            factory: Default::default(),
             protos: Vec::new(),
             upvals: Vec::new(),
             nparams: 0,

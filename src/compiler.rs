@@ -920,6 +920,7 @@ impl Compiler {
             closure_entry: Cell::new(0),
             closure_argc: Cell::new(u32::MAX),
             closure_bool: Cell::new(false),
+            factory: Cell::new(0),
             names: fs.names,
             protos: fs.protos,
             upvals: fs.upvals.iter().map(|(_, d, _)| *d).collect(),

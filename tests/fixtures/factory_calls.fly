@@ -1,0 +1,49 @@
+// Factories: functions that return a closure over their parameters. Calls in a loop, captured numbers, strings, objects
+// and arrays, too few and too many arguments, a method call on a factory, a factory replaced by another function, a
+// parameter that the factory writes, an arrow factory, and a factory with nothing to capture.
+function adder(k) { return (x) => x + k; }
+function pair(a, b) { return (x) => a * x + b; }
+function tag(s) { return (n) => s + n; }
+function holder(o) { return (x) => o.v + x; }
+function other(k) { return (x) => x * k; }
+function counter(n) { n = n + 1; return (x) => x + n; }
+function konst() { return () => 42; }
+const mk = (k) => (x) => x * k;
+
+let total = 0;
+for (let i = 0; i < 20; i++) {
+  const add = adder(i % 5);
+  total += add(i);
+}
+const f = pair(2, 3);
+const g = tag("row");
+const obj = { v: 1 };
+const h = holder(obj);
+obj.v = 10;
+console.log(total, f(4), g(7), h(1), adder(1) === adder(1), typeof adder(2));
+
+console.log(pair(1)(3), pair(1, 2, 99)(3));
+
+const o2 = { m: adder };
+console.log(o2.m(4)(1));
+
+let fac = adder;
+const first = fac(2)(10);
+fac = other;
+console.log(first, fac(2)(10), mk(3)(4));
+
+const made = [];
+for (let i = 0; i < 3; i++) made.push(holder({ v: i * 100 }));
+console.log(made.map((c) => c(1)).join(" "));
+
+const shared = [1, 2, 3];
+const sum = (xs) => (k) => xs.length + k;
+const s1 = sum(shared);
+shared.push(4);
+console.log(s1(0), shared.length);
+
+console.log(counter(1)(10), konst()(), konst() === konst());
+
+let acc = 0;
+for (let i = 0; i < 6; i++) acc += adder(i)(i * 2) + counter(i)(1);
+console.log(acc);

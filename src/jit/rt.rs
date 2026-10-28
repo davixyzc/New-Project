@@ -355,6 +355,47 @@ pub unsafe extern "C" fn make_closure(vm: *mut Vm, depth: usize, idx: usize, dst
     ptr::write(dst, v);
 }
 
+/// The call of a factory (see `Proto::factory`), which makes the closure that the function returns, over its arguments,
+/// without a frame. The callee holds the factory, and is replaced by the closure. The `argc` arguments at `args` are
+/// released once their values have gone to the closure. A call that does not fit, with another number of arguments or with
+/// a `this` that is not `undefined`, is declined with status 1, before anything has changed.
+///
+/// # Safety
+/// `callee` must hold a function value whose prototype is a factory, and `args` the `argc` values of the call, as the
+/// operands of a call are.
+pub unsafe extern "C" fn call_factory(
+    callee: *mut Value,
+    this: *const Value,
+    args: *mut Value,
+    argc: usize,
+) -> u64 {
+    let Value::Func(f) = &*callee else {
+        return 1;
+    };
+    let proto = f.proto.clone();
+    if argc != proto.nparams as usize || !matches!(*this, Value::Undef) {
+        return 1;
+    }
+    let child = proto.protos[proto.factory.get() as usize - 1].clone();
+    let upvals: Vec<Value> = child
+        .upvals
+        .iter()
+        .map(|u| (*args.add(u.index as usize)).clone())
+        .collect();
+    let made = Value::Func(Rc::new(crate::value::Closure {
+        proto: child,
+        upvals,
+        this: Value::Undef,
+        class: Default::default(),
+    }));
+    for j in 0..argc {
+        ptr::drop_in_place(args.add(j));
+        ptr::write(args.add(j), Value::Undef);
+    }
+    *callee = made;
+    0
+}
+
 /// Boxes the parameter in slot `idx` of the running frame, as `op` does for `Op::BoxParam`.
 ///
 /// # Safety
