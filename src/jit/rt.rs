@@ -2,6 +2,7 @@
 //! the interpreter's own code in `Vm`, so an instruction behaves the same whichever path runs it.
 
 use std::cell::Cell;
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::rc::Rc;
 
@@ -386,12 +387,16 @@ pub unsafe extern "C" fn call_factory(
     let made = Value::Func(Rc::new(crate::value::Closure {
         proto: child,
         upvals,
-        this: Value::Undef,
+        this: ManuallyDrop::new(Value::Undef),
         class: Default::default(),
     }));
     for j in 0..argc {
-        ptr::drop_in_place(args.add(j));
-        ptr::write(args.add(j), Value::Undef);
+        // A value that holds no reference, such as a moved-out `undefined` or a number, needs no drop glue call.
+        let arg = args.add(j);
+        if (*arg).owns_ref() {
+            ptr::drop_in_place(arg);
+        }
+        ptr::write(arg, Value::Undef);
     }
     *callee = made;
     0

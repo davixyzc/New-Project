@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell, RefMut};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::rc::Rc;
 
@@ -393,10 +394,34 @@ pub struct Closure {
     /// The captured variables: a `Value::Cell` for a variable that is shared with the enclosing frame, or the value
     /// itself for a parameter copied in (see `UpvalDesc::by_value`).
     pub upvals: Vec<Value>,
-    /// `this` captured at creation time; only used by arrow functions.
-    pub this: Value,
+    /// `this` captured at creation time; only used by arrow functions. `Drop` releases it, and only when it holds a reference.
+    pub this: ManuallyDrop<Value>,
     /// What the function holds as a class or as a constructor (see `ClassInfo`). Most functions hold none.
     pub class: RefCell<Option<Box<ClassInfo>>>,
+}
+
+impl Drop for Closure {
+    /// Releases the captured values here. A value that holds no reference has nothing to release, so the drop glue is not
+    /// called for it: the common capture is a number, and the glue would only test its tag.
+    fn drop(&mut self) {
+        if self.this.owns_ref() {
+            // SAFETY: `this` is dropped here, once, and `ManuallyDrop` never drops it again.
+            unsafe { ManuallyDrop::drop(&mut self.this) }
+        }
+        let n = self.upvals.len();
+        // SAFETY: the first `n` values are initialised. The length is cleared first, so that the `Vec` frees its buffer
+        // without dropping them a second time, and each one is dropped here, once.
+        unsafe {
+            self.upvals.set_len(0);
+            let base = self.upvals.as_mut_ptr();
+            for i in 0..n {
+                let v = base.add(i);
+                if (*v).owns_ref() {
+                    ptr::drop_in_place(v);
+                }
+            }
+        }
+    }
 }
 
 /// What a class, or a function that is used as a constructor, holds beyond its code.

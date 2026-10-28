@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::io::{BufWriter, Stdout, Write};
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -894,7 +895,7 @@ impl Vm {
         let func = Value::Func(Rc::new(Closure {
             proto: Rc::new(proto),
             upvals: Vec::new(),
-            this: Value::Undef,
+            this: ManuallyDrop::new(Value::Undef),
             class: Default::default(),
         }));
         let args = [
@@ -1636,7 +1637,7 @@ impl Vm {
             Op::False => self.stack.push(Value::Bool(false)),
             Op::This => {
                 let this = if proto.is_arrow {
-                    self.frames.last().unwrap().closure().this.clone()
+                    (*self.frames.last().unwrap().closure().this).clone()
                 } else {
                     self.stack[base - 1].clone()
                 };
@@ -2840,14 +2841,14 @@ impl Vm {
         let this = if !child.is_arrow {
             Value::Undef
         } else if closure.proto.is_arrow {
-            closure.this.clone()
+            (*closure.this).clone()
         } else {
             self.stack[base - 1].clone()
         };
         Value::Func(Rc::new(Closure {
             proto: child,
             upvals,
-            this,
+            this: ManuallyDrop::new(this),
             class: Default::default(),
         }))
     }
