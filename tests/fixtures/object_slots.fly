@@ -1,0 +1,45 @@
+// Objects with fewer and more properties than the values that an object keeps inline, read and written in loops.
+const points = [];
+for (let i = 0; i < 300; i++) {
+  const p = { x: i, y: i * 2 };
+  if (i % 3 === 0) p.z = i * 3;
+  if (i % 5 === 0) {
+    p.w = 1;
+    p.v = 2;
+    p.u = 3;
+  }
+  points.push(p);
+}
+let total = 0;
+for (let i = 0; i < points.length; i++) {
+  const p = points[i];
+  total += p.x + p.y + (p.z || 0) + (p.w || 0) + (p.v || 0) + (p.u || 0);
+  p.x = p.x + 1;
+}
+console.log(total, points[0].x, points[299].y);
+console.log(JSON.stringify(points[15]), JSON.stringify(points[1]));
+
+// Properties removed from objects that keep them inline, and from objects that keep them on the heap.
+const small = { a: 1, b: 2 };
+const big = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+delete small.a;
+delete big.c;
+big.f = 6;
+console.log(Object.keys(small), Object.keys(big), small.b, big.e, big.f, small.a);
+
+// An object that grows one property at a time, read in the loop that makes it grow.
+const grow = {};
+let sum = 0;
+for (let i = 0; i < 12; i++) {
+  grow["k" + i] = i;
+  sum += grow["k" + i];
+}
+console.log(sum, Object.keys(grow).length, grow.k11);
+
+// Objects made by a function, which a loop builds and reads in turn.
+function make(n) {
+  return { n: n, sq: n * n };
+}
+let squares = 0;
+for (let i = 0; i < 1000; i++) squares += make(i).sq;
+console.log(squares);

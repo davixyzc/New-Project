@@ -17,6 +17,7 @@ mod jit;
 mod lexer;
 mod parser;
 mod scalar;
+mod slots;
 mod value;
 mod vm;
 

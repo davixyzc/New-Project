@@ -10,6 +10,7 @@ use std::rc::Rc;
 
 use crate::bytecode::Proto;
 use crate::collection::Collection;
+use crate::slots::Slots;
 use crate::vm::Vm;
 
 /// The number of changes that move the values of an object, change its shape, or free an object. A cache of the address of
@@ -38,7 +39,7 @@ pub struct Props {
     /// object gets. It changes when the position of a key does (see `remove`), so a cache that holds it is never wrong.
     id: usize,
     /// The values, in the order of the keys.
-    values: Vec<Value>,
+    values: Slots,
     /// The keys and the index of an object in dictionary mode.
     dict: Option<Box<Dict>>,
     /// The entries of a Map or a Set, for an object that is one (see `builtins::collections`).
@@ -190,12 +191,20 @@ impl Props {
         Props {
             id: shape_id(shape),
             shape,
-            values: Vec::with_capacity(capacity),
+            values: Slots::with_capacity(capacity),
             dict: None,
             collection: None,
             proto: None,
             accessors: None,
         }
+    }
+
+    /// Puts a new object with these properties in its allocation. Native code reads the values of an object in place, and
+    /// the values that are inline point into the record, so the record is fixed up where it stays.
+    pub fn place(props: Props) -> ObjRef {
+        let obj = Rc::new(RefCell::new(props));
+        obj.borrow_mut().values.fixup();
+        obj
     }
 
     /// The keys, in the order the properties were added.
@@ -212,7 +221,7 @@ impl Props {
 
     /// Each own property, with its key, in the order the properties were added.
     pub fn iter(&self) -> impl Iterator<Item = (&Rc<str>, &Value)> {
-        self.keys().iter().zip(&self.values)
+        self.keys().iter().zip(self.values.iter())
     }
 
     pub fn key(&self, i: usize) -> &Rc<str> {
@@ -550,7 +559,7 @@ impl Value {
     pub fn collection(c: Collection) -> Value {
         let mut props = Props::default();
         props.collection = Some(Box::new(c));
-        Value::Obj(Rc::new(RefCell::new(props)))
+        Value::Obj(Props::place(props))
     }
 
     pub fn obj() -> Value {
@@ -558,7 +567,7 @@ impl Value {
     }
 
     pub fn obj_with(capacity: usize) -> Value {
-        Value::Obj(Rc::new(RefCell::new(Props::with_capacity(capacity))))
+        Value::Obj(Props::place(Props::with_capacity(capacity)))
     }
 
     /// A new object whose prototype is `proto`, which is what `new` makes for a constructor.
@@ -745,7 +754,7 @@ pub fn find_setter(obj: &ObjRef, name: &str) -> Option<Option<Value>> {
 pub fn new_obj(proto: Option<ObjRef>) -> ObjRef {
     let mut props = Props::default();
     props.proto = proto;
-    Rc::new(RefCell::new(props))
+    Props::place(props)
 }
 
 /// The prototypes of the built-in errors, by kind. Each kind inherits from the prototype of `Error`, which is first.
@@ -800,7 +809,7 @@ pub fn obj_put_hinted(obj: &ObjRef, key: &Rc<str>, v: Value, hint: &PropHint) {
 
 /// Where the properties of an object sit in memory, for native code that reads and writes one in place (see
 /// `jit::codegen`). `shape` is from the allocation of the object to the address of its shape. `values` is from there to
-/// the `Vec` of its values, whose `buf` and `len` are the pointer and the length within that `Vec`.
+/// the `Slots` of its values, whose `buf`, `len` and `cap` are the pointer, the length and the capacity within them.
 #[derive(Clone, Copy)]
 pub(crate) struct PropLayout {
     pub shape: i32,
@@ -821,21 +830,24 @@ pub(crate) fn prop_layout() -> Option<PropLayout> {
 
 fn probe_prop_layout() -> Option<PropLayout> {
     use std::mem::{offset_of, size_of};
-    let arr = arr_layout()?;
-    if size_of::<usize>() != size_of::<&'static Shape>() {
+    if !crate::jit::rc_layout_ok()
+        || size_of::<Value>() != 16
+        || size_of::<usize>() != size_of::<&'static Shape>()
+    {
         return None;
     }
     // The properties of an object sit in a `RefCell`, whose value Rust does not place at a fixed offset.
     let cell = RefCell::new(Props::default());
     let cell_value = cell.as_ptr() as usize - &cell as *const _ as usize;
     let base = crate::jit::RC_VALUE + cell_value as i32;
+    let slots = crate::slots::layout();
     Some(PropLayout {
         shape: base + offset_of!(Props, id) as i32,
         shape_rc: base + offset_of!(Props, shape) as i32,
         values: base + offset_of!(Props, values) as i32,
-        buf: arr.buf,
-        len: arr.len,
-        cap: arr.cap,
+        buf: slots.buf as i32,
+        len: slots.len as i32,
+        cap: slots.cap as i32,
     })
 }
 
@@ -1023,7 +1035,7 @@ pub fn make_obj(pairs: Vec<(&str, Value)>) -> Value {
     for (k, v) in pairs {
         props.push(intern_name(k), v);
     }
-    Value::Obj(Rc::new(RefCell::new(props)))
+    Value::Obj(Props::place(props))
 }
 
 pub fn truthy(v: &Value) -> bool {

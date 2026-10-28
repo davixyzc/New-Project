@@ -39,10 +39,7 @@ pub fn install(vm: &mut Vm) {
             props.push(name.clone(), value.clone());
         }
     }
-    vm.set_global(
-        "globalThis",
-        Value::Obj(std::rc::Rc::new(std::cell::RefCell::new(props))),
-    );
+    vm.set_global("globalThis", Value::Obj(crate::value::Props::place(props)));
 }
 
 /// The definition called `name` in a table of built-in methods. `index` holds the table sorted by name. It is built
