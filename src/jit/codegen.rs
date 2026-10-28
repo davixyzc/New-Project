@@ -159,8 +159,13 @@ struct VmLayout {
     f_base: i32,
     f_handlers: i32,
     f_ctor: i32,
-    f_session: i32,
 }
+
+/// The constructor and callback flags of a frame are adjacent bytes, which native code clears with one store and checks
+/// with one compare, so the layout of `Frame` must keep them together.
+const _: () = assert!(
+    std::mem::offset_of!(crate::vm::Frame, session) == std::mem::offset_of!(crate::vm::Frame, ctor) + 1
+);
 
 fn vm_layout() -> VmLayout {
     use crate::vm::{Frame, FrameStack, ValueStack, Vm};
@@ -181,7 +186,6 @@ fn vm_layout() -> VmLayout {
         f_base: std::mem::offset_of!(Frame, base) as i32,
         f_handlers: std::mem::offset_of!(Frame, handlers) as i32,
         f_ctor: std::mem::offset_of!(Frame, ctor) as i32,
-        f_session: std::mem::offset_of!(Frame, session) as i32,
     }
 }
 
@@ -1168,7 +1172,7 @@ impl<'a> Gen<'a> {
         let (frames_buf, frames_len, frames_cap) = (l.frames_buf, l.frames_len, l.frames_cap);
         let (stack_buf, stack_cap) = (l.stack_buf, l.stack_cap);
         let (frame_size, f_closure, f_ip, f_base) = (l.frame_size, l.f_closure, l.f_ip, l.f_base);
-        let (f_handlers, f_ctor, f_session) = (l.f_handlers, l.f_ctor, l.f_session);
+        let (f_handlers, f_ctor) = (l.f_handlers, l.f_ctor);
 
         // The code must be compiled, and the function must take the arguments of this call and no rest parameter. The
         // count in `call_argc` says both: it is set together with `call_entry`, and is `u32::MAX` otherwise.
@@ -1292,17 +1296,11 @@ impl<'a> Gen<'a> {
             },
             0,
         );
-        self.a.mov8_imm(
+        // The two flags are adjacent bytes (see the layout check above `vm_layout`), so one store clears both.
+        self.a.mov16_imm(
             Mem {
                 base: R11,
                 disp: f_ctor,
-            },
-            0,
-        );
-        self.a.mov8_imm(
-            Mem {
-                base: R11,
-                disp: f_session,
             },
             0,
         );
@@ -2182,26 +2180,29 @@ impl<'a> Gen<'a> {
             base: R11,
             disp: field - frame_size,
         };
-        self.a.cmp8_imm(top(l.f_ctor), 0);
-        self.a.jcc(CC_NE, slow);
-        self.a.cmp8_imm(top(l.f_session), 0);
+        // The two flags are checked together (see the layout check above `vm_layout`).
+        self.a.cmp16_imm8(top(l.f_ctor), 0);
         self.a.jcc(CC_NE, slow);
         self.a.mov_load(RCX, top(l.f_handlers));
         self.a.test64(RCX, RCX);
         self.a.jcc(CC_NE, slow);
 
         // Each dropped slot releases its reference. The count is the first word of the `Rc` allocation (see
-        // `rc_layout_ok`). The last reference goes to `rt::drop_slot`, which frees the value.
+        // `rc_layout_ok`). The last reference goes to `rt::drop_slot`, which frees the value. The callee slot holds the
+        // closure of the frame, which owns it (see `Frame::closure`), so it needs no tag test. A call of `rt::drop_slot`
+        // clobbers the registers that hold the top frame, so they are computed again after it.
         for s in released {
             let (skip, dead) = (self.a.label(), self.a.label());
             let m = Mem {
                 base: R12,
                 disp: 16 * s,
             };
-            self.a.movzx_load8(RAX, m);
-            self.a.mov_imm32(RCX, OWNING);
-            self.a.bt(RCX, RAX);
-            self.a.jcc(CC_AE, skip);
+            if s != -2 {
+                self.a.movzx_load8(RAX, m);
+                self.a.mov_imm32(RCX, OWNING);
+                self.a.bt(RCX, RAX);
+                self.a.jcc(CC_AE, skip);
+            }
             self.a.mov_load(RCX, m.at(8));
             self.a.cmp64_mem_imm8(Mem { base: RCX, disp: 0 }, 1);
             self.a.jcc(CC_BE, dead);
@@ -2212,27 +2213,28 @@ impl<'a> Gen<'a> {
             self.a
                 .mov_imm64(RAX, rt::drop_slot as *const () as usize as u64);
             self.a.call_reg(RAX);
+            self.a.mov_load(
+                R10,
+                Mem {
+                    base: RBX,
+                    disp: frames_len,
+                },
+            );
+            self.a.imul64_imm(R11, R10, frame_size);
+            self.a.mov_load(
+                RCX,
+                Mem {
+                    base: RBX,
+                    disp: frames_buf,
+                },
+            );
+            self.a.add64(R11, RCX);
             self.a.bind(skip);
         }
 
         // The frame is popped. The value stack ends below the callee slot, and the result takes that slot. The call
-        // returns to the frame below, whose base is the caller's frame pointer (as `rt::ret` returns it).
-        self.a.mov_load(
-            R10,
-            Mem {
-                base: RBX,
-                disp: frames_len,
-            },
-        );
-        self.a.imul64_imm(R11, R10, frame_size);
-        self.a.mov_load(
-            RCX,
-            Mem {
-                base: RBX,
-                disp: frames_buf,
-            },
-        );
-        self.a.add64(R11, RCX);
+        // returns to the frame below, whose base is the caller's frame pointer (as `rt::ret` returns it). `R10` and `R11`
+        // still hold the top frame, since the releases above computed them again after any call.
         self.a.mov_load(RSI, top(f_base));
         self.a.lea(
             RCX,

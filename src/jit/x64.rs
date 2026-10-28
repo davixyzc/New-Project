@@ -174,6 +174,18 @@ impl Asm {
         self.code.push(imm);
     }
 
+    /// `cmp word [m], imm8`, which is sign-extended. It compares two bytes at once.
+    pub fn cmp16_imm8(&mut self, m: Mem, imm: i8) {
+        self.op(Some(0x66), false, &[0x83], 7, Rm::Mem(m));
+        self.code.push(imm as u8);
+    }
+
+    /// `mov word [m], imm16`. It stores two bytes at once.
+    pub fn mov16_imm(&mut self, m: Mem, imm: u16) {
+        self.op(Some(0x66), false, &[0xC7], 0, Rm::Mem(m));
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
     /// `mov dst, imm64`.
     pub fn mov_imm64(&mut self, dst: u8, imm: u64) {
         self.code.push(0x48 | (dst >> 3));
