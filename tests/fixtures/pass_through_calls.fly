@@ -1,0 +1,20 @@
+// Functions whose bodies only pass a parameter on, so each has a numeric entry. A call with numbers takes that entry, and a call
+// with objects takes the generic code.
+function pick(a, b) {
+  return a;
+}
+function same(o) {
+  return o;
+}
+const box = { v: 2 };
+let sum = 0;
+let boxes = 0;
+for (let i = 0; i < 3000; i++) {
+  sum += pick(i, 1);
+  const r = same(i % 2 === 0 ? box : i);
+  if (r === box) boxes++;
+  else sum += r;
+  sum += pick(box, i).v;
+}
+console.log(sum, boxes);
+console.log(same(box).v, pick(box, 3).v, pick(7, 8), same(box) === box);

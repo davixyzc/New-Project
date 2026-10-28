@@ -2345,6 +2345,12 @@ impl<'a> Gen<'a> {
                     let target = self.target(t);
                     self.a.jmp(target);
                 }
+                // A local that the return hands out moves into the result, and is cleared, so that the frame does not release it.
+                Op::GetLocal(i) if self.proto.code.get(ip + 1) == Some(&Op::Return) => {
+                    let (src, dst) = (self.local(i), self.temp(d));
+                    self.copy(src, dst);
+                    self.a.mov8_imm(src, TAG_UNDEF);
+                }
                 Op::Return => self.return_helper(ip, d),
                 Op::Call(argc) => self.plain_call(ip, d, argc),
                 Op::New(argc) => self.call_helper(ip, d, argc, rt::CALL_NEW),
@@ -2454,7 +2460,8 @@ impl<'a> Gen<'a> {
                 Fast::Direct(assign, vec![Arg::Addr(src), Arg::Addr(dst)])
             }
             Op::PopToLocal(i) => {
-                // Moves the top value, so only the old local must own nothing.
+                // Moves the top value into the local. The old value gives up its reference here when another one remains, and
+                // the helper frees it otherwise (see `check_release`).
                 let (src, dst) = (self.temp(d - 1), self.local(i));
                 self.check_plain(dst, slow);
                 self.copy(src, dst);
@@ -3030,9 +3037,28 @@ impl<'a> Gen<'a> {
                 Fast::Guarded
             }
             Op::GetBoxed(i) => {
+                // A captured variable holds a cell, whose value is read in place and counted as a clone counts it. Any other
+                // value takes the helper, which copies it as it is.
                 let (src, dst) = (self.local(i), self.temp(d));
                 let boxed = rt::boxed_into as *const () as usize;
+                let (other, done) = (self.a.label(), self.a.label());
+                match cell_value_offset() {
+                    Some(cell_value) => {
+                        self.check_tag(src, TAG_CELL, other);
+                        self.a.mov_load(RDX, src.at(8));
+                        self.load_clone(Mem {
+                            base: RDX,
+                            disp: cell_value,
+                        });
+                        self.a.mov_store(dst, RAX);
+                        self.a.mov_store(dst.at(8), RCX);
+                        self.a.jmp(done);
+                    }
+                    None => self.a.jmp(other),
+                }
+                self.a.bind(other);
                 self.direct_call(boxed, &[Arg::Addr(src), Arg::Addr(dst)]);
+                self.a.bind(done);
                 Fast::Pure
             }
             Op::IncLocal(i) => self.step_local(i, SSE_ADD, slow),

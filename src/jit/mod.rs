@@ -196,11 +196,6 @@ impl Native {
         self.frame_len
     }
 
-    /// Whether the function has a numeric entry (see `numeric_entry`).
-    pub(crate) fn has_numeric_entry(&self) -> bool {
-        self.spec.is_some()
-    }
-
     /// The numeric entry as native code calls it: its wrapper's address, its number of parameters and whether it
     /// returns a boolean. `None` when the function has no such entry, or calls itself through an upvalue, whose check
     /// the helpers make (see `call_numbers`).

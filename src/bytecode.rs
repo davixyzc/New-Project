@@ -293,12 +293,12 @@ impl Proto {
                 self.factory.set(factory_child(self));
                 let compiled = crate::jit::compile(self);
                 if let Some(code) = &compiled {
-                    // A function with a numeric entry has no `call_entry`: native code tries `numeric_entry` first,
-                    // and the helpers try it too.
+                    // A function with a numeric entry keeps its `call_entry` too: native code tries `numeric_entry` first, and
+                    // a call whose arguments are not numbers runs the generic code, which every function has.
                     // A factory has no direct entry: a call of it makes the closure instead (see `factory_child`).
                     if self.factory.get() != 0 {
                         self.call_argc.set(FACTORY_ARGC);
-                    } else if !code.has_numeric_entry() {
+                    } else {
                         self.call_entry.set(code.entry() as usize);
                         self.call_frame_len.set(code.frame_len());
                         self.call_argc.set(if self.has_rest {

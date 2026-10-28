@@ -1,0 +1,30 @@
+// Locals that hold objects are reassigned, self-assigned and popped in loops. Other references keep the objects alive.
+const keep = [];
+let cur = { n: 0, prev: null };
+let last = null;
+for (let i = 0; i < 2000; i++) {
+  const next = { n: i, prev: cur };
+  cur = next;
+  keep.push(cur);
+  if (i % 3 === 0) cur;
+  last = cur;
+  last = last;
+}
+let sum = 0;
+for (let i = 0; i < keep.length; i++) sum += keep[i].n;
+console.log(sum, cur.n, last.n, keep[10].prev.n, keep[1999].prev.prev.n);
+
+// The chain of objects that the last one reaches.
+let chainLen = 0;
+for (let node = cur; node !== null; node = node.prev) chainLen++;
+console.log(chainLen);
+
+// Strings and arrays are released in the same way.
+let text = "a";
+let parts = [];
+for (let i = 0; i < 1000; i++) {
+  text = text + "b";
+  parts = [text, i];
+  if (i % 100 === 0) parts[1];
+}
+console.log(text.length, parts[0].length, parts[1]);
