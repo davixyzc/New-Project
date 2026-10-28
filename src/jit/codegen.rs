@@ -164,7 +164,8 @@ struct VmLayout {
 /// The constructor and callback flags of a frame are adjacent bytes, which native code clears with one store and checks
 /// with one compare, so the layout of `Frame` must keep them together.
 const _: () = assert!(
-    std::mem::offset_of!(crate::vm::Frame, session) == std::mem::offset_of!(crate::vm::Frame, ctor) + 1
+    std::mem::offset_of!(crate::vm::Frame, session)
+        == std::mem::offset_of!(crate::vm::Frame, ctor) + 1
 );
 
 fn vm_layout() -> VmLayout {
