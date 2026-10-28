@@ -1,0 +1,17 @@
+// Calls with objects nest until the frame stack is full, and the RangeError that the full stack raises reaches the try in the
+// outer call. Each frame above that try is dropped, so the calls after it still nest deep.
+function down(o) {
+  return down({ n: o.n + 1 }) + 1;
+}
+function guarded(o) {
+  try {
+    return down(o);
+  } catch (e) {
+    return e.name;
+  }
+}
+function count(o) {
+  return o.n === 0 ? 0 : count({ n: o.n - 1 }) + 1;
+}
+console.log(guarded({ n: 0 }), guarded({ n: 5 }));
+console.log(count({ n: 3000 }), count({ n: 100 }));

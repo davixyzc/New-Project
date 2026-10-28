@@ -210,29 +210,31 @@ pub struct FrameStack {
 }
 
 impl FrameStack {
+    /// The buffer holds `MAX_FRAMES` frames from the start. A call that has checked the limit has room for its frame, and
+    /// native code relies on that instead of checking the capacity (see `jit::codegen`).
     fn new() -> FrameStack {
+        let layout =
+            std::alloc::Layout::array::<Frame>(MAX_FRAMES).expect("frame stack fits in memory");
+        // SAFETY: `layout` has a non-zero size.
+        let buf = unsafe { std::alloc::alloc(layout) };
+        if buf.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
         FrameStack {
-            buf: std::ptr::NonNull::dangling().as_ptr(),
+            buf: buf as *mut Frame,
             len: 0,
-            cap: 0,
+            cap: MAX_FRAMES,
         }
     }
 
-    /// Makes room for one more frame.
+    /// Makes room for one more frame. The buffer only grows, so it always holds `MAX_FRAMES` frames.
     #[cold]
     fn grow(&mut self) {
-        let cap = (self.cap * 2).max(16);
+        let cap = self.cap * 2;
         let layout = std::alloc::Layout::array::<Frame>(cap).expect("frame stack fits in memory");
-        // SAFETY: `layout` has a non-zero size. A buffer that exists was allocated with the layout
-        // of `self.cap` frames, which is what `realloc` is given.
-        let buf = unsafe {
-            if self.cap == 0 {
-                std::alloc::alloc(layout)
-            } else {
-                let old = std::alloc::Layout::array::<Frame>(self.cap).expect("frame stack fits");
-                std::alloc::realloc(self.buf as *mut u8, old, layout.size())
-            }
-        };
+        let old = std::alloc::Layout::array::<Frame>(self.cap).expect("frame stack fits");
+        // SAFETY: the buffer was allocated with the layout of `self.cap` frames, which is what `realloc` is given.
+        let buf = unsafe { std::alloc::realloc(self.buf as *mut u8, old, layout.size()) };
         if buf.is_null() {
             std::alloc::handle_alloc_error(layout);
         }

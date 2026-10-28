@@ -149,7 +149,6 @@ pub(super) fn find_prop(a: &mut Asm, obj: Mem, site: PropSite, miss: Label) {
 struct VmLayout {
     frames_buf: i32,
     frames_len: i32,
-    frames_cap: i32,
     stack_buf: i32,
     stack_len: i32,
     stack_cap: i32,
@@ -171,7 +170,6 @@ fn vm_layout() -> VmLayout {
     VmLayout {
         frames_buf: (frames + std::mem::offset_of!(FrameStack, buf)) as i32,
         frames_len: (frames + std::mem::offset_of!(FrameStack, len)) as i32,
-        frames_cap: (frames + std::mem::offset_of!(FrameStack, cap)) as i32,
         stack_buf: (stack + std::mem::offset_of!(ValueStack, buf)) as i32,
         stack_len: (stack + std::mem::offset_of!(ValueStack, len)) as i32,
         stack_cap: (stack + std::mem::offset_of!(ValueStack, cap)) as i32,
@@ -1136,7 +1134,7 @@ impl<'a> Gen<'a> {
             disp: field as i32,
         };
         let l = vm_layout();
-        let (frames_buf, frames_len, frames_cap) = (l.frames_buf, l.frames_len, l.frames_cap);
+        let (frames_buf, frames_len) = (l.frames_buf, l.frames_len);
         let (stack_buf, stack_cap) = (l.stack_buf, l.stack_cap);
         let (frame_size, f_closure, f_ip, f_base) = (l.frame_size, l.f_closure, l.f_ip, l.f_base);
         let (f_handlers, f_ctor, f_session) = (l.f_handlers, l.f_ctor, l.f_session);
@@ -1150,7 +1148,7 @@ impl<'a> Gen<'a> {
         let not_direct = self.a.label();
         self.a.cmp64_imm32(R9, argc);
         self.a.jcc(CC_NE, not_direct);
-        // The frame stack has room for one more frame.
+        // The frame stack has room for one more frame, as its buffer holds `MAX_FRAMES` (see `vm::FrameStack::new`).
         self.a.mov_load(
             R10,
             Mem {
@@ -1159,15 +1157,6 @@ impl<'a> Gen<'a> {
             },
         );
         self.a.cmp64_imm32(R10, crate::vm::MAX_FRAMES as i32);
-        self.a.jcc(CC_AE, generic);
-        self.a.mov_load(
-            R11,
-            Mem {
-                base: RBX,
-                disp: frames_cap,
-            },
-        );
-        self.a.cmp_rr64(R10, R11);
         self.a.jcc(CC_AE, generic);
         // The value stack has room for the callee's whole frame, from its first argument on.
         self.a.lea(
@@ -1347,15 +1336,11 @@ impl<'a> Gen<'a> {
             base: RDX,
             disp: field as i32,
         };
-        // The entry takes exactly the arguments of the call, and each of them is a number.
+        // The entry takes exactly the arguments of the call. `plain_call` has checked that they are numbers.
         self.a
             .mov32_load(R9, proto_field(std::mem::offset_of!(Proto, numeric_argc)));
         self.a.cmp64_imm32(R9, argc);
         self.a.jcc(CC_NE, not_numeric);
-        for j in 0..argc {
-            let arg = self.temp(d - argc + j);
-            self.check_tag(arg, TAG_NUM, not_numeric);
-        }
         // Releasing the callee and `this` after the call frees nothing only if each has a reference to spare, and they
         // are different objects, so that each reference to spare is its own.
         self.check_release(callee, not_numeric);
@@ -1429,15 +1414,11 @@ impl<'a> Gen<'a> {
             base: RDX,
             disp: field as i32,
         };
-        // The entry takes exactly the arguments of the call, each of them a number.
+        // The entry takes exactly the arguments of the call. `plain_call` has checked that they are numbers.
         self.a
             .mov32_load(R9, proto_field(std::mem::offset_of!(Proto, closure_argc)));
         self.a.cmp64_imm32(R9, argc);
         self.a.jcc(CC_NE, not_closure);
-        for j in 0..argc {
-            let arg = self.temp(d - argc + j);
-            self.check_tag(arg, TAG_NUM, not_closure);
-        }
         // Releasing the callee and `this` after the call frees nothing only if each has a reference to spare (see
         // `numeric_call`).
         self.check_release(callee, not_closure);
@@ -1498,16 +1479,13 @@ impl<'a> Gen<'a> {
             base: RDX,
             disp: field as i32,
         };
-        // The entry takes exactly the arguments of the call, and the receiver must be an object.
+        // The entry takes exactly the arguments of the call, which `plain_call` has checked are numbers, and the receiver
+        // must be an object.
         self.a
             .mov32_load(R9, proto_field(std::mem::offset_of!(Proto, method_argc)));
         self.a.cmp64_imm32(R9, argc);
         self.a.jcc(CC_NE, not_method);
         self.check_tag(this, TAG_OBJ, not_method);
-        for j in 0..argc {
-            let arg = self.temp(d - argc + j);
-            self.check_tag(arg, TAG_NUM, not_method);
-        }
         // Releasing the callee and the receiver after the call frees nothing only if each has a reference to spare (see
         // `numeric_call`).
         self.check_release(callee, not_method);
@@ -1643,6 +1621,11 @@ impl<'a> Gen<'a> {
                 );
                 self.a.bt_imm(R9, argc as u8);
                 self.a.jcc(CC_AE, not_numeric);
+            }
+            // The three entries take numbers only, so a call with another argument goes to the closure call at once.
+            for j in 0..argc as i32 {
+                let arg = self.temp(d - argc as i32 + j);
+                self.check_tag(arg, TAG_NUM, not_numeric);
             }
             self.method_call(d, argc, not_method, generic, done);
             self.a.bind(not_method);
@@ -2116,8 +2099,7 @@ impl<'a> Gen<'a> {
     /// before anything has changed.
     fn native_return(&mut self, d: i32, slow: Label) {
         let l = vm_layout();
-        let (frames_buf, frames_len, stack_buf, stack_len) =
-            (l.frames_buf, l.frames_len, l.stack_buf, l.stack_len);
+        let (frames_len, stack_buf, stack_len) = (l.frames_len, l.stack_buf, l.stack_len);
         let (frame_size, f_base) = (l.frame_size, l.f_base);
         let nlocals = self.proto.nlocals as i32;
         let done = self.done;
@@ -2130,24 +2112,9 @@ impl<'a> Gen<'a> {
         };
 
         // The frame on top is `frames[len - 1]`, and the call returns to the one below it.
-        self.a.mov_load(
-            R10,
-            Mem {
-                base: RBX,
-                disp: frames_len,
-            },
-        );
+        self.top_frame_end();
         self.a.cmp64_imm8(R10, 2);
         self.a.jcc(CC_B, slow);
-        self.a.imul64_imm(R11, R10, frame_size);
-        self.a.mov_load(
-            RCX,
-            Mem {
-                base: RBX,
-                disp: frames_buf,
-            },
-        );
-        self.a.add64(R11, RCX);
         // `R11` is one past the top frame, so `top` addresses a field of that frame.
         let top = |field: i32| Mem {
             base: R11,
@@ -2157,22 +2124,33 @@ impl<'a> Gen<'a> {
         self.a.jcc(CC_NE, slow);
         self.a.cmp8_imm(top(l.f_session), 0);
         self.a.jcc(CC_NE, slow);
-        self.a.mov_load(RCX, top(l.f_handlers));
-        self.a.test64(RCX, RCX);
-        self.a.jcc(CC_NE, slow);
+        // A frame of a function without `PushHandler` never has handlers, so the check is left out for it.
+        if self
+            .proto
+            .code
+            .iter()
+            .any(|op| matches!(op, Op::PushHandler(_)))
+        {
+            self.a.mov_load(RCX, top(l.f_handlers));
+            self.a.test64(RCX, RCX);
+            self.a.jcc(CC_NE, slow);
+        }
 
         // Each dropped slot releases its reference. The count is the first word of the `Rc` allocation (see
-        // `rc_layout_ok`). The last reference goes to `rt::drop_slot`, which frees the value.
+        // `rc_layout_ok`). The last reference goes to `rt::drop_slot`, which frees the value. The callee in slot -2 is
+        // always a function, which owns its reference, so its tag is not tested.
         for s in released {
             let (skip, dead) = (self.a.label(), self.a.label());
             let m = Mem {
                 base: R12,
                 disp: 16 * s,
             };
-            self.a.movzx_load8(RAX, m);
-            self.a.mov_imm32(RCX, OWNING);
-            self.a.bt(RCX, RAX);
-            self.a.jcc(CC_AE, skip);
+            if s != -2 {
+                self.a.movzx_load8(RAX, m);
+                self.a.mov_imm32(RCX, OWNING);
+                self.a.bt(RCX, RAX);
+                self.a.jcc(CC_AE, skip);
+            }
             self.a.mov_load(RCX, m.at(8));
             self.a.cmp64_mem_imm8(Mem { base: RCX, disp: 0 }, 1);
             self.a.jcc(CC_BE, dead);
@@ -2183,27 +2161,13 @@ impl<'a> Gen<'a> {
             self.a
                 .mov_imm64(RAX, rt::drop_slot as *const () as usize as u64);
             self.a.call_reg(RAX);
+            // The call clobbers `R10` and `R11`, which address the top frame for the rest of the return.
+            self.top_frame_end();
             self.a.bind(skip);
         }
 
         // The frame is popped. The value stack ends below the callee slot, and the result takes that slot. The call
         // returns to the frame below, whose base is the caller's frame pointer (as `rt::ret` returns it).
-        self.a.mov_load(
-            R10,
-            Mem {
-                base: RBX,
-                disp: frames_len,
-            },
-        );
-        self.a.imul64_imm(R11, R10, frame_size);
-        self.a.mov_load(
-            RCX,
-            Mem {
-                base: RBX,
-                disp: frames_buf,
-            },
-        );
-        self.a.add64(R11, RCX);
         self.a.mov_load(RSI, top(f_base));
         self.a.lea(
             RCX,
@@ -2260,6 +2224,27 @@ impl<'a> Gen<'a> {
             RCX,
         );
         self.a.jmp(done);
+    }
+
+    /// Leaves `R10` at the number of frames, and `R11` one past the top frame, which `native_return` addresses.
+    fn top_frame_end(&mut self) {
+        let l = vm_layout();
+        self.a.mov_load(
+            R10,
+            Mem {
+                base: RBX,
+                disp: l.frames_len,
+            },
+        );
+        self.a.imul64_imm(R11, R10, l.frame_size);
+        self.a.mov_load(
+            RCX,
+            Mem {
+                base: RBX,
+                disp: l.frames_buf,
+            },
+        );
+        self.a.add64(R11, RCX);
     }
 
     fn return_helper(&mut self, ip: usize, d: i32) {
