@@ -1,0 +1,55 @@
+// Statements that run once before an inner loop: after a jump that enters the statement, in a loop that is re-entered with
+// new outer values, in a loop that never runs, and in a loop left by break. The others read the loop's own variables.
+let total = 0;
+for (let i = 0; i < 300; i++) {
+  let acc = 0;
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (dx > 5) continue;
+      const yy = 5;
+      acc += yy * 10 + dx;
+    }
+  }
+  total += acc;
+}
+console.log(total);
+
+let re = 0;
+for (let i = 0; i < 50; i++) {
+  for (let j = 0; j < 4; j++) {
+    const k = i * 3 + 1;
+    re += k + j;
+  }
+}
+console.log(re);
+
+let zero = 0;
+for (let i = 0; i < 20; i++) {
+  for (let j = 0; j < i - 100; j++) {
+    const q = i * 2;
+    zero += q;
+  }
+  zero += 1;
+}
+console.log(zero);
+
+let mixed = 0;
+for (let i = 0; i < 40; i++) {
+  for (let j = 0; j < 5; j++) {
+    const w = j * j + i;
+    mixed += w;
+    if (w % 3 === 0) continue;
+    mixed -= 1;
+  }
+}
+console.log(mixed);
+
+let brk = 0;
+for (let i = 0; i < 30; i++) {
+  for (let j = 0; j < 10; j++) {
+    if (j === 4) break;
+    const s = i + 2;
+    brk += s;
+  }
+}
+console.log(brk);

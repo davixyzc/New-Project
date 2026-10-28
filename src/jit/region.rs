@@ -172,6 +172,8 @@ pub(super) struct Region {
     pub(super) function: Option<Function>,
     /// The method call that the loop runs in place, with its body, when `with_inline` finds one.
     pub(super) inline: Option<Box<Inline>>,
+    /// The statements that run once before an inner loop, instead of on each of its trips (see `with_hoists`).
+    pub(super) hoists: Vec<Hoist>,
 }
 
 /// A method that a loop region runs in place of its call (see `with_inline`): the call, the function that the callee
@@ -202,6 +204,217 @@ fn arg_payload() -> Mem {
         base: RSP,
         disp: ARG_SLOT + 8,
     }
+}
+
+/// A statement of a loop that computes the same number on every trip of an inner loop. The region runs it once, before
+/// the jump that enters the inner loop, and skips it inside the loop (see `with_hoists`).
+#[derive(Clone, Copy)]
+pub(super) struct Hoist {
+    /// The jump that enters the inner loop, which the statement runs before.
+    pub(super) entry: usize,
+    /// The first instruction of the statement.
+    pub(super) start: usize,
+    /// The last instruction of the statement: the `PopToLocal` that writes its local.
+    pub(super) end: usize,
+}
+
+/// The locals that `op` reads. A `PopToLocal` or `SetLocal` only writes its local.
+fn local_read(op: Op) -> Vec<u32> {
+    match op {
+        Op::PopToLocal(_) | Op::SetLocal(_) => Vec::new(),
+        _ => local_uses(op),
+    }
+}
+
+/// The local that `op` writes, if it writes one.
+fn local_write(op: Op) -> Option<u32> {
+    match op {
+        Op::PopToLocal(i)
+        | Op::SetLocal(i)
+        | Op::IncLocal(i)
+        | Op::DecLocal(i)
+        | Op::AddToLocal(i) => Some(i),
+        _ => None,
+    }
+}
+
+/// Whether `op` computes a number from constants and locals, with no effect except the value it leaves. These are the
+/// operations that a statement may hold (see `statement_end`).
+fn pure_number(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Const(_)
+            | Op::True
+            | Op::False
+            | Op::GetLocal(_)
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Mod
+            | Op::Neg
+            | Op::AddLK(..)
+            | Op::SubLK(..)
+            | Op::MulLK(..)
+            | Op::ModLK(..)
+    )
+}
+
+/// The `PopToLocal` that ends the statement which starts at `s`, inside a loop from `h` to `t` whose operand depth at the
+/// header is `base`. The instructions from `s` to it are number operations that leave only the value the `PopToLocal`
+/// writes, and no jump lands on a later one of them.
+fn statement_end(
+    proto: &Proto,
+    depth: &[i32],
+    s: usize,
+    t: usize,
+    base: i32,
+    jumped: &[bool],
+) -> Option<usize> {
+    if depth[s] != base {
+        return None;
+    }
+    for e in s..=t {
+        if e > s && jumped[e] {
+            return None;
+        }
+        match proto.code[e] {
+            Op::PopToLocal(_) => return (depth[e] == base + 1).then_some(e),
+            op if pure_number(op) => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether a read of `x` inside the loop `h..=t` can run from its header without passing the statement at `s`.
+fn reads_before(proto: &Proto, depth: &[i32], h: usize, t: usize, s: usize, x: u32) -> bool {
+    let code = &proto.code;
+    let mut seen = vec![false; code.len()];
+    let mut stack = vec![h];
+    while let Some(k) = stack.pop() {
+        if !(h..=t).contains(&k) || k == s || seen[k] || depth[k] < 0 {
+            continue;
+        }
+        seen[k] = true;
+        if local_read(code[k]).contains(&x) {
+            return true;
+        }
+        stack.extend(successors(code[k], k, depth[k]).into_iter().map(|(n, _)| n));
+    }
+    false
+}
+
+/// Whether the statement `s..=e` may run once before the inner loop `h..=t`. Nothing in the loop writes a local that the
+/// statement reads, nothing but the statement writes its target, the target is read nowhere outside the loop, and every
+/// read of it inside the loop comes after the statement on every path from the header.
+fn hoistable(
+    proto: &Proto,
+    depth: &[i32],
+    lp: &Region,
+    (h, t): (usize, usize),
+    (s, e): (usize, usize),
+) -> bool {
+    let code = &proto.code;
+    let Op::PopToLocal(x) = code[e] else {
+        return false;
+    };
+    let reads: Vec<u32> = (s..e).flat_map(|k| local_read(code[k])).collect();
+    if [x]
+        .iter()
+        .chain(&reads)
+        .any(|&i| lp.arrays.contains(&i) || lp.objects.contains(&i))
+    {
+        return false;
+    }
+    for k in h..=t {
+        if let Some(w) = local_write(code[k]) {
+            if reads.contains(&w) || (w == x && !(s..=e).contains(&k)) {
+                return false;
+            }
+        }
+    }
+    let read_outside = (0..code.len())
+        .filter(|&k| !(h..=t).contains(&k) && depth[k] >= 0)
+        .any(|k| local_read(code[k]).contains(&x));
+    !read_outside && !reads_before(proto, depth, h, t, s, x)
+}
+
+/// The jump that enters the inner loop `h..=t` of `lp`, when that jump is the only way in. A `for` or `while` loop is
+/// entered by the jump just before its header, which goes to its test. Another jump into the loop, or a region entry in
+/// it, would skip the statements that run before that jump.
+fn loop_entry(proto: &Proto, depth: &[i32], lp: &Region, (h, t): (usize, usize)) -> Option<usize> {
+    let code = &proto.code;
+    let entry = h.checked_sub(1).filter(|&e| e >= lp.header)?;
+    let inside = h..=t;
+    let Op::Jump(test) = code[entry] else {
+        return None;
+    };
+    if !inside.contains(&(test as usize)) || depth[h] < 0 || depth[entry] != depth[h] {
+        return None;
+    }
+    if lp.entries.iter().any(|e| inside.contains(e)) {
+        return None;
+    }
+    let other = (lp.header..=lp.last).any(|k| {
+        k != entry
+            && !inside.contains(&k)
+            && depth[k] >= 0
+            && successors(code[k], k, depth[k])
+                .iter()
+                .any(|&(n, _)| inside.contains(&n))
+    });
+    (!other).then_some(entry)
+}
+
+/// Returns `lp`, with the statements that run once before each inner loop of it, instead of on every trip. A statement
+/// qualifies when `hoistable` says so, and it belongs to the innermost loop that holds it, which is the one it is hoisted
+/// before. The loop must be entered only by the jump that `loop_entry` finds.
+pub(super) fn with_hoists(proto: &Proto, depth: &[i32], mut lp: Region) -> Region {
+    let code = &proto.code;
+    let jumped = jump_targets(proto);
+    // The loops inside the region: a back jump from `t` to `h`, where `h` is after the header.
+    let mut loops: Vec<(usize, usize)> = Vec::new();
+    for t in lp.header..=lp.last {
+        if depth[t] < 0 {
+            continue;
+        }
+        for (h, _) in successors(code[t], t, depth[t]) {
+            if h > lp.header && h <= t {
+                loops.push((h, t));
+            }
+        }
+    }
+    loops.sort_unstable();
+    loops.dedup();
+    let mut hoists = Vec::new();
+    for &(h, t) in &loops {
+        let Some(entry) = loop_entry(proto, depth, &lp, (h, t)) else {
+            continue;
+        };
+        let mut s = h;
+        while s <= t {
+            let inner = loops.iter().any(|&(h2, t2)| h < h2 && h2 <= s && s <= t2);
+            let end = if inner {
+                None
+            } else {
+                statement_end(proto, depth, s, t, depth[h], &jumped)
+            };
+            match end {
+                Some(e) if hoistable(proto, depth, &lp, (h, t), (s, e)) => {
+                    hoists.push(Hoist {
+                        entry,
+                        start: s,
+                        end: e,
+                    });
+                    s = e + 1;
+                }
+                _ => s += 1,
+            }
+        }
+    }
+    lp.hoists = hoists;
+    lp
 }
 
 /// Returns `lp`, with the method call that its loop inlines, when there is one. The call is the first in the loop whose
@@ -724,6 +937,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         resumes,
         function: None,
         inline: None,
+        hoists: Vec::new(),
     })
 }
 
@@ -803,6 +1017,7 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
             upvals: facts.upvals,
         }),
         inline: None,
+        hoists: Vec::new(),
     })
 }
 
@@ -2310,7 +2525,27 @@ impl Emitter<'_, '_> {
         let lp = self.lp;
         for ip in lp.header..=lp.last {
             let at = self.at[ip - lp.header];
+            // A hoisted statement starts at its own depth, so an operand still pending there is dead: the statement would
+            // overwrite it. It is dropped, not written out at the label that a jump into the statement reaches.
+            if lp.hoists.iter().any(|h| h.start == ip) {
+                let base = self.depth[ip].max(0) as usize;
+                self.pending[base..].iter_mut().for_each(|p| *p = None);
+            }
             self.bind_at(at, ip);
+            // A statement that runs once before an inner loop is emitted at the jump that enters it, after that jump's
+            // label, so every way into the loop runs it. The back jump goes to the loop's body, which comes after the
+            // jump, so it does not run the statement again (see `with_hoists`).
+            for hoist in lp.hoists.iter().filter(|h| h.entry == ip) {
+                self.materialize(PENDING as i32);
+                for k in hoist.start..=hoist.end {
+                    let (op, d) = (self.proto.code[k], self.depth[k]);
+                    self.op(op, d, k);
+                }
+            }
+            // The hoisted statements are not emitted where they stand, though their labels are still bound.
+            if lp.hoists.iter().any(|h| (h.start..=h.end).contains(&ip)) {
+                continue;
+            }
             let d = self.depth[ip];
             if d < 0 {
                 self.a.ud2();
