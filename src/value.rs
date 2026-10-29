@@ -1551,7 +1551,9 @@ fn append_text(s: &mut String, v: &Value) {
 /// Appends the JavaScript text of a finite number. An integer, and a number with few digits after the point, are written
 /// without a temporary string.
 pub fn push_number(out: &mut String, n: f64) {
-    if n.fract() == 0.0 && n.abs() < 9.0e15 {
+    // A whole number of this size is one that the cast to an integer and back leaves as it was. The cast avoids the library
+    // call that `fract` makes.
+    if n.abs() < 9.0e15 && (n as i64) as f64 == n {
         push_int(out, n as i64);
     } else if !push_short_decimal(out, n) {
         out.push_str(&num_to_string(n));
@@ -1575,18 +1577,31 @@ fn push_short_decimal(out: &mut String, n: f64) -> bool {
         if 1.0 / scale <= gap {
             break;
         }
-        let m = (x * scale).round();
-        if m / scale == x {
+        let y = x * scale;
+        if y >= 9.007_199_254_740_992e15 {
+            break;
+        }
+        // The whole number nearest to `y`, with halves rounded up, which is what `round` gives for a positive number. The
+        // cast and the comparison do it without the library call that `round` makes.
+        let low = y as u64;
+        let m = low + u64::from(y - low as f64 >= 0.5);
+        if m as f64 / scale == x {
             if n < 0.0 {
                 out.push('-');
             }
             let unit = 10u64.pow(d);
-            let frac = m as u64 % unit;
-            push_int(out, (m as u64 / unit) as i64);
+            push_int(out, (m / unit) as i64);
             out.push('.');
-            for place in (0..d).rev() {
-                out.push(char::from(b'0' + (frac / 10u64.pow(place) % 10) as u8));
+            let mut frac = m % unit;
+            let mut digits = [b'0'; 8];
+            for place in (0..d as usize).rev() {
+                digits[place] = b'0' + (frac % 10) as u8;
+                frac /= 10;
             }
+            // SAFETY: the digits are ASCII, so they are valid UTF-8.
+            push_small(out, unsafe {
+                std::str::from_utf8_unchecked(&digits[..d as usize])
+            });
             return true;
         }
     }

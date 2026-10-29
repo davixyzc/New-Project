@@ -43,7 +43,7 @@ fn stringify(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> 
         &indent,
         0,
         &mut out,
-        &mut QuotedKeys::default(),
+        &mut QuotedKeys::new(&indent),
     ) {
         Ok(true) => Ok(Value::from_string(out)),
         Ok(false) => Ok(Value::Undef),
@@ -53,24 +53,52 @@ fn stringify(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> 
 
 /// The quoted form of the keys that one write has met. Objects of one shape repeat their keys, and a key is shared by
 /// its allocation, so a key is quoted once and its text is copied for the objects that come after it.
-#[derive(Default)]
 struct QuotedKeys {
+    /// The quoted key of each name, followed by the separator that comes after it, which is the same for the whole write.
     entries: Vec<(Rc<str>, String)>,
+    /// The entry that the last key matched. The keys of the next object come in the same order, so the entry after it is
+    /// the one that a key is looked for first.
+    last: usize,
+    /// What comes between a key and its value: a colon, or a colon and a space when the output is indented.
+    sep: &'static str,
 }
 
 /// The most keys a write keeps quoted. A write that meets more keys quotes the rest each time.
 const MAX_QUOTED_KEYS: usize = 32;
 
 impl QuotedKeys {
-    /// Appends the quoted form of `key` to `out`.
+    fn new(indent: &str) -> QuotedKeys {
+        QuotedKeys {
+            entries: Vec::new(),
+            last: 0,
+            sep: if indent.is_empty() { ":" } else { ": " },
+        }
+    }
+
+    /// Appends the quoted form of `key`, and the separator after it, to `out`.
     fn push(&mut self, key: &Rc<str>, out: &mut String) {
-        if let Some((_, quoted)) = self.entries.iter().find(|(k, _)| Rc::ptr_eq(k, key)) {
-            push_small(out, quoted);
+        let guess = if self.last + 1 < self.entries.len() {
+            self.last + 1
+        } else {
+            0
+        };
+        if let Some((k, quoted)) = self.entries.get(guess) {
+            if Rc::ptr_eq(k, key) {
+                self.last = guess;
+                push_small(out, quoted);
+                return;
+            }
+        }
+        if let Some(at) = self.entries.iter().position(|(k, _)| Rc::ptr_eq(k, key)) {
+            self.last = at;
+            push_small(out, &self.entries[at].1);
             return;
         }
         let start = out.len();
         quote(key, out);
+        push_small(out, self.sep);
         if self.entries.len() < MAX_QUOTED_KEYS {
+            self.last = self.entries.len();
             self.entries.push((key.clone(), out[start..].to_string()));
         }
     }
@@ -120,7 +148,9 @@ fn write_value(
             let mut written = false;
             // Index keys come first, in ascending order, so an object that has them is ordered by its positions. Any other
             // object is written in the order of its properties, which needs no list of positions.
-            if props.iter().any(|(k, _)| is_index_key(k)) {
+            if props.iter().any(|(k, _)| {
+                k.as_bytes().first().is_some_and(u8::is_ascii_digit) && is_index_key(k)
+            }) {
                 for i in key_order(&props) {
                     write_member(
                         props.key(i),
@@ -174,11 +204,6 @@ fn write_member(
     *written = true;
     newline(indent, depth + 1, out);
     keys.push(key, out);
-    if indent.is_empty() {
-        out.push(':');
-    } else {
-        push_small(out, ": ");
-    }
     write_value(val, indent, depth + 1, out, keys)?;
     Ok(())
 }
@@ -206,11 +231,34 @@ const ESCAPED: [bool; 256] = {
     table
 };
 
+/// Whether some byte of `bytes` is one that a JSON string writes escaped (see `ESCAPED`). Eight bytes are tested at a time
+/// with bit tricks, which answer only whether some byte of the word has the property, not which one. A true answer leads
+/// the caller to the byte-by-byte copy, which then escapes exactly the bytes that need it.
+fn needs_escape(bytes: &[u8]) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    // A byte is below 0x20, or equal to the quote, or equal to the backslash.
+    let has_zero = |v: u64| v.wrapping_sub(ONES) & !v & HIGHS;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(chunk);
+        let w = u64::from_le_bytes(word);
+        let below = w.wrapping_sub(ONES * 0x20) & !w & HIGHS;
+        if below | has_zero(w ^ (ONES * u64::from(b'"'))) | has_zero(w ^ (ONES * u64::from(b'\\')))
+            != 0
+        {
+            return true;
+        }
+    }
+    chunks.remainder().iter().any(|&b| ESCAPED[usize::from(b)])
+}
+
 fn quote(s: &str, out: &mut String) {
     out.push('"');
     // Most strings need no escape, so they are copied whole. Every character that needs one is ASCII, so the bytes
     // are enough to check.
-    if !s.bytes().any(|b| ESCAPED[usize::from(b)]) {
+    if !needs_escape(s.as_bytes()) {
         push_small(out, s);
     } else {
         for c in s.chars() {
@@ -270,9 +318,11 @@ fn same_text(a: &str, b: &str) -> bool {
 }
 
 impl<'a> Parser<'a> {
-    /// The byte at the current position. Every token starts with an ASCII byte, so this is enough to choose a token.
-    fn byte(&self) -> Option<u8> {
-        self.text.as_bytes().get(self.pos).copied()
+    /// The byte at the current position, or zero past the end. No token starts with a zero byte, and the error for a token
+    /// is made from the text (see `error`), so both read the same way.
+    #[inline(always)]
+    fn peek(&self) -> u8 {
+        self.text.as_bytes().get(self.pos).copied().unwrap_or(0)
     }
 
     fn rest(&self) -> &'a str {
@@ -280,25 +330,32 @@ impl<'a> Parser<'a> {
         &text[self.pos..]
     }
 
-    /// Skips the whitespace at the current position. The common case, which has none, is checked inline.
-    #[inline]
+    /// Skips the whitespace at the current position: the ASCII whitespace, and the other characters that `char::is_whitespace`
+    /// accepts. The ASCII case is inline, since most tokens are next to none or to a few spaces.
+    #[inline(always)]
     fn skip_ws(&mut self) {
-        if matches!(self.byte(), Some(b'\t'..=b'\r' | b' ' | 0x80..=0xff)) {
-            self.skip_whitespace_run();
+        loop {
+            match self.peek() {
+                b'\t'..=b'\r' | b' ' => self.pos += 1,
+                0x80.. => {
+                    if !self.skip_unicode_space() {
+                        return;
+                    }
+                }
+                _ => return,
+            }
         }
     }
 
-    fn skip_whitespace_run(&mut self) {
-        loop {
-            match self.byte() {
-                // The whitespace `char::is_whitespace` accepts: the ASCII ones here, and some other characters below.
-                Some(b'\t'..=b'\r' | b' ') => self.pos += 1,
-                Some(b) if !b.is_ascii() => match self.rest().chars().next() {
-                    Some(c) if c.is_whitespace() => self.pos += c.len_utf8(),
-                    _ => return,
-                },
-                _ => return,
+    /// Skips one character at the current position if it is a non-ASCII whitespace character, and tells whether it did.
+    #[inline(never)]
+    fn skip_unicode_space(&mut self) -> bool {
+        match self.rest().chars().next() {
+            Some(c) if c.is_whitespace() => {
+                self.pos += c.len_utf8();
+                true
             }
+            _ => false,
         }
     }
 
@@ -317,21 +374,24 @@ impl<'a> Parser<'a> {
 
     fn value(&mut self) -> Result<Value, String> {
         self.skip_ws();
-        match self.byte() {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
-            Some(b'"') => Ok(Value::str(&self.string()?)),
-            Some(b't') => self.word("true", Value::Bool(true)),
-            Some(b'f') => self.word("false", Value::Bool(false)),
-            Some(b'n') => self.word("null", Value::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
+        match self.peek() {
+            b'{' => self.object(),
+            b'[' => self.array(),
+            b'"' => {
+                let text = self.string_text()?;
+                Ok(Value::str(&text))
+            }
+            b't' => self.word("true", Value::Bool(true)),
+            b'f' => self.word("false", Value::Bool(false)),
+            b'n' => self.word("null", Value::Null),
+            b'-' | b'0'..=b'9' => self.number(),
             _ => Err(self.error("Unexpected token")),
         }
     }
 
     fn word(&mut self, text: &str, v: Value) -> Result<Value, String> {
         for &expected in text.as_bytes() {
-            if self.byte() != Some(expected) {
+            if self.peek() != expected {
                 return Err(self.error("Unexpected token"));
             }
             self.pos += 1;
@@ -403,10 +463,7 @@ impl<'a> Parser<'a> {
             return Ok(Value::Num(n));
         }
         let start = self.pos;
-        while matches!(
-            self.byte(),
-            Some(b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
-        ) {
+        while matches!(self.peek(), b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
             self.pos += 1;
         }
         self.text[start..self.pos]
@@ -415,26 +472,44 @@ impl<'a> Parser<'a> {
             .map_err(|_| self.error("Unexpected token"))
     }
 
-    /// Reads a string. It is borrowed from the text when it has no escape, so most strings and keys are not copied.
-    fn string(&mut self) -> Result<Cow<'a, str>, String> {
+    /// The text of the string at the current position, when it has no escape and is closed, which the position moves past.
+    /// Otherwise the position stays where it is, and `escaped_string` reads the string.
+    #[inline(always)]
+    fn plain_string(&mut self) -> Option<&'a str> {
+        let bytes = self.text.as_bytes();
+        let start = self.pos + 1;
+        let mut end = start;
+        while end < bytes.len() {
+            match bytes[end] {
+                b'"' => {
+                    self.pos = end + 1;
+                    // SAFETY: the slice starts after an ASCII quote and ends at one, which are character boundaries of the
+                    // text, so the slice is valid UTF-8 like the text.
+                    return Some(unsafe { std::str::from_utf8_unchecked(&bytes[start..end]) });
+                }
+                b'\\' => return None,
+                _ => end += 1,
+            }
+        }
+        None
+    }
+
+    /// Reads the string at the current position. It is borrowed from the text when it has no escape, so most strings and
+    /// keys are not copied.
+    #[inline(always)]
+    fn string_text(&mut self) -> Result<Cow<'a, str>, String> {
+        match self.plain_string() {
+            Some(text) => Ok(Cow::Borrowed(text)),
+            None => self.escaped_string(),
+        }
+    }
+
+    /// Reads a string that has an escape, or that is not closed, from the position of its opening quote.
+    #[inline(never)]
+    fn escaped_string(&mut self) -> Result<Cow<'a, str>, String> {
         let text = self.text;
         self.pos += 1; // opening quote
-                       // A string without an escape is a slice of the text, up to its closing quote, which one scan finds. A string
-                       // with an escape, or one that is not closed, takes the loop below from the same point.
-        let bytes = text.as_bytes();
-        let mut end = self.pos;
-        while let Some(&b) = bytes.get(end) {
-            if b == b'"' {
-                let plain = &text[self.pos..end];
-                self.pos = end + 1;
-                return Ok(Cow::Borrowed(plain));
-            }
-            if b == b'\\' {
-                break;
-            }
-            end += 1;
-        }
-        // The text from `run` on has not been copied into `out` yet. `out` is only made once an escape is read.
+                       // The text from `run` on has not been copied into `out` yet. `out` is only made once an escape is read.
         let mut run = self.pos;
         let mut out: Option<String> = None;
         loop {
@@ -446,7 +521,7 @@ impl<'a> Parser<'a> {
             };
             self.pos += offset;
             let plain = &text[run..self.pos];
-            if self.byte() == Some(b'"') {
+            if self.peek() == b'"' {
                 self.pos += 1;
                 return Ok(match out {
                     Some(mut s) => {
@@ -502,16 +577,16 @@ impl<'a> Parser<'a> {
         self.pos += 1;
         let mut items = Vec::new();
         self.skip_ws();
-        if self.byte() == Some(b']') {
+        if self.peek() == b']' {
             self.pos += 1;
             return Ok(Value::arr(items));
         }
         loop {
             items.push(self.value()?);
             self.skip_ws();
-            match self.byte() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
+            match self.peek() {
+                b',' => self.pos += 1,
+                b']' => {
                     self.pos += 1;
                     return Ok(Value::arr(items));
                 }
@@ -524,19 +599,19 @@ impl<'a> Parser<'a> {
         self.pos += 1;
         let obj = Value::obj();
         self.skip_ws();
-        if self.byte() == Some(b'}') {
+        if self.peek() == b'}' {
             self.pos += 1;
             return Ok(obj);
         }
         loop {
             self.skip_ws();
-            if self.byte() != Some(b'"') {
+            if self.peek() != b'"' {
                 return Err(self.error("Expected property name"));
             }
-            let name = self.string()?;
+            let name = self.string_text()?;
             let key = self.shared_key(&name);
             self.skip_ws();
-            if self.byte() != Some(b':') {
+            if self.peek() != b':' {
                 return Err(self.error("Expected ':'"));
             }
             self.pos += 1;
@@ -545,9 +620,9 @@ impl<'a> Parser<'a> {
                 obj_put_cached(o, &key, v, &mut self.transitions);
             }
             self.skip_ws();
-            match self.byte() {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
+            match self.peek() {
+                b',' => self.pos += 1,
+                b'}' => {
                     self.pos += 1;
                     return Ok(obj);
                 }
