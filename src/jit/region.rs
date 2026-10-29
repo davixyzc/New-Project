@@ -157,6 +157,8 @@ pub(super) struct Region {
     /// The properties that a loop reads or writes through an object local, which keep the address of their value in the
     /// frame (see `prop_address`).
     prop_caches: Vec<(u32, u32)>,
+    /// Whether the loop calls anything that may run script code, which can write any property to any value (see `plan`).
+    calls: bool,
     /// The locals that hold objects, which a loop reads in place (see `Mark::View`). They have no register.
     pub(super) objects: Vec<u32>,
     /// The object locals that a path reads from the entry before it writes them, which the loop checks on entry.
@@ -911,6 +913,16 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         }
         prop_caches.push(key);
     }
+    // A call that runs script code may write any property to any value. Calls of `sqrt` and of `push` are native, and
+    // run no script code (see `Region::calls`).
+    let calls = (header..=last).any(|ip| match code[ip] {
+        Op::Call(argc) => {
+            let stack = &marks[ip - header];
+            let callee = stack.len().checked_sub(argc as usize + 2).map(|k| stack[k]);
+            !matches!(callee, Some(Mark::Sqrt | Mark::Push(_)))
+        }
+        _ => false,
+    });
     Some(Region {
         header,
         last,
@@ -924,6 +936,7 @@ pub(super) fn plan(proto: &Proto, depth: &[i32], types: &Numbers, header: usize)
         arrays: (0..proto.nlocals).filter(|&i| arrays[i as usize]).collect(),
         row_caches,
         prop_caches,
+        calls,
         objects: (0..proto.nlocals)
             .filter(|&i| objects[i as usize])
             .collect(),
@@ -999,6 +1012,7 @@ pub(super) fn plan_function(proto: &Proto, depth: &[i32], types: &Numbers) -> Op
         arrays: Vec::new(),
         row_caches: Vec::new(),
         prop_caches: Vec::new(),
+        calls: true,
         objects: Vec::new(),
         object_guards: Vec::new(),
         object_reads: Vec::new(),
@@ -2747,6 +2761,15 @@ impl Emitter<'_, '_> {
                 self.a.movzx_load8(RAX, from);
                 self.a.mov_store8(to, RAX);
             }
+            // The `Math` and the `sqrt` of a call of `Math.sqrt` trade places. Neither holds a value that the trade would
+            // move: a side exit writes the `sqrt` into the slot of its operand, and never reads the old contents. So the
+            // trade is only in the marks.
+            Op::Swap
+                if self.lp.function.is_none()
+                    && matches!(
+                        (self.mark(ip, d - 1), self.mark(ip, d - 2)),
+                        (Mark::Math | Mark::Sqrt, Mark::Math | Mark::Sqrt)
+                    ) => {}
             Op::Swap if self.lp.function.is_none() && !has_register(&self.mark(ip, d - 1)) => {
                 // Operands without registers trade their slots, whose values are dead unless they are owned.
                 let (top, under) = (self.operand_mem(d - 1), self.operand_mem(d - 2));
@@ -4024,6 +4047,12 @@ impl Emitter<'_, '_> {
                 self.a.test64(RDX, RDX);
                 self.a.jcc(CC_NE, done);
                 find_prop(&mut *self.a, obj, site, exit);
+                if !self.lp.calls {
+                    // Without a call, a number stays a number under the loop's writes, which store only numbers over
+                    // numbers. So the check is made once, here, and a hit does not repeat it (see `prop_read`).
+                    self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
+                    self.a.jcc(CC_NE, exit);
+                }
                 self.a.mov_store(slot, RDX);
                 self.a.bind(done);
             }
@@ -4089,8 +4118,12 @@ impl Emitter<'_, '_> {
         if self.r14_free() {
             self.a.mov_rr(R14, RDX);
         }
-        self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
-        self.a.jcc(CC_NE, exit);
+        // The check of a cached address was made when the cache was filled, and it still holds (see `prop_address`).
+        let checked = !self.lp.calls && local.is_some_and(|s| self.prop_cache_slot(s, n).is_some());
+        if !checked {
+            self.a.cmp8_imm(Mem { base: RDX, disp: 0 }, TAG_NUM);
+            self.a.jcc(CC_NE, exit);
+        }
         self.a.movsd_load(dst, Mem { base: RDX, disp: 8 });
     }
 

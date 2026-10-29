@@ -1,0 +1,49 @@
+// Property reads and writes in loops, where a property changes type between runs or through a call, and where two locals
+// name one object, checked against Node.
+function sumX(list) {
+  let total = 0;
+  for (let k = 0; k < list.length; k++) {
+    const o = list[k];
+    for (let j = 0; j < 3; j++) total += o.x * 2 + o.y;
+  }
+  return total;
+}
+const objs = [];
+for (let k = 0; k < 40; k++) objs.push({ x: k, y: 1 });
+console.log("numbers", sumX(objs), sumX(objs));
+objs[7].y = "s";
+console.log("string", sumX(objs));
+objs[7].y = 1;
+objs[9].x = 2.5;
+console.log("fraction", sumX(objs));
+// A call in the loop writes the property to a string, which the next read must see.
+function flip(o) { o.x = "flipped"; return 1; }
+function run(o, n) {
+  let total = "";
+  for (let j = 0; j < n; j++) {
+    total = total + o.x;
+    if (j === 2) flip(o);
+  }
+  return total;
+}
+console.log("call", run({ x: 5 }, 6));
+// Two locals name one object: a write through one is read through the other.
+function alias(n) {
+  const p = { v: 1 };
+  const q = p;
+  let t = 0;
+  for (let j = 0; j < n; j++) {
+    p.v = p.v + 1;
+    t = t + q.v;
+  }
+  return t;
+}
+console.log("alias", alias(5), alias(1));
+// An object whose property is not a number at the entry of the loop leaves to the generic code, which handles it.
+function readY(list) {
+  let s = 0;
+  for (let k = 0; k < list.length; k++) s = s + list[k].y * 1;
+  return s;
+}
+const mixed = [{ y: 1 }, { y: "2" }, { y: 3 }];
+console.log("mixed", readY(mixed), readY([{ y: 4 }, { y: 5 }]));
