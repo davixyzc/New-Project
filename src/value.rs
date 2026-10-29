@@ -593,23 +593,19 @@ impl JsStr {
 
     /// Points `bytes` at the text, which is inline or in the buffer of `heap`.
     fn point_at_text(&mut self) {
-        self.bytes = self.as_str().as_ptr();
+        self.bytes = if self.len > INLINE_BYTES {
+            self.heap.as_ptr()
+        } else {
+            self.inline.as_ptr()
+        };
     }
 
     /// The text.
     pub fn as_str(&self) -> &str {
-        if self.len > INLINE_BYTES {
-            &self.heap
-        } else {
-            self.inline_text()
-        }
-    }
-
-    /// The text while it is short.
-    fn inline_text(&self) -> &str {
-        // SAFETY: the first `len` bytes of `inline` are whole strings that were copied in from valid text, so they are
-        // valid UTF-8. This is called only for short text, so `len` is within `inline`.
-        unsafe { std::str::from_utf8_unchecked(&self.inline[..self.len]) }
+        // SAFETY: `bytes` points to the `len` bytes of the text, which are valid UTF-8 whether they are inline or in the
+        // buffer of `heap`. That buffer is replaced only with `bytes` set to its address (see `append`), and the inline
+        // bytes are the whole strings copied in from valid text.
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.bytes, self.len)) }
     }
 
     /// The length in characters.
@@ -627,22 +623,23 @@ impl JsStr {
         self.chars += chars;
         self.ascii = self.ascii && ascii;
         self.append(more);
-        self.point_at_text();
     }
 
     /// Appends `more` to the text. Text that grows past the inline length moves into a buffer of its own, which has room
-    /// to grow.
+    /// to grow. Inline text keeps its address, so only the buffer's address is set, after each append to it.
     fn append(&mut self, more: &str) {
         let len = self.len + more.len();
-        if len <= INLINE_BYTES {
+        if self.len > INLINE_BYTES {
+            push_small(&mut self.heap, more);
+            self.bytes = self.heap.as_ptr();
+        } else if len <= INLINE_BYTES {
             copy_short(&mut self.inline[self.len..], more.as_bytes());
         } else {
-            if self.len <= INLINE_BYTES {
-                let mut heap = String::with_capacity(2 * len);
-                heap.push_str(self.inline_text());
-                self.heap = heap;
-            }
-            push_small(&mut self.heap, more);
+            let mut heap = String::with_capacity(2 * len);
+            heap.push_str(self.as_str());
+            push_small(&mut heap, more);
+            self.heap = heap;
+            self.bytes = self.heap.as_ptr();
         }
         self.len = len;
     }
